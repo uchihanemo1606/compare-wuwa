@@ -1,0 +1,109 @@
+{
+  "schema_version": "whashreonator.wwmi-knowledge.v1",
+  "generated_at_unix_ms": 3,
+  "repo": {
+    "input": "https://github.com/SpectrumQT/WWMI-Package.git",
+    "resolved_path": "fixtures/wwmi",
+    "origin_url": "https://github.com/SpectrumQT/WWMI-Package"
+  },
+  "summary": {
+    "analyzed_commits": 12,
+    "fix_like_commits": 8,
+    "discovered_patterns": 4
+  },
+  "patterns": [
+    {
+      "kind": "mapping_or_hash_update",
+      "description": "mapping updates frequently recover broken mods after path/hash drift",
+      "frequency": 4,
+      "average_fix_likelihood": 0.78,
+      "example_commits": [
+        "abc123",
+        "def456"
+      ]
+    },
+    {
+      "kind": "buffer_layout_or_capacity_fix",
+      "description": "buffer or layout changes commonly require runtime guard updates",
+      "frequency": 3,
+      "average_fix_likelihood": 0.82,
+      "example_commits": [
+        "ghi789"
+      ]
+    },
+    {
+      "kind": "runtime_config_change",
+      "description": "runtime config changes sometimes avoid startup crashes",
+      "frequency": 2,
+      "average_fix_likelihood": 0.68,
+      "example_commits": [
+        "jkl012"
+      ]
+    },
+    {
+      "kind": "shader_logic_change",
+      "description": "shader logic updates can accompany mapping or hash fixes",
+      "frequency": 2,
+      "average_fix_likelihood": 0.61,
+      "example_commits": [
+        "mno345"
+      ]
+    }
+  ],
+  "keyword_stats": [
+    {
+      "keyword": "mapping",
+      "count": 4
+    },
+    {
+      "keyword": "buffer",
+      "count": 3
+    }
+  ],
+  "evidence_commits": [
+    {
+      "hash": "abc123",
+      "subject": "Update mappings after game asset move",
+      "unix_time": 100,
+      "decorations": "",
+      "commit_url": "https://github.com/SpectrumQT/WWMI-Package/commit/abc123",
+      "fix_likelihood": 0.83,
+      "changed_files": [
+        "WWMI/Mods/Character/Encore.ini"
+      ],
+      "detected_patterns": [
+        "mapping_or_hash_update"
+      ],
+      "detected_keywords": [
+        "update",
+        "mapping"
+      ],
+      "reasons": [
+        "subject contains update and mapping"
+      ]
+    },
+    {
+      "hash": "ghi789",
+      "subject": "Fix crash after buffer resize requirement changed",
+      "unix_time": 110,
+      "decorations": "",
+      "commit_url": "https://github.com/SpectrumQT/WWMI-Package/commit/ghi789",
+      "fix_likelihood": 0.87,
+      "changed_files": [
+        "WWMI/d3dx.ini"
+      ],
+      "detected_patterns": [
+        "buffer_layout_or_capacity_fix",
+        "runtime_config_change"
+      ],
+      "detected_keywords": [
+        "fix",
+        "crash",
+        "buffer"
+      ],
+      "reasons": [
+        "subject contains fix crash and buffer"
+      ]
+    }
+  ]
+}

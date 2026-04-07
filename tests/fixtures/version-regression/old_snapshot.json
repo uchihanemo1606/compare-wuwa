@@ -1,0 +1,137 @@
+{
+  "schema_version": "whashreonator.snapshot.v1",
+  "version_id": "2.4.0",
+  "created_at_unix_ms": 1,
+  "source_root": "fixtures/2.4.0",
+  "asset_count": 3,
+  "assets": [
+    {
+      "id": "encore-body",
+      "path": "Content/Character/Encore/Body.mesh",
+      "kind": "mesh",
+      "metadata": {
+        "logical_name": "encore body",
+        "vertex_count": 21000,
+        "index_count": 42000,
+        "material_slots": 2,
+        "section_count": 1,
+        "tags": [
+          "character",
+          "body"
+        ]
+      },
+      "fingerprint": {
+        "normalized_kind": "mesh",
+        "normalized_name": "encore body",
+        "name_tokens": [
+          "encore",
+          "body"
+        ],
+        "path_tokens": [
+          "content",
+          "character",
+          "encore",
+          "body",
+          "mesh"
+        ],
+        "tags": [
+          "character",
+          "body"
+        ],
+        "vertex_count": 21000,
+        "index_count": 42000,
+        "material_slots": 2,
+        "section_count": 1
+      },
+      "hash_fields": {
+        "asset_hash": "body-old-hash",
+        "shader_hash": "shader-body-a"
+      }
+    },
+    {
+      "id": "encore-hair",
+      "path": "Content/Character/Encore/Hair.mesh",
+      "kind": "mesh",
+      "metadata": {
+        "logical_name": "encore hair",
+        "vertex_count": 8000,
+        "index_count": 16000,
+        "material_slots": 1,
+        "section_count": 1,
+        "tags": [
+          "character",
+          "hair"
+        ]
+      },
+      "fingerprint": {
+        "normalized_kind": "mesh",
+        "normalized_name": "encore hair",
+        "name_tokens": [
+          "encore",
+          "hair"
+        ],
+        "path_tokens": [
+          "content",
+          "character",
+          "encore",
+          "hair",
+          "mesh"
+        ],
+        "tags": [
+          "character",
+          "hair"
+        ],
+        "vertex_count": 8000,
+        "index_count": 16000,
+        "material_slots": 1,
+        "section_count": 1
+      },
+      "hash_fields": {
+        "asset_hash": "hair-old-hash",
+        "shader_hash": "shader-hair-a"
+      }
+    },
+    {
+      "id": "pistol-main",
+      "path": "Content/Weapon/Pistol_Main.weapon",
+      "kind": "weapon",
+      "metadata": {
+        "logical_name": "pistol main",
+        "vertex_count": 1500,
+        "index_count": 3000,
+        "material_slots": 1,
+        "section_count": 1,
+        "tags": [
+          "weapon",
+          "pistol"
+        ]
+      },
+      "fingerprint": {
+        "normalized_kind": "weapon",
+        "normalized_name": "pistol main",
+        "name_tokens": [
+          "pistol",
+          "main"
+        ],
+        "path_tokens": [
+          "content",
+          "weapon",
+          "pistol",
+          "main"
+        ],
+        "tags": [
+          "weapon",
+          "pistol"
+        ],
+        "vertex_count": 1500,
+        "index_count": 3000,
+        "material_slots": 1,
+        "section_count": 1
+      },
+      "hash_fields": {
+        "asset_hash": "pistol-old-hash",
+        "shader_hash": null
+      }
+    }
+  ]
+}
