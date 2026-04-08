@@ -30,6 +30,17 @@ fn snapshot_command_exports_machine_readable_snapshot() {
     assert_eq!(snapshot.asset_count, 2);
     assert_eq!(parsed.asset_count, 2);
     assert_eq!(parsed.version_id, "2.4.0");
+    assert_eq!(
+        parsed.context.scope.capture_mode.as_deref(),
+        Some("local_filesystem_inventory")
+    );
+    assert_eq!(parsed.context.scope.coverage.content_like_path_count, 2);
+    assert_eq!(parsed.context.scope.coverage.character_path_count, 1);
+    assert_eq!(parsed.context.scope.coverage.non_content_path_count, 0);
+    assert_eq!(
+        parsed.context.scope.mostly_install_or_package_level,
+        Some(true)
+    );
     assert!(
         parsed
             .assets
@@ -80,6 +91,25 @@ fn snapshot_command_auto_detects_version_and_enriches_hashes() {
 
     assert_eq!(snapshot.version_id, "3.2.1");
     assert_eq!(parsed.version_id, "3.2.1");
+    assert_eq!(
+        parsed.context.scope.capture_mode.as_deref(),
+        Some("local_filesystem_inventory")
+    );
+    assert_eq!(parsed.context.scope.coverage.content_like_path_count, 1);
+    assert_eq!(parsed.context.scope.coverage.character_path_count, 0);
+    assert_eq!(parsed.context.scope.coverage.non_content_path_count, 2);
+    assert_eq!(
+        parsed.context.scope.mostly_install_or_package_level,
+        Some(true)
+    );
+    assert_eq!(
+        parsed.context.scope.meaningful_content_coverage,
+        Some(false)
+    );
+    assert_eq!(
+        parsed.context.scope.meaningful_character_coverage,
+        Some(false)
+    );
     assert_eq!(
         parsed
             .context

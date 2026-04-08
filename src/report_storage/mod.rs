@@ -8,11 +8,13 @@ use crate::{
     compare::{SnapshotCompareReport, SnapshotComparer},
     error::{AppError, AppResult},
     export::{
-        export_inference_output, export_snapshot_compare_output, export_snapshot_output,
-        export_version_diff_report_v2,
+        export_inference_output, export_mapping_proposal_output,
+        export_proposal_patch_draft_output, export_snapshot_compare_output, export_snapshot_output,
+        export_text_output, export_version_diff_report_v2,
     },
     inference::InferenceReport,
     output_policy::{resolve_artifact_root, resolve_report_store_root},
+    proposal::{MappingProposalOutput, ProposalArtifacts, ProposalPatchDraftOutput},
     report::{VersionDiffReportBuilder, VersionDiffReportV2, load_version_diff_report_v2},
     snapshot::{GameSnapshot, load_snapshot},
 };
@@ -38,6 +40,9 @@ pub struct ReportListEntry {
 pub enum VersionArtifactKind {
     Snapshot,
     ReportBundle,
+    InferenceData,
+    ProposalData,
+    HumanSummary,
     BufferData,
     HashData,
     Auxiliary,
@@ -59,6 +64,9 @@ pub struct StoredVersionEntry {
     pub artifacts: Vec<VersionArtifactEntry>,
     pub has_snapshot: bool,
     pub has_report_bundle: bool,
+    pub has_inference_data: bool,
+    pub has_proposal_data: bool,
+    pub has_human_summary: bool,
     pub has_buffer_data: bool,
     pub has_hash_data: bool,
 }
@@ -68,6 +76,9 @@ pub struct VersionLayoutPaths {
     pub version_dir: PathBuf,
     pub snapshot_dir: PathBuf,
     pub report_bundle_dir: PathBuf,
+    pub inference_dir: PathBuf,
+    pub proposal_dir: PathBuf,
+    pub summary_dir: PathBuf,
     pub buffer_dir: PathBuf,
     pub hash_dir: PathBuf,
     pub auxiliary_dir: PathBuf,
@@ -115,6 +126,9 @@ impl ReportStorage {
         let version_dir = self.build_version_directory(version_id);
         let snapshot_dir = version_dir.join("snapshot");
         let report_bundle_dir = version_dir.join("report_bundle");
+        let inference_dir = version_dir.join("inference");
+        let proposal_dir = version_dir.join("proposal");
+        let summary_dir = version_dir.join("summary");
         let buffer_dir = version_dir.join("buffer");
         let hash_dir = version_dir.join("hash");
         let auxiliary_dir = version_dir.join("auxiliary");
@@ -127,6 +141,9 @@ impl ReportStorage {
             version_dir,
             snapshot_dir,
             report_bundle_dir,
+            inference_dir,
+            proposal_dir,
+            summary_dir,
             buffer_dir,
             hash_dir,
             auxiliary_dir,
@@ -138,6 +155,9 @@ impl ReportStorage {
         let layout = self.build_version_layout(version_id);
         fs::create_dir_all(&layout.snapshot_dir)?;
         fs::create_dir_all(&layout.report_bundle_dir)?;
+        fs::create_dir_all(&layout.inference_dir)?;
+        fs::create_dir_all(&layout.proposal_dir)?;
+        fs::create_dir_all(&layout.summary_dir)?;
         fs::create_dir_all(&layout.buffer_dir)?;
         fs::create_dir_all(&layout.hash_dir)?;
         fs::create_dir_all(&layout.auxiliary_dir)?;
@@ -174,6 +194,54 @@ impl ReportStorage {
             directory: run_dir,
             report_path,
         })
+    }
+
+    pub fn save_phase3_outputs(
+        &self,
+        report: &VersionDiffReportV2,
+        old_snapshot: &GameSnapshot,
+        new_snapshot: &GameSnapshot,
+        compare: &SnapshotCompareReport,
+        inference: &InferenceReport,
+        proposals: &ProposalArtifacts,
+        human_summary: &str,
+    ) -> AppResult<SavedReportBundle> {
+        let saved = self.save_run(report, old_snapshot, new_snapshot, compare, Some(inference))?;
+        let layout = self.ensure_version_layout(&report.new_version.version_id)?;
+
+        let stamp = inference.generated_at_unix_ms;
+        let pair_label = format!(
+            "{}-to-{}",
+            sanitize_version_segment(&report.old_version.version_id),
+            sanitize_version_segment(&report.new_version.version_id)
+        );
+
+        export_inference_output(
+            inference,
+            &layout
+                .inference_dir
+                .join(format!("{stamp}-{pair_label}.inference.v1.json")),
+        )?;
+        export_mapping_proposal_output(
+            &proposals.mapping_proposal,
+            &layout
+                .proposal_dir
+                .join(format!("{stamp}-{pair_label}.mapping-proposal.v1.json")),
+        )?;
+        export_proposal_patch_draft_output(
+            &proposals.patch_draft,
+            &layout
+                .proposal_dir
+                .join(format!("{stamp}-{pair_label}.proposal-patch-draft.v1.json")),
+        )?;
+        export_text_output(
+            human_summary,
+            &layout
+                .summary_dir
+                .join(format!("{stamp}-{pair_label}.human-summary.md")),
+        )?;
+
+        Ok(saved)
     }
 
     pub fn snapshot_path_for_version(&self, version_id: &str) -> PathBuf {
@@ -306,6 +374,15 @@ impl ReportStorage {
                         VersionArtifactKind::ReportBundle | VersionArtifactKind::LegacyReportBundle
                     )
                 });
+                let has_inference_data = artifacts
+                    .iter()
+                    .any(|artifact| artifact.kind == VersionArtifactKind::InferenceData);
+                let has_proposal_data = artifacts
+                    .iter()
+                    .any(|artifact| artifact.kind == VersionArtifactKind::ProposalData);
+                let has_human_summary = artifacts
+                    .iter()
+                    .any(|artifact| artifact.kind == VersionArtifactKind::HumanSummary);
                 let has_buffer_data = artifacts
                     .iter()
                     .any(|artifact| artifact.kind == VersionArtifactKind::BufferData);
@@ -319,6 +396,9 @@ impl ReportStorage {
                     artifacts,
                     has_snapshot,
                     has_report_bundle,
+                    has_inference_data,
+                    has_proposal_data,
+                    has_human_summary,
                     has_buffer_data,
                     has_hash_data,
                 }
@@ -363,6 +443,143 @@ impl ReportStorage {
         }
 
         Ok(None)
+    }
+
+    pub fn load_latest_inference(&self, version_id: &str) -> AppResult<Option<InferenceReport>> {
+        let mut candidates = self
+            .list_version_artifacts(version_id)?
+            .into_iter()
+            .filter(|artifact| {
+                artifact.kind == VersionArtifactKind::InferenceData
+                    && artifact.path.extension().is_some_and(|ext| ext == "json")
+            })
+            .map(|artifact| artifact.path)
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| right.cmp(left));
+
+        for path in candidates {
+            if let Ok(content) = fs::read_to_string(&path)
+                && let Ok(parsed) = serde_json::from_str::<InferenceReport>(&content)
+            {
+                return Ok(Some(parsed));
+            }
+        }
+
+        Ok(None)
+    }
+
+    pub fn load_latest_mapping_proposal(
+        &self,
+        version_id: &str,
+    ) -> AppResult<Option<MappingProposalOutput>> {
+        let mut candidates = self
+            .list_version_artifacts(version_id)?
+            .into_iter()
+            .filter(|artifact| {
+                artifact.kind == VersionArtifactKind::ProposalData
+                    && artifact.path.extension().is_some_and(|ext| ext == "json")
+                    && artifact
+                        .path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.contains("mapping-proposal"))
+            })
+            .map(|artifact| artifact.path)
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| right.cmp(left));
+
+        for path in candidates {
+            if let Ok(content) = fs::read_to_string(&path)
+                && let Ok(parsed) = serde_json::from_str::<MappingProposalOutput>(&content)
+            {
+                return Ok(Some(parsed));
+            }
+        }
+
+        Ok(None)
+    }
+
+    pub fn load_latest_patch_draft(
+        &self,
+        version_id: &str,
+    ) -> AppResult<Option<ProposalPatchDraftOutput>> {
+        let mut candidates = self
+            .list_version_artifacts(version_id)?
+            .into_iter()
+            .filter(|artifact| {
+                artifact.kind == VersionArtifactKind::ProposalData
+                    && artifact.path.extension().is_some_and(|ext| ext == "json")
+                    && artifact
+                        .path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.contains("proposal-patch-draft"))
+            })
+            .map(|artifact| artifact.path)
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| right.cmp(left));
+
+        for path in candidates {
+            if let Ok(content) = fs::read_to_string(&path)
+                && let Ok(parsed) = serde_json::from_str::<ProposalPatchDraftOutput>(&content)
+            {
+                return Ok(Some(parsed));
+            }
+        }
+
+        Ok(None)
+    }
+
+    pub fn load_latest_human_summary(&self, version_id: &str) -> AppResult<Option<String>> {
+        let mut candidates = self
+            .list_version_artifacts(version_id)?
+            .into_iter()
+            .filter(|artifact| {
+                artifact.kind == VersionArtifactKind::HumanSummary
+                    && artifact.path.extension().is_some_and(|ext| ext == "md")
+            })
+            .map(|artifact| artifact.path)
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| right.cmp(left));
+
+        for path in candidates {
+            if let Ok(content) = fs::read_to_string(&path) {
+                return Ok(Some(content));
+            }
+        }
+
+        Ok(None)
+    }
+
+    pub fn select_baseline_version(&self, current_version: &str) -> AppResult<Option<String>> {
+        let mut versions = self
+            .list_versions()?
+            .into_iter()
+            .filter(|entry| entry.has_snapshot)
+            .map(|entry| entry.version_id)
+            .collect::<Vec<_>>();
+        versions.sort_by(|left, right| version_sort_key(left).cmp(&version_sort_key(right)));
+
+        if versions.is_empty() {
+            return Ok(None);
+        }
+
+        if let Some(index) = versions
+            .iter()
+            .position(|version| version == current_version)
+        {
+            if index > 0 {
+                return Ok(Some(versions[index - 1].clone()));
+            }
+            return Ok(None);
+        }
+
+        let target_key = version_sort_key(current_version);
+        let baseline = versions
+            .into_iter()
+            .filter(|version| version_sort_key(version) < target_key)
+            .next_back();
+        Ok(baseline)
     }
 
     pub fn compare_versions(
@@ -470,6 +687,9 @@ fn collect_artifacts_from_new_layout(version_dir: &Path) -> AppResult<Vec<Versio
             let kind = match section.as_str() {
                 "snapshot" => VersionArtifactKind::Snapshot,
                 "report_bundle" => VersionArtifactKind::ReportBundle,
+                "inference" => VersionArtifactKind::InferenceData,
+                "proposal" => VersionArtifactKind::ProposalData,
+                "summary" => VersionArtifactKind::HumanSummary,
                 "buffer" => VersionArtifactKind::BufferData,
                 "hash" => VersionArtifactKind::HashData,
                 _ => VersionArtifactKind::Auxiliary,
@@ -583,8 +803,14 @@ mod tests {
     };
 
     use crate::{
+        compare::SnapshotComparer,
         domain::AssetMetadata,
-        report::{VersionDiffSummary, VersionSide},
+        inference::{
+            InferenceCompareInput, InferenceKnowledgeInput, InferenceReport, InferenceScopeContext,
+            InferenceSummary, InferredMappingHint,
+        },
+        proposal::{ProposalArtifacts, ProposalEngine},
+        report::{VersionDiffReportBuilder, VersionDiffSummary, VersionSide},
         snapshot::{
             GameSnapshot, SnapshotAsset, SnapshotContext, SnapshotFingerprint, SnapshotHashFields,
         },
@@ -737,6 +963,76 @@ mod tests {
         let _ = fs::remove_dir_all(test_root);
     }
 
+    #[test]
+    fn save_phase3_outputs_are_indexed_and_loadable() {
+        let test_root = unique_test_dir();
+        let storage = ReportStorage::new(test_root.join("out").join("report"));
+        let old_snapshot = sample_snapshot("3.2.1", 1);
+        let new_snapshot = sample_snapshot("3.3.1", 2);
+        storage
+            .save_snapshot_for_version(&old_snapshot)
+            .expect("save old snapshot");
+        storage
+            .save_snapshot_for_version(&new_snapshot)
+            .expect("save new snapshot");
+
+        let compare = SnapshotComparer.compare(&old_snapshot, &new_snapshot);
+        let inference = sample_inference_report("3.2.1", "3.3.1");
+        let proposals: ProposalArtifacts = ProposalEngine.generate(&inference, 0.85);
+        let report = VersionDiffReportBuilder.enrich_with_inference(
+            VersionDiffReportBuilder.from_compare(&old_snapshot, &new_snapshot, &compare),
+            &inference,
+        );
+
+        storage
+            .save_phase3_outputs(
+                &report,
+                &old_snapshot,
+                &new_snapshot,
+                &compare,
+                &inference,
+                &proposals,
+                "# summary",
+            )
+            .expect("save phase3 outputs");
+
+        let versions = storage.list_versions().expect("list versions");
+        let v331 = versions
+            .iter()
+            .find(|entry| entry.version_id == "3.3.1")
+            .expect("3.3.1 exists");
+        assert!(v331.has_inference_data);
+        assert!(v331.has_proposal_data);
+        assert!(v331.has_human_summary);
+
+        let latest_inference = storage
+            .load_latest_inference("3.3.1")
+            .expect("load inference")
+            .expect("inference exists");
+        assert_eq!(latest_inference.compare_input.new_version_id, "3.3.1");
+        assert!(
+            storage
+                .load_latest_mapping_proposal("3.3.1")
+                .expect("load mapping proposal")
+                .is_some()
+        );
+        assert!(
+            storage
+                .load_latest_patch_draft("3.3.1")
+                .expect("load patch draft")
+                .is_some()
+        );
+        assert_eq!(
+            storage
+                .load_latest_human_summary("3.3.1")
+                .expect("load human summary")
+                .as_deref(),
+            Some("# summary")
+        );
+
+        let _ = fs::remove_dir_all(test_root);
+    }
+
     fn sample_snapshot(version_id: &str, vertex_count: u32) -> GameSnapshot {
         GameSnapshot {
             schema_version: "whashreonator.snapshot.v1".to_string(),
@@ -797,6 +1093,47 @@ mod tests {
                 uncertain_items: 0,
                 mapping_candidates: 0,
             },
+            scope_notes: Vec::new(),
+        }
+    }
+
+    fn sample_inference_report(old_version: &str, new_version: &str) -> InferenceReport {
+        InferenceReport {
+            schema_version: "whashreonator.inference.v1".to_string(),
+            generated_at_unix_ms: 123,
+            compare_input: InferenceCompareInput {
+                old_version_id: old_version.to_string(),
+                new_version_id: new_version.to_string(),
+                changed_assets: 1,
+                added_assets: 0,
+                removed_assets: 0,
+                candidate_mapping_changes: 1,
+            },
+            knowledge_input: InferenceKnowledgeInput {
+                repo: "repo".to_string(),
+                analyzed_commits: 1,
+                fix_like_commits: 1,
+                discovered_patterns: 1,
+            },
+            scope: InferenceScopeContext::default(),
+            summary: InferenceSummary {
+                probable_crash_causes: 0,
+                suggested_fixes: 0,
+                candidate_mapping_hints: 1,
+                highest_confidence: 0.91,
+            },
+            probable_crash_causes: Vec::new(),
+            suggested_fixes: Vec::new(),
+            candidate_mapping_hints: vec![InferredMappingHint {
+                old_asset_path: "Content/Character/Encore/Body.mesh".to_string(),
+                new_asset_path: "Content/Character/Encore/Body.mesh".to_string(),
+                confidence: 0.91,
+                needs_review: false,
+                ambiguous: false,
+                confidence_gap: Some(0.2),
+                reasons: vec!["exact path".to_string()],
+                evidence: vec!["compare confidence".to_string()],
+            }],
         }
     }
 

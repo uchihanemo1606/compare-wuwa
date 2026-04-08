@@ -21,10 +21,21 @@ pub struct InferenceReport {
     pub generated_at_unix_ms: u128,
     pub compare_input: InferenceCompareInput,
     pub knowledge_input: InferenceKnowledgeInput,
+    #[serde(default)]
+    pub scope: InferenceScopeContext,
     pub summary: InferenceSummary,
     pub probable_crash_causes: Vec<ProbableCrashCause>,
     pub suggested_fixes: Vec<SuggestedFix>,
     pub candidate_mapping_hints: Vec<InferredMappingHint>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct InferenceScopeContext {
+    pub low_signal_compare: bool,
+    pub old_snapshot_low_signal: bool,
+    pub new_snapshot_low_signal: bool,
+    pub notes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -110,6 +121,9 @@ impl FixInferenceEngine {
         compare_report: &SnapshotCompareReport,
         wwmi_knowledge: &WwmiKnowledgeBase,
     ) -> InferenceReport {
+        let scope = build_inference_scope_context(compare_report);
+        let confidence_scale = if scope.low_signal_compare { 0.85 } else { 1.0 };
+
         let mapping_support = pattern_support(wwmi_knowledge, WwmiPatternKind::MappingOrHashUpdate);
         let buffer_support =
             pattern_support(wwmi_knowledge, WwmiPatternKind::BufferLayoutOrCapacityFix);
@@ -132,7 +146,8 @@ impl FixInferenceEngine {
                 + 0.10 * runtime_support
                 + 0.10 * shader_support
                 + 0.10)
-                .clamp(0.0, 1.0);
+                .clamp(0.0, 1.0)
+                * confidence_scale;
             let affected_assets = structural_changes
                 .iter()
                 .filter_map(|change| change.new_asset.as_ref().or(change.old_asset.as_ref()))
@@ -200,8 +215,9 @@ impl FixInferenceEngine {
             .filter(|change| change.change_type == SnapshotChangeType::Removed)
             .collect::<Vec<_>>();
         if !removed_assets.is_empty() && !compare_report.candidate_mapping_changes.is_empty() {
-            let confidence =
-                (0.55 + 0.25 * mapping_support + 0.10 * shader_support + 0.05).clamp(0.0, 1.0);
+            let confidence = (0.55 + 0.25 * mapping_support + 0.10 * shader_support + 0.05)
+                .clamp(0.0, 1.0)
+                * confidence_scale;
             probable_crash_causes.push(ProbableCrashCause {
                 code: "asset_paths_or_mapping_shifted".to_string(),
                 summary: "Assets disappeared from their old paths but plausible replacements exist in the new snapshot; the mod likely needs remapping.".to_string(),
@@ -251,7 +267,7 @@ impl FixInferenceEngine {
                 ),
             });
         } else if !removed_assets.is_empty() {
-            let confidence = (0.45 + 0.20 * mapping_support).clamp(0.0, 1.0);
+            let confidence = (0.45 + 0.20 * mapping_support).clamp(0.0, 1.0) * confidence_scale;
             probable_crash_causes.push(ProbableCrashCause {
                 code: "asset_removed_without_clear_replacement".to_string(),
                 summary: "Some old asset paths disappeared and the tool could not find strong replacements; the mod may target stale assets.".to_string(),
@@ -286,8 +302,9 @@ impl FixInferenceEngine {
             })
             .collect::<Vec<_>>();
         if !name_or_hash_changes.is_empty() {
-            let confidence =
-                (0.45 + 0.20 * mapping_support + 0.10 * shader_support).clamp(0.0, 1.0);
+            let confidence = (0.45 + 0.20 * mapping_support + 0.10 * shader_support)
+                .clamp(0.0, 1.0)
+                * confidence_scale;
             probable_crash_causes.push(ProbableCrashCause {
                 code: "asset_signature_or_hash_changed".to_string(),
                 summary: "Asset identity signals changed across versions; shader or hash-based targeting may no longer match.".to_string(),
@@ -323,7 +340,7 @@ impl FixInferenceEngine {
             probable_crash_causes.push(ProbableCrashCause {
                 code: "possible_runtime_initialization_issue".to_string(),
                 summary: "The snapshot diff alone is inconclusive; WWMI history suggests some crashes are caused by timing/init-order issues rather than asset inventory drift.".to_string(),
-                confidence: (0.25 + 0.25 * timing_support).clamp(0.0, 1.0),
+                confidence: (0.25 + 0.25 * timing_support).clamp(0.0, 1.0) * confidence_scale,
                 risk: RiskLevel::Low,
                 affected_assets: Vec::new(),
                 related_patterns: vec![WwmiPatternKind::StartupTimingAdjustment],
@@ -339,7 +356,7 @@ impl FixInferenceEngine {
             suggested_fixes.push(SuggestedFix {
                 code: "review_runtime_init_path".to_string(),
                 summary: "If asset diffs do not explain the crash, review startup/init ordering and runtime guards before patching mappings.".to_string(),
-                confidence: (0.25 + 0.25 * timing_support).clamp(0.0, 1.0),
+                confidence: (0.25 + 0.25 * timing_support).clamp(0.0, 1.0) * confidence_scale,
                 priority: RiskLevel::Low,
                 related_patterns: vec![WwmiPatternKind::StartupTimingAdjustment],
                 actions: vec![
@@ -359,8 +376,18 @@ impl FixInferenceEngine {
         let mut candidate_mapping_hints = compare_report
             .candidate_mapping_changes
             .iter()
-            .map(|candidate| infer_mapping_hint(candidate, mapping_support))
+            .map(|candidate| infer_mapping_hint(candidate, mapping_support, &scope))
             .collect::<Vec<_>>();
+
+        if scope.low_signal_compare {
+            apply_low_signal_inference_guardrails(
+                &mut probable_crash_causes,
+                &mut suggested_fixes,
+                &mut candidate_mapping_hints,
+                &scope,
+            );
+        }
+
         candidate_mapping_hints.sort_by(|left, right| {
             right
                 .confidence
@@ -405,6 +432,7 @@ impl FixInferenceEngine {
                 fix_like_commits: wwmi_knowledge.summary.fix_like_commits,
                 discovered_patterns: wwmi_knowledge.summary.discovered_patterns,
             },
+            scope,
             summary: InferenceSummary {
                 probable_crash_causes: probable_crash_causes.len(),
                 suggested_fixes: suggested_fixes.len(),
@@ -440,10 +468,14 @@ fn is_structural_change(change: &SnapshotAssetChange) -> bool {
 fn infer_mapping_hint(
     candidate: &CandidateMappingChange,
     mapping_support: f32,
+    scope: &InferenceScopeContext,
 ) -> InferredMappingHint {
     let mut confidence = (candidate.confidence * 0.70 + mapping_support * 0.30).clamp(0.0, 1.0);
     if candidate.ambiguous {
         confidence = (confidence - 0.12).clamp(0.0, 1.0);
+    }
+    if scope.low_signal_compare {
+        confidence = (confidence - 0.03).clamp(0.0, 1.0);
     }
 
     let mut reasons = candidate
@@ -454,6 +486,12 @@ fn infer_mapping_hint(
     if candidate.ambiguous {
         reasons.push(
             "compare detected a near-tie runner-up candidate; confidence was penalized to keep this mapping under review".to_string(),
+        );
+    }
+    if scope.low_signal_compare {
+        reasons.push(
+            "snapshot scope is install/package-level or low-coverage; treat remap confidence as low-signal and require conservative review"
+                .to_string(),
         );
     }
 
@@ -476,6 +514,15 @@ fn infer_mapping_hint(
             "mapping hint confidence penalized by 0.120 because the runner-up candidate was too close".to_string(),
         );
     }
+    if scope.low_signal_compare {
+        evidence.extend(
+            scope
+                .notes
+                .iter()
+                .take(3)
+                .map(|note| format!("scope context: {note}")),
+        );
+    }
 
     InferredMappingHint {
         old_asset_path: candidate.old_asset.path.clone(),
@@ -486,6 +533,71 @@ fn infer_mapping_hint(
         confidence_gap: candidate.confidence_gap,
         reasons,
         evidence,
+    }
+}
+
+fn build_inference_scope_context(compare_report: &SnapshotCompareReport) -> InferenceScopeContext {
+    let mut notes = compare_report.scope.notes.clone();
+    if compare_report.scope.low_signal_compare {
+        notes.push(
+            "inference confidence is conservative because compare scope is low-signal for deep character-level analysis"
+                .to_string(),
+        );
+    }
+
+    InferenceScopeContext {
+        low_signal_compare: compare_report.scope.low_signal_compare,
+        old_snapshot_low_signal: compare_report
+            .scope
+            .old_snapshot
+            .low_signal_for_character_analysis,
+        new_snapshot_low_signal: compare_report
+            .scope
+            .new_snapshot
+            .low_signal_for_character_analysis,
+        notes,
+    }
+}
+
+fn apply_low_signal_inference_guardrails(
+    probable_crash_causes: &mut [ProbableCrashCause],
+    suggested_fixes: &mut [SuggestedFix],
+    candidate_mapping_hints: &mut [InferredMappingHint],
+    scope: &InferenceScopeContext,
+) {
+    for cause in probable_crash_causes {
+        cause.reasons.push(
+            "low-signal compare scope limits semantic certainty; confidence should be interpreted conservatively"
+                .to_string(),
+        );
+        cause.evidence.extend(
+            scope
+                .notes
+                .iter()
+                .take(3)
+                .map(|note| format!("scope context: {note}")),
+        );
+    }
+
+    for fix in suggested_fixes {
+        fix.reasons.push(
+            "low-signal compare scope limits semantic certainty; validate fixes manually before applying changes"
+                .to_string(),
+        );
+        fix.evidence.extend(
+            scope
+                .notes
+                .iter()
+                .take(3)
+                .map(|note| format!("scope context: {note}")),
+        );
+    }
+
+    for hint in candidate_mapping_hints {
+        hint.needs_review = true;
+        hint.reasons.push(
+            "low-signal compare scope keeps this mapping hint in review-first mode".to_string(),
+        );
     }
 }
 
@@ -535,7 +647,8 @@ mod tests {
         compare::{
             CandidateMappingChange, RiskLevel, SnapshotAssetChange, SnapshotAssetSummary,
             SnapshotChangeType, SnapshotCompareReason, SnapshotCompareReport,
-            SnapshotCompareSummary, SnapshotVersionInfo,
+            SnapshotCompareScopeContext, SnapshotCompareScopeInfo, SnapshotCompareSummary,
+            SnapshotVersionInfo,
         },
         wwmi::{
             WwmiEvidenceCommit, WwmiFixPattern, WwmiKeywordStat, WwmiKnowledgeBase,
@@ -560,6 +673,7 @@ mod tests {
                 source_root: "new".to_string(),
                 asset_count: 2,
             },
+            scope: SnapshotCompareScopeContext::default(),
             summary: SnapshotCompareSummary {
                 total_old_assets: 2,
                 total_new_assets: 2,
@@ -686,6 +800,150 @@ mod tests {
         assert_eq!(report.candidate_mapping_hints.len(), 1);
         assert!(!report.candidate_mapping_hints[0].ambiguous);
         assert!(report.summary.highest_confidence >= 0.75);
+        assert!(!report.scope.low_signal_compare);
+    }
+
+    #[test]
+    fn inference_adds_low_signal_caution_without_stopping_generation() {
+        let engine = FixInferenceEngine;
+        let mut compare_report = SnapshotCompareReport {
+            schema_version: "whashreonator.snapshot-compare.v1".to_string(),
+            old_snapshot: SnapshotVersionInfo {
+                version_id: "3.0.0".to_string(),
+                source_root: "old".to_string(),
+                asset_count: 1,
+            },
+            new_snapshot: SnapshotVersionInfo {
+                version_id: "3.1.0".to_string(),
+                source_root: "new".to_string(),
+                asset_count: 1,
+            },
+            scope: SnapshotCompareScopeContext {
+                old_snapshot: SnapshotCompareScopeInfo {
+                    capture_mode: Some("local_filesystem_inventory".to_string()),
+                    mostly_install_or_package_level: true,
+                    meaningful_content_coverage: false,
+                    meaningful_character_coverage: false,
+                    content_like_path_count: 1,
+                    character_path_count: 0,
+                    non_content_path_count: 2,
+                    low_signal_for_character_analysis: true,
+                    note: Some("install-level snapshot".to_string()),
+                },
+                new_snapshot: SnapshotCompareScopeInfo {
+                    capture_mode: Some("local_filesystem_inventory".to_string()),
+                    mostly_install_or_package_level: true,
+                    meaningful_content_coverage: false,
+                    meaningful_character_coverage: false,
+                    content_like_path_count: 1,
+                    character_path_count: 0,
+                    non_content_path_count: 3,
+                    low_signal_for_character_analysis: true,
+                    note: Some("install-level snapshot".to_string()),
+                },
+                low_signal_compare: true,
+                notes: vec!["low-signal compare scope".to_string()],
+            },
+            summary: SnapshotCompareSummary {
+                total_old_assets: 1,
+                total_new_assets: 1,
+                unchanged_assets: 0,
+                added_assets: 1,
+                removed_assets: 1,
+                changed_assets: 0,
+                candidate_mapping_changes: 1,
+            },
+            added_assets: Vec::new(),
+            removed_assets: vec![SnapshotAssetChange {
+                change_type: SnapshotChangeType::Removed,
+                old_asset: Some(asset_summary(
+                    "Client/Content/Paks/pakchunk0-WindowsNoEditor.pak",
+                )),
+                new_asset: None,
+                changed_fields: vec!["path_presence".to_string()],
+                probable_impact: RiskLevel::Medium,
+                crash_risk: RiskLevel::Medium,
+                suspected_mapping_change: true,
+                reasons: vec![SnapshotCompareReason {
+                    code: "asset_removed".to_string(),
+                    message: "old path removed".to_string(),
+                }],
+            }],
+            changed_assets: Vec::new(),
+            candidate_mapping_changes: vec![CandidateMappingChange {
+                old_asset: asset_summary("Client/Content/Paks/pakchunk0-WindowsNoEditor.pak"),
+                new_asset: asset_summary("Client/Content/Paks/pakchunk1-WindowsNoEditor.pak"),
+                confidence: 0.90,
+                reasons: vec![SnapshotCompareReason {
+                    code: "same_parent_directory".to_string(),
+                    message: "same folder".to_string(),
+                }],
+                runner_up_confidence: None,
+                confidence_gap: None,
+                ambiguous: false,
+            }],
+        };
+        // Ensure summary counts stay aligned with payload to keep behavior deterministic.
+        compare_report.summary.candidate_mapping_changes =
+            compare_report.candidate_mapping_changes.len();
+        compare_report.summary.removed_assets = compare_report.removed_assets.len();
+
+        let knowledge = WwmiKnowledgeBase {
+            schema_version: "whashreonator.wwmi-knowledge.v1".to_string(),
+            generated_at_unix_ms: 1,
+            repo: WwmiKnowledgeRepoInfo {
+                input: "repo".to_string(),
+                resolved_path: "repo".to_string(),
+                origin_url: None,
+            },
+            summary: WwmiKnowledgeSummary {
+                analyzed_commits: 1,
+                fix_like_commits: 1,
+                discovered_patterns: 1,
+            },
+            patterns: vec![WwmiFixPattern {
+                kind: WwmiPatternKind::MappingOrHashUpdate,
+                description: "mapping".to_string(),
+                frequency: 1,
+                average_fix_likelihood: 0.8,
+                example_commits: vec!["abc".to_string()],
+            }],
+            keyword_stats: vec![WwmiKeywordStat {
+                keyword: "mapping".to_string(),
+                count: 1,
+            }],
+            evidence_commits: vec![WwmiEvidenceCommit {
+                hash: "abc".to_string(),
+                subject: "fix mapping".to_string(),
+                unix_time: 1,
+                decorations: String::new(),
+                commit_url: None,
+                fix_likelihood: 0.8,
+                changed_files: vec!["WWMI/d3dx.ini".to_string()],
+                detected_patterns: vec![WwmiPatternKind::MappingOrHashUpdate],
+                detected_keywords: vec!["mapping".to_string()],
+                reasons: vec!["subject contains fix".to_string()],
+            }],
+        };
+
+        let report = engine.infer(&compare_report, &knowledge);
+
+        assert!(report.scope.low_signal_compare);
+        assert!(
+            report
+                .scope
+                .notes
+                .iter()
+                .any(|note| note.contains("low-signal"))
+        );
+        assert!(!report.candidate_mapping_hints.is_empty());
+        assert!(report.candidate_mapping_hints[0].needs_review);
+        assert!(
+            report.candidate_mapping_hints[0]
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("low-signal"))
+        );
     }
 
     fn asset_summary(path: &str) -> SnapshotAssetSummary {

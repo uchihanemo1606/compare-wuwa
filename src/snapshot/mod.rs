@@ -11,7 +11,7 @@ use crate::{
     domain::{AssetMetadata, AssetRecord},
     error::{AppError, AppResult},
     fingerprint::{AssetFingerprint, DefaultFingerprinter, Fingerprinter},
-    ingest::{AssetListSource, LocalSnapshotIngestSource},
+    ingest::{LocalSnapshotIngestSource, SnapshotAssetExtractor},
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -61,7 +61,46 @@ pub struct SnapshotHashFields {
 pub struct SnapshotContext {
     pub launcher: Option<SnapshotLauncherContext>,
     pub resource_manifest: Option<SnapshotResourceManifestContext>,
+    #[serde(default)]
+    pub scope: SnapshotScopeContext,
     pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct SnapshotScopeContext {
+    pub capture_mode: Option<String>,
+    pub mostly_install_or_package_level: Option<bool>,
+    pub meaningful_content_coverage: Option<bool>,
+    pub meaningful_character_coverage: Option<bool>,
+    pub coverage: SnapshotCoverageSignals,
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct SnapshotCoverageSignals {
+    pub content_like_path_count: usize,
+    pub character_path_count: usize,
+    pub non_content_path_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotScopeAssessment {
+    pub capture_mode: Option<String>,
+    pub mostly_install_or_package_level: bool,
+    pub meaningful_content_coverage: bool,
+    pub meaningful_character_coverage: bool,
+    pub coverage: SnapshotCoverageSignals,
+    pub note: Option<String>,
+    pub observed_fallback_used: bool,
+}
+
+impl SnapshotScopeAssessment {
+    pub fn is_low_signal_for_character_analysis(&self) -> bool {
+        self.mostly_install_or_package_level
+            && !(self.meaningful_content_coverage && self.meaningful_character_coverage)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -90,7 +129,7 @@ pub struct SnapshotBuilder<S, F> {
 
 impl<S, F> SnapshotBuilder<S, F>
 where
-    S: AssetListSource,
+    S: SnapshotAssetExtractor,
     F: Fingerprinter,
 {
     pub fn new(asset_source: S, fingerprinter: F) -> Self {
@@ -107,7 +146,8 @@ where
             ));
         }
 
-        let assets = self.asset_source.load_assets(source_root)?;
+        let extraction_mode = self.asset_source.extraction_mode();
+        let assets = self.asset_source.extract_snapshot_assets(source_root)?;
         let snapshot_assets = assets
             .iter()
             .map(|asset| SnapshotAsset::from_asset(asset, self.fingerprinter.fingerprint(asset)))
@@ -120,16 +160,39 @@ where
             source_root: normalize_source_root(source_root),
             asset_count: snapshot_assets.len(),
             assets: snapshot_assets,
-            context: SnapshotContext::default(),
+            context: SnapshotContext {
+                launcher: None,
+                resource_manifest: None,
+                scope: SnapshotScopeContext {
+                    capture_mode: Some(extraction_mode.capture_mode().to_string()),
+                    ..SnapshotScopeContext::default()
+                },
+                notes: Vec::new(),
+            },
         })
     }
 }
 
-pub fn create_local_snapshot(version_id: &str, source_root: &Path) -> AppResult<GameSnapshot> {
+pub fn create_snapshot_with_extractor<E>(
+    version_id: &str,
+    source_root: &Path,
+    extractor: E,
+) -> AppResult<GameSnapshot>
+where
+    E: SnapshotAssetExtractor,
+{
+    // Extension seam: future asset-level extractors can plug in here without changing
+    // downstream snapshot/compare/inference/proposal/report storage flows.
     let resolved_version_id = resolve_snapshot_version_id(version_id, source_root)?;
-    let mut snapshot = SnapshotBuilder::new(LocalSnapshotIngestSource, DefaultFingerprinter)
-        .build(&resolved_version_id, source_root)?;
+    SnapshotBuilder::new(extractor, DefaultFingerprinter).build(&resolved_version_id, source_root)
+}
+
+pub fn create_local_snapshot(version_id: &str, source_root: &Path) -> AppResult<GameSnapshot> {
+    // Current default path remains install/package-level filesystem inventory.
+    let mut snapshot =
+        create_snapshot_with_extractor(version_id, source_root, LocalSnapshotIngestSource)?;
     enrich_snapshot_from_game_root(&mut snapshot, source_root)?;
+    annotate_local_snapshot_scope(&mut snapshot);
     Ok(snapshot)
 }
 
@@ -237,6 +300,124 @@ fn enrich_snapshot_from_game_root(
 
     snapshot.context.notes = notes;
     Ok(())
+}
+
+const MIN_MEANINGFUL_CONTENT_PATH_COUNT: usize = 10;
+const MIN_MEANINGFUL_CHARACTER_PATH_COUNT: usize = 5;
+
+pub fn assess_snapshot_scope(snapshot: &GameSnapshot) -> SnapshotScopeAssessment {
+    let scope = &snapshot.context.scope;
+    let has_explicit_scope_flags = scope.mostly_install_or_package_level.is_some()
+        || scope.meaningful_content_coverage.is_some()
+        || scope.meaningful_character_coverage.is_some();
+    let mut coverage = scope.coverage.clone();
+    let mut observed_fallback_used = false;
+
+    if !has_explicit_scope_flags
+        && coverage.content_like_path_count == 0
+        && coverage.character_path_count == 0
+        && coverage.non_content_path_count == 0
+        && snapshot.asset_count > 0
+    {
+        coverage = compute_scope_coverage(snapshot);
+        observed_fallback_used = true;
+    }
+
+    let meaningful_content_coverage = scope
+        .meaningful_content_coverage
+        .unwrap_or(coverage.content_like_path_count >= MIN_MEANINGFUL_CONTENT_PATH_COUNT);
+    let meaningful_character_coverage = scope
+        .meaningful_character_coverage
+        .unwrap_or(coverage.character_path_count >= MIN_MEANINGFUL_CHARACTER_PATH_COUNT);
+    let mostly_install_or_package_level = scope
+        .mostly_install_or_package_level
+        .unwrap_or(!(meaningful_content_coverage && meaningful_character_coverage));
+
+    SnapshotScopeAssessment {
+        capture_mode: scope.capture_mode.clone(),
+        mostly_install_or_package_level,
+        meaningful_content_coverage,
+        meaningful_character_coverage,
+        coverage,
+        note: scope.note.clone(),
+        observed_fallback_used,
+    }
+}
+
+fn annotate_local_snapshot_scope(snapshot: &mut GameSnapshot) {
+    let coverage = compute_scope_coverage(snapshot);
+    let meaningful_content_coverage =
+        coverage.content_like_path_count >= MIN_MEANINGFUL_CONTENT_PATH_COUNT;
+    let meaningful_character_coverage =
+        coverage.character_path_count >= MIN_MEANINGFUL_CHARACTER_PATH_COUNT;
+    let mostly_install_or_package_level =
+        !(meaningful_content_coverage && meaningful_character_coverage);
+
+    let note = if mostly_install_or_package_level {
+        format!(
+            "local snapshot looks mostly install/package-level (content-like paths: {}, character-like paths: {}, non-content paths: {})",
+            coverage.content_like_path_count,
+            coverage.character_path_count,
+            coverage.non_content_path_count
+        )
+    } else {
+        format!(
+            "local snapshot has stronger content/character path signals (content-like paths: {}, character-like paths: {}, non-content paths: {}), but remains path-level inventory",
+            coverage.content_like_path_count,
+            coverage.character_path_count,
+            coverage.non_content_path_count
+        )
+    };
+
+    snapshot.context.scope = SnapshotScopeContext {
+        capture_mode: Some("local_filesystem_inventory".to_string()),
+        mostly_install_or_package_level: Some(mostly_install_or_package_level),
+        meaningful_content_coverage: Some(meaningful_content_coverage),
+        meaningful_character_coverage: Some(meaningful_character_coverage),
+        coverage,
+        note: Some(note.clone()),
+    };
+    snapshot.context.notes.push(note);
+}
+
+fn compute_scope_coverage(snapshot: &GameSnapshot) -> SnapshotCoverageSignals {
+    let content_like_path_count = snapshot
+        .assets
+        .iter()
+        .filter(|asset| is_content_like_path(&asset.path))
+        .count();
+    let character_path_count = snapshot
+        .assets
+        .iter()
+        .filter(|asset| is_character_like_path(&asset.path))
+        .count();
+
+    SnapshotCoverageSignals {
+        content_like_path_count,
+        character_path_count,
+        non_content_path_count: snapshot.asset_count.saturating_sub(content_like_path_count),
+    }
+}
+
+fn is_content_like_path(path: &str) -> bool {
+    path.replace('\\', "/")
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .any(|segment| segment.eq_ignore_ascii_case("content"))
+}
+
+fn is_character_like_path(path: &str) -> bool {
+    let normalized = path.replace('\\', "/");
+    let segments = normalized
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+
+    segments.windows(3).any(|window| {
+        window[0].eq_ignore_ascii_case("content")
+            && window[1].eq_ignore_ascii_case("character")
+            && !window[2].is_empty()
+    })
 }
 
 fn load_launcher_context(source_root: &Path) -> AppResult<Option<SnapshotLauncherContext>> {
@@ -354,7 +535,13 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::create_local_snapshot;
+    use crate::ingest::PreparedSnapshotAssetExtractor;
+
+    use super::{
+        GameSnapshot, SnapshotAsset, SnapshotContext, SnapshotFingerprint, SnapshotHashFields,
+        SnapshotScopeContext, assess_snapshot_scope, create_local_snapshot,
+        create_snapshot_with_extractor, load_snapshot,
+    };
 
     #[test]
     fn creates_snapshot_from_local_root() {
@@ -373,6 +560,35 @@ mod tests {
         );
         assert!(snapshot.context.launcher.is_none());
         assert!(snapshot.context.resource_manifest.is_none());
+        assert_eq!(
+            snapshot.context.scope.capture_mode.as_deref(),
+            Some("local_filesystem_inventory")
+        );
+        assert_eq!(
+            snapshot.context.scope.coverage.content_like_path_count,
+            snapshot.asset_count
+        );
+        assert_eq!(snapshot.context.scope.coverage.character_path_count, 1);
+        assert_eq!(snapshot.context.scope.coverage.non_content_path_count, 0);
+        assert_eq!(
+            snapshot.context.scope.mostly_install_or_package_level,
+            Some(true)
+        );
+        assert_eq!(
+            snapshot.context.scope.meaningful_content_coverage,
+            Some(false)
+        );
+        assert_eq!(
+            snapshot.context.scope.meaningful_character_coverage,
+            Some(false)
+        );
+        assert!(
+            snapshot
+                .context
+                .notes
+                .iter()
+                .any(|note| note.contains("install/package-level"))
+        );
 
         let _ = fs::remove_dir_all(&test_root);
     }
@@ -419,8 +635,136 @@ mod tests {
         assert!(snapshot.assets.iter().any(|asset| asset.path
             == "Client/Content/Paks/pakchunk0-WindowsNoEditor.pak"
             && asset.hash_fields.asset_hash.as_deref() == Some("abc123")));
+        assert_eq!(
+            snapshot.context.scope.capture_mode.as_deref(),
+            Some("local_filesystem_inventory")
+        );
+        assert_eq!(snapshot.context.scope.coverage.content_like_path_count, 1);
+        assert_eq!(snapshot.context.scope.coverage.character_path_count, 0);
+        assert_eq!(snapshot.context.scope.coverage.non_content_path_count, 3);
+        assert_eq!(
+            snapshot.context.scope.mostly_install_or_package_level,
+            Some(true)
+        );
 
         let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[test]
+    fn create_snapshot_with_extractor_accepts_prepared_extension_point() {
+        let test_root = unique_test_dir();
+        fs::create_dir_all(&test_root).expect("create test root");
+        let extractor = PreparedSnapshotAssetExtractor::new(vec![crate::domain::AssetRecord {
+            id: "asset-1".to_string(),
+            path: "Content/Character/Encore/Body.mesh".to_string(),
+            kind: Some("mesh".to_string()),
+            metadata: crate::domain::AssetMetadata::default(),
+        }])
+        .expect("build prepared extractor");
+
+        let snapshot =
+            create_snapshot_with_extractor("2.4.0", &test_root, extractor).expect("snapshot");
+
+        assert_eq!(snapshot.version_id, "2.4.0");
+        assert_eq!(snapshot.asset_count, 1);
+        assert_eq!(
+            snapshot.context.scope.capture_mode.as_deref(),
+            Some("prepared_asset_list_inventory")
+        );
+        assert!(
+            snapshot
+                .context
+                .scope
+                .mostly_install_or_package_level
+                .is_none()
+        );
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[test]
+    fn load_snapshot_defaults_scope_context_for_legacy_json() {
+        let test_root = unique_test_dir();
+        fs::create_dir_all(&test_root).expect("create test root");
+        let snapshot_path = test_root.join("legacy.json");
+        fs::write(
+            &snapshot_path,
+            r#"{
+                "schema_version":"whashreonator.snapshot.v1",
+                "version_id":"2.4.0",
+                "created_at_unix_ms":1,
+                "source_root":"legacy",
+                "asset_count":0,
+                "assets":[],
+                "context":{"notes":["legacy note"]}
+            }"#,
+        )
+        .expect("write legacy snapshot");
+
+        let snapshot = load_snapshot(&snapshot_path).expect("load legacy snapshot");
+
+        assert_eq!(snapshot.context.notes, vec!["legacy note".to_string()]);
+        assert_eq!(snapshot.context.scope, SnapshotScopeContext::default());
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[test]
+    fn assess_scope_falls_back_to_observed_paths_for_legacy_snapshot() {
+        let snapshot = GameSnapshot {
+            schema_version: "whashreonator.snapshot.v1".to_string(),
+            version_id: "legacy".to_string(),
+            created_at_unix_ms: 1,
+            source_root: "legacy".to_string(),
+            asset_count: 2,
+            assets: vec![
+                SnapshotAsset {
+                    id: "a".to_string(),
+                    path: "Content/Character/Encore/Body.mesh".to_string(),
+                    kind: Some("mesh".to_string()),
+                    metadata: crate::domain::AssetMetadata::default(),
+                    fingerprint: SnapshotFingerprint {
+                        normalized_kind: None,
+                        normalized_name: None,
+                        name_tokens: Vec::new(),
+                        path_tokens: Vec::new(),
+                        tags: Vec::new(),
+                        vertex_count: None,
+                        index_count: None,
+                        material_slots: None,
+                        section_count: None,
+                    },
+                    hash_fields: SnapshotHashFields::default(),
+                },
+                SnapshotAsset {
+                    id: "b".to_string(),
+                    path: "Client/Config/DefaultGame.ini".to_string(),
+                    kind: Some("ini".to_string()),
+                    metadata: crate::domain::AssetMetadata::default(),
+                    fingerprint: SnapshotFingerprint {
+                        normalized_kind: None,
+                        normalized_name: None,
+                        name_tokens: Vec::new(),
+                        path_tokens: Vec::new(),
+                        tags: Vec::new(),
+                        vertex_count: None,
+                        index_count: None,
+                        material_slots: None,
+                        section_count: None,
+                    },
+                    hash_fields: SnapshotHashFields::default(),
+                },
+            ],
+            context: SnapshotContext::default(),
+        };
+
+        let scope = assess_snapshot_scope(&snapshot);
+
+        assert!(scope.observed_fallback_used);
+        assert_eq!(scope.coverage.content_like_path_count, 1);
+        assert_eq!(scope.coverage.character_path_count, 1);
+        assert_eq!(scope.coverage.non_content_path_count, 1);
+        assert!(scope.is_low_signal_for_character_analysis());
     }
 
     fn seed_local_asset(root: &Path, relative_path: &str) {

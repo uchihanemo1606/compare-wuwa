@@ -16,11 +16,54 @@ pub trait AssetListSource {
     fn load_assets(&self, path: &Path) -> AppResult<Vec<AssetRecord>>;
 }
 
+/// Extraction strategy used when building snapshots from a local source root.
+///
+/// This is intentionally narrow: today we only support install/package-level filesystem
+/// inventory, but the trait provides a concrete seam for future asset-level extractors.
+pub trait SnapshotAssetExtractor {
+    fn extraction_mode(&self) -> SnapshotExtractionMode;
+    fn extract_snapshot_assets(&self, path: &Path) -> AppResult<Vec<AssetRecord>>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotExtractionMode {
+    /// Current default implementation: recursive local filesystem inventory.
+    InstallFilesystemInventory,
+    /// Hook for tests or future adapter-based ingestion of already prepared assets.
+    PreparedAssetList,
+    /// Future extension point; proprietary format parsing is intentionally not implemented yet.
+    AssetLevelExtractorPlaceholder,
+}
+
+impl SnapshotExtractionMode {
+    pub fn capture_mode(self) -> &'static str {
+        match self {
+            SnapshotExtractionMode::InstallFilesystemInventory => "local_filesystem_inventory",
+            SnapshotExtractionMode::PreparedAssetList => "prepared_asset_list_inventory",
+            SnapshotExtractionMode::AssetLevelExtractorPlaceholder => {
+                "asset_level_extractor_placeholder"
+            }
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct JsonFileIngestSource;
 
+/// Default snapshot extraction strategy used by current CLI/GUI flows.
+///
+/// This scanner collects install/package-level inventory from local paths. It does not parse
+/// proprietary containers (for example `.pak`) into semantic asset-level records.
 #[derive(Debug, Default, Clone)]
 pub struct LocalSnapshotIngestSource;
+
+#[derive(Debug, Clone)]
+pub struct PreparedSnapshotAssetExtractor {
+    assets: Vec<AssetRecord>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct AssetLevelSnapshotExtractorPlaceholder;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BundleAssetSide {
@@ -47,9 +90,52 @@ impl IngestSource for JsonFileIngestSource {
     }
 }
 
-impl AssetListSource for LocalSnapshotIngestSource {
-    fn load_assets(&self, path: &Path) -> AppResult<Vec<AssetRecord>> {
+impl SnapshotAssetExtractor for LocalSnapshotIngestSource {
+    fn extraction_mode(&self) -> SnapshotExtractionMode {
+        SnapshotExtractionMode::InstallFilesystemInventory
+    }
+
+    fn extract_snapshot_assets(&self, path: &Path) -> AppResult<Vec<AssetRecord>> {
         scan_local_assets(path)
+    }
+}
+
+impl PreparedSnapshotAssetExtractor {
+    pub fn new(assets: Vec<AssetRecord>) -> AppResult<Self> {
+        validate_assets("prepared_assets", &assets)?;
+        Ok(Self { assets })
+    }
+}
+
+impl SnapshotAssetExtractor for PreparedSnapshotAssetExtractor {
+    fn extraction_mode(&self) -> SnapshotExtractionMode {
+        SnapshotExtractionMode::PreparedAssetList
+    }
+
+    fn extract_snapshot_assets(&self, _path: &Path) -> AppResult<Vec<AssetRecord>> {
+        Ok(self.assets.clone())
+    }
+}
+
+impl SnapshotAssetExtractor for AssetLevelSnapshotExtractorPlaceholder {
+    fn extraction_mode(&self) -> SnapshotExtractionMode {
+        SnapshotExtractionMode::AssetLevelExtractorPlaceholder
+    }
+
+    fn extract_snapshot_assets(&self, path: &Path) -> AppResult<Vec<AssetRecord>> {
+        Err(AppError::InvalidInput(format!(
+            "asset-level extraction is not implemented yet for {}; keep using install-level inventory extraction until a real parser is integrated",
+            path.display()
+        )))
+    }
+}
+
+impl<T> AssetListSource for T
+where
+    T: SnapshotAssetExtractor,
+{
+    fn load_assets(&self, path: &Path) -> AppResult<Vec<AssetRecord>> {
+        self.extract_snapshot_assets(path)
     }
 }
 
@@ -212,7 +298,10 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::scan_local_assets;
+    use super::{
+        AssetLevelSnapshotExtractorPlaceholder, AssetListSource, PreparedSnapshotAssetExtractor,
+        scan_local_assets,
+    };
 
     #[test]
     fn local_scan_skips_runtime_and_cache_directories() {
@@ -237,6 +326,37 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[test]
+    fn prepared_snapshot_asset_extractor_returns_seeded_assets() {
+        let extractor = PreparedSnapshotAssetExtractor::new(vec![crate::domain::AssetRecord {
+            id: "asset-1".to_string(),
+            path: "Content/Character/Encore/Body.mesh".to_string(),
+            kind: Some("mesh".to_string()),
+            metadata: crate::domain::AssetMetadata::default(),
+        }])
+        .expect("build prepared extractor");
+
+        let loaded = extractor
+            .load_assets(Path::new("ignored"))
+            .expect("load prepared assets");
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].path, "Content/Character/Encore/Body.mesh");
+    }
+
+    #[test]
+    fn asset_level_placeholder_is_explicitly_not_implemented() {
+        let error = AssetLevelSnapshotExtractorPlaceholder
+            .load_assets(Path::new("D:/fake-game"))
+            .expect_err("placeholder should not parse proprietary containers yet");
+
+        assert!(
+            error
+                .to_string()
+                .contains("asset-level extraction is not implemented yet")
+        );
     }
 
     fn seed_file(root: &Path, relative_path: &str) {

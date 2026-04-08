@@ -101,6 +101,7 @@ impl ProposalEngine {
     pub fn generate(&self, report: &InferenceReport, min_confidence: f32) -> ProposalArtifacts {
         let generated_at_unix_ms = current_unix_ms().unwrap_or(report.generated_at_unix_ms);
         let blocked_paths = structurally_blocked_paths(report);
+        let low_signal_compare = report.scope.low_signal_compare;
         let remap_fix_available = report
             .suggested_fixes
             .iter()
@@ -116,7 +117,13 @@ impl ProposalEngine {
             .map(|hint| {
                 let blocked = blocked_paths.contains(&hint.old_asset_path)
                     || blocked_paths.contains(&hint.new_asset_path);
-                let status = if !blocked && !hint.ambiguous && hint.confidence >= min_confidence {
+                let strong_low_signal_justification =
+                    has_strong_low_signal_justification(hint, min_confidence, blocked);
+                let status = if !blocked
+                    && !hint.ambiguous
+                    && hint.confidence >= min_confidence
+                    && (!low_signal_compare || strong_low_signal_justification)
+                {
                     ProposalStatus::Proposed
                 } else {
                     ProposalStatus::NeedsReview
@@ -142,6 +149,19 @@ impl ProposalEngine {
                         hint.confidence, min_confidence
                     ));
                 }
+                if low_signal_compare {
+                    if status == ProposalStatus::NeedsReview {
+                        reasons.push(
+                            "compare scope is low-signal; defaulting this mapping to NeedsReview unless evidence is exceptionally strong"
+                                .to_string(),
+                        );
+                    } else {
+                        reasons.push(
+                            "compare scope is low-signal, but this mapping passed elevated strong-evidence checks"
+                                .to_string(),
+                        );
+                    }
+                }
 
                 let mut evidence = hint.evidence.clone();
                 if blocked {
@@ -155,6 +175,16 @@ impl ProposalEngine {
                             .map(|gap| format!("{gap:.3}"))
                             .unwrap_or_else(|| "unknown".to_string())
                     ));
+                }
+                if low_signal_compare {
+                    evidence.extend(
+                        report
+                            .scope
+                            .notes
+                            .iter()
+                            .take(3)
+                            .map(|note| format!("scope context: {note}")),
+                    );
                 }
 
                 let mut related_fix_codes = Vec::new();
@@ -311,6 +341,35 @@ fn blocking_evidence(
         .collect()
 }
 
+fn has_strong_low_signal_justification(
+    hint: &crate::inference::InferredMappingHint,
+    min_confidence: f32,
+    blocked: bool,
+) -> bool {
+    if blocked || hint.ambiguous {
+        return false;
+    }
+
+    let strong_confidence_threshold = (min_confidence + 0.03).max(0.90).clamp(0.0, 1.0);
+    if hint.confidence < strong_confidence_threshold {
+        return false;
+    }
+
+    if hint.confidence_gap.is_some_and(|gap| gap < 0.12) {
+        return false;
+    }
+
+    has_reason_code(&hint.reasons, "normalized_name_exact")
+        && has_reason_code(&hint.reasons, "same_parent_directory")
+}
+
+fn has_reason_code(reasons: &[String], code: &str) -> bool {
+    let prefix = format!("{code}:");
+    reasons
+        .iter()
+        .any(|reason| reason.trim() == code || reason.trim_start().starts_with(&prefix))
+}
+
 fn current_unix_ms() -> AppResult<u128> {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -323,8 +382,8 @@ mod tests {
     use crate::{
         compare::RiskLevel,
         inference::{
-            InferenceCompareInput, InferenceKnowledgeInput, InferenceReport, InferenceSummary,
-            InferredMappingHint, ProbableCrashCause, SuggestedFix,
+            InferenceCompareInput, InferenceKnowledgeInput, InferenceReport, InferenceScopeContext,
+            InferenceSummary, InferredMappingHint, ProbableCrashCause, SuggestedFix,
         },
         wwmi::WwmiPatternKind,
     };
@@ -350,6 +409,7 @@ mod tests {
                 fix_like_commits: 5,
                 discovered_patterns: 3,
             },
+            scope: InferenceScopeContext::default(),
             summary: InferenceSummary {
                 probable_crash_causes: 1,
                 suggested_fixes: 2,
@@ -438,5 +498,102 @@ mod tests {
                 .iter()
                 .any(|action| action.action == "review_fix")
         );
+    }
+
+    #[test]
+    fn proposal_engine_defaults_low_signal_hints_to_review_unless_strong() {
+        let report = InferenceReport {
+            schema_version: "whashreonator.inference.v1".to_string(),
+            generated_at_unix_ms: 1,
+            compare_input: InferenceCompareInput {
+                old_version_id: "3.0.0".to_string(),
+                new_version_id: "3.1.0".to_string(),
+                changed_assets: 0,
+                added_assets: 1,
+                removed_assets: 1,
+                candidate_mapping_changes: 2,
+            },
+            knowledge_input: InferenceKnowledgeInput {
+                repo: "repo".to_string(),
+                analyzed_commits: 3,
+                fix_like_commits: 1,
+                discovered_patterns: 1,
+            },
+            scope: InferenceScopeContext {
+                low_signal_compare: true,
+                old_snapshot_low_signal: true,
+                new_snapshot_low_signal: true,
+                notes: vec!["install/package-level scope".to_string()],
+            },
+            summary: InferenceSummary {
+                probable_crash_causes: 0,
+                suggested_fixes: 1,
+                candidate_mapping_hints: 2,
+                highest_confidence: 0.96,
+            },
+            probable_crash_causes: Vec::new(),
+            suggested_fixes: vec![SuggestedFix {
+                code: "review_candidate_asset_remaps".to_string(),
+                summary: "review remaps".to_string(),
+                confidence: 0.70,
+                priority: RiskLevel::Medium,
+                related_patterns: vec![WwmiPatternKind::MappingOrHashUpdate],
+                actions: vec!["inspect hints".to_string()],
+                reasons: vec!["low-signal scope".to_string()],
+                evidence: vec!["scope context".to_string()],
+            }],
+            candidate_mapping_hints: vec![
+                InferredMappingHint {
+                    old_asset_path: "Client/Content/Paks/pakchunk0-WindowsNoEditor.pak".to_string(),
+                    new_asset_path: "Client/Content/Paks/pakchunk1-WindowsNoEditor.pak".to_string(),
+                    confidence: 0.93,
+                    needs_review: true,
+                    ambiguous: false,
+                    confidence_gap: Some(0.20),
+                    reasons: vec![
+                        "same_parent_directory: same folder".to_string(),
+                        "path_token_overlap: overlap".to_string(),
+                    ],
+                    evidence: vec!["compare candidate confidence 0.930".to_string()],
+                },
+                InferredMappingHint {
+                    old_asset_path: "Content/Character/Encore/Hair.mesh".to_string(),
+                    new_asset_path: "Content/Character/Encore/Hair_LOD0.mesh".to_string(),
+                    confidence: 0.96,
+                    needs_review: true,
+                    ambiguous: false,
+                    confidence_gap: Some(0.25),
+                    reasons: vec![
+                        "normalized_name_exact: encore hair".to_string(),
+                        "same_parent_directory: same folder".to_string(),
+                    ],
+                    evidence: vec!["compare candidate confidence 0.960".to_string()],
+                },
+            ],
+        };
+
+        let artifacts = ProposalEngine.generate(&report, 0.90);
+
+        let install_mapping = artifacts
+            .mapping_proposal
+            .mappings
+            .iter()
+            .find(|entry| entry.old_asset_path.contains("pakchunk0"))
+            .expect("install mapping");
+        assert_eq!(install_mapping.status, ProposalStatus::NeedsReview);
+        assert!(
+            install_mapping
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("low-signal"))
+        );
+
+        let strong_mapping = artifacts
+            .mapping_proposal
+            .mappings
+            .iter()
+            .find(|entry| entry.old_asset_path.contains("Hair.mesh"))
+            .expect("strong mapping");
+        assert_eq!(strong_mapping.status, ProposalStatus::Proposed);
     }
 }

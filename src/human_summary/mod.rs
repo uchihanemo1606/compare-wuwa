@@ -238,8 +238,8 @@ mod tests {
     use crate::{
         compare::RiskLevel,
         inference::{
-            InferenceCompareInput, InferenceKnowledgeInput, InferenceReport, InferenceSummary,
-            InferredMappingHint, ProbableCrashCause, SuggestedFix,
+            InferenceCompareInput, InferenceKnowledgeInput, InferenceReport, InferenceScopeContext,
+            InferenceSummary, InferredMappingHint, ProbableCrashCause, SuggestedFix,
         },
         proposal::{ProposalArtifacts, ProposalEngine},
         wwmi::WwmiPatternKind,
@@ -266,6 +266,7 @@ mod tests {
                 fix_like_commits: 6,
                 discovered_patterns: 3,
             },
+            scope: InferenceScopeContext::default(),
             summary: InferenceSummary {
                 probable_crash_causes: 2,
                 suggested_fixes: 2,

@@ -8,8 +8,8 @@ use whashreonator::{
     cli::InferFixesArgs,
     compare::{
         CandidateMappingChange, RiskLevel, SnapshotAssetChange, SnapshotAssetSummary,
-        SnapshotChangeType, SnapshotCompareReason, SnapshotCompareReport, SnapshotCompareSummary,
-        SnapshotVersionInfo,
+        SnapshotChangeType, SnapshotCompareReason, SnapshotCompareReport,
+        SnapshotCompareScopeContext, SnapshotCompareSummary, SnapshotVersionInfo,
     },
     inference::InferenceReport,
     pipeline::run_infer_fixes_command,
@@ -63,6 +63,7 @@ fn infer_fixes_command_exports_crash_causes_and_suggested_fixes() {
             .any(|fix| fix.code == "review_candidate_asset_remaps")
     );
     assert_eq!(parsed.candidate_mapping_hints.len(), 1);
+    assert!(!parsed.scope.low_signal_compare);
 
     let _ = fs::remove_dir_all(&test_root);
 }
@@ -80,6 +81,7 @@ fn sample_compare_report() -> SnapshotCompareReport {
             source_root: "new".to_string(),
             asset_count: 2,
         },
+        scope: SnapshotCompareScopeContext::default(),
         summary: SnapshotCompareSummary {
             total_old_assets: 2,
             total_new_assets: 2,

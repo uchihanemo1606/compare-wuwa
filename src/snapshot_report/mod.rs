@@ -6,7 +6,7 @@ use std::{
 use crate::{
     compare::{CandidateMappingChange, SnapshotComparer},
     error::{AppError, AppResult},
-    snapshot::{GameSnapshot, load_snapshot},
+    snapshot::{GameSnapshot, SnapshotScopeAssessment, assess_snapshot_scope, load_snapshot},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,11 +32,20 @@ impl SnapshotReportRenderer {
             .iter()
             .map(snapshot_resonator_counts)
             .collect::<Vec<_>>();
+        let scope_assessments = snapshots
+            .iter()
+            .map(assess_snapshot_scope)
+            .collect::<Vec<_>>();
         let all_resonators = resonator_counts
             .iter()
             .flat_map(|counts| counts.keys().cloned())
             .collect::<BTreeSet<_>>();
-        let markdown = render_markdown(snapshots, &resonator_counts, &all_resonators);
+        let markdown = render_markdown(
+            snapshots,
+            &resonator_counts,
+            &all_resonators,
+            &scope_assessments,
+        );
 
         Ok(SnapshotInventoryReport {
             markdown,
@@ -64,6 +73,7 @@ fn render_markdown(
     snapshots: &[GameSnapshot],
     resonator_counts: &[BTreeMap<String, usize>],
     all_resonators: &BTreeSet<String>,
+    scope_assessments: &[SnapshotScopeAssessment],
 ) -> String {
     let mut lines = Vec::new();
     lines.push("# Snapshot Report".to_string());
@@ -102,12 +112,75 @@ fn render_markdown(
     }
     lines.push(String::new());
 
-    lines.push("## Resonator Matrix".to_string());
-    if all_resonators.is_empty() {
+    lines.push("## Scope & Coverage".to_string());
+    lines.push(
+        "| Version | Capture Mode | Scope | Content-like Paths | Character-like Paths | Non-content Paths | Note |"
+            .to_string(),
+    );
+    lines.push("| --- | --- | --- | ---: | ---: | ---: | --- |".to_string());
+    for (snapshot, scope) in snapshots.iter().zip(scope_assessments.iter()) {
+        lines.push(format!(
+            "| {} | {} | {} | {} | {} | {} | {} |",
+            md_cell(&snapshot.version_id),
+            md_cell(scope.capture_mode.as_deref().unwrap_or("-")),
+            scope_label(scope),
+            scope.coverage.content_like_path_count,
+            scope.coverage.character_path_count,
+            scope.coverage.non_content_path_count,
+            md_cell(&scope_note(scope))
+        ));
+    }
+    lines.push(String::new());
+
+    lines.push("## Analysis Limitations".to_string());
+    let mut low_signal_lines = Vec::new();
+    for (snapshot, scope) in snapshots.iter().zip(scope_assessments.iter()) {
+        if scope.is_low_signal_for_character_analysis() {
+            low_signal_lines.push(format!(
+                "- {}: install/package-level or low-coverage snapshot; resonator-level and mapping-level interpretation can be incomplete.",
+                snapshot.version_id
+            ));
+        }
+    }
+    if low_signal_lines.is_empty() {
         lines.push(
-            "No `Content/Character/<Name>/...` assets were found in the provided snapshots."
+            "Scope metadata indicates character/content coverage is present for the analyzed snapshots."
                 .to_string(),
         );
+    } else {
+        lines.push(
+            "The following snapshots are low-signal for deep character/resonator analysis:"
+                .to_string(),
+        );
+        lines.extend(low_signal_lines);
+    }
+    lines.push(String::new());
+
+    lines.push("## Resonator Matrix".to_string());
+    if scope_assessments
+        .iter()
+        .any(SnapshotScopeAssessment::is_low_signal_for_character_analysis)
+    {
+        lines.push(
+            "Resonator matrix is still shown, but low-signal snapshots should be treated as inventory-level hints."
+                .to_string(),
+        );
+    }
+    if all_resonators.is_empty() {
+        if scope_assessments
+            .iter()
+            .all(SnapshotScopeAssessment::is_low_signal_for_character_analysis)
+        {
+            lines.push(
+                "No `Content/Character/<Name>/...` assets were found, and scope metadata indicates install/package-level coverage for this snapshot set."
+                    .to_string(),
+            );
+        } else {
+            lines.push(
+                "No `Content/Character/<Name>/...` assets were found in the provided snapshots."
+                    .to_string(),
+            );
+        }
     } else {
         let mut header = vec!["Resonator".to_string()];
         header.extend(snapshots.iter().map(|snapshot| snapshot.version_id.clone()));
@@ -136,14 +209,13 @@ fn render_markdown(
         return lines.join("\n");
     }
 
-    for ((old_snapshot, old_counts), (new_snapshot, new_counts)) in
-        snapshots.iter().zip(resonator_counts.iter()).zip(
-            snapshots
-                .iter()
-                .skip(1)
-                .zip(resonator_counts.iter().skip(1)),
-        )
-    {
+    for index in 1..snapshots.len() {
+        let old_snapshot = &snapshots[index - 1];
+        let new_snapshot = &snapshots[index];
+        let old_counts = &resonator_counts[index - 1];
+        let new_counts = &resonator_counts[index];
+        let old_scope = &scope_assessments[index - 1];
+        let new_scope = &scope_assessments[index];
         let compare_report = SnapshotComparer.compare(old_snapshot, new_snapshot);
         let added_resonators = new_counts
             .keys()
@@ -162,6 +234,14 @@ fn render_markdown(
             "### {} -> {}",
             old_snapshot.version_id, new_snapshot.version_id
         ));
+        if old_scope.is_low_signal_for_character_analysis()
+            || new_scope.is_low_signal_for_character_analysis()
+        {
+            lines.push(
+                "Scope note: this pair includes install/package-level or low-coverage snapshots, so resonator-level and candidate-remap signals are limited."
+                    .to_string(),
+            );
+        }
         lines.push("| Metric | Value |".to_string());
         lines.push("| --- | --- |".to_string());
         lines.push(format!(
@@ -256,6 +336,28 @@ fn render_markdown(
     }
 
     lines.join("\n")
+}
+
+fn scope_label(scope: &SnapshotScopeAssessment) -> &'static str {
+    if scope.mostly_install_or_package_level {
+        "mostly install/package-level"
+    } else if scope.meaningful_content_coverage && scope.meaningful_character_coverage {
+        "content/character-oriented inventory"
+    } else {
+        "mixed or partial coverage"
+    }
+}
+
+fn scope_note(scope: &SnapshotScopeAssessment) -> String {
+    if let Some(note) = scope.note.as_deref() {
+        return note.to_string();
+    }
+
+    if scope.observed_fallback_used {
+        return "scope metadata missing; inferred from observed paths".to_string();
+    }
+
+    "-".to_string()
 }
 
 fn snapshot_resonator_counts(snapshot: &GameSnapshot) -> BTreeMap<String, usize> {
@@ -384,8 +486,8 @@ fn md_cell(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use crate::snapshot::{
-        GameSnapshot, SnapshotAsset, SnapshotContext, SnapshotFingerprint, SnapshotHashFields,
-        SnapshotLauncherContext,
+        GameSnapshot, SnapshotAsset, SnapshotContext, SnapshotCoverageSignals, SnapshotFingerprint,
+        SnapshotHashFields, SnapshotLauncherContext, SnapshotScopeContext,
     };
 
     use super::{SnapshotReportRenderer, infer_resonator_name};
@@ -420,14 +522,86 @@ mod tests {
         assert_eq!(report.resonator_count, 2);
         assert_eq!(report.pair_count, 1);
         assert!(report.markdown.contains("## Version Summary"));
+        assert!(report.markdown.contains("## Scope & Coverage"));
+        assert!(report.markdown.contains("## Analysis Limitations"));
         assert!(report.markdown.contains("| 2.4.0 | 2.3.0 |"));
         assert!(report.markdown.contains("## Resonator Matrix"));
         assert!(report.markdown.contains("| Encore | 2 | 2 |"));
         assert!(report.markdown.contains("| Camellya | - | 1 |"));
         assert!(report.markdown.contains("### 2.4.0 -> 2.5.0"));
+        assert!(report.markdown.contains("Scope note: this pair includes"));
         assert!(report.markdown.contains("| Added resonators | Camellya |"));
         assert!(report.markdown.contains("#### Candidate Remaps"));
         assert!(report.markdown.contains("Hair.mesh"));
+    }
+
+    #[test]
+    fn renderer_marks_install_level_snapshots_as_low_signal() {
+        let old_snapshot = sample_snapshot_with_scope(
+            "3.0.0",
+            None,
+            vec![asset(
+                "Client/Content/Paks/pakchunk0-WindowsNoEditor.pak",
+                "pak",
+            )],
+            install_level_scope("local install-level inventory", 1, 0, 2),
+        );
+        let new_snapshot = sample_snapshot_with_scope(
+            "3.1.0",
+            None,
+            vec![asset(
+                "Client/Content/Paks/pakchunk1-WindowsNoEditor.pak",
+                "pak",
+            )],
+            install_level_scope("local install-level inventory", 1, 0, 3),
+        );
+
+        let report = SnapshotReportRenderer
+            .render(&[old_snapshot, new_snapshot])
+            .expect("render report");
+
+        assert!(report.markdown.contains("## Version Summary"));
+        assert!(report.markdown.contains("## Analysis Limitations"));
+        assert!(report.markdown.contains(
+            "install/package-level or low-coverage snapshot; resonator-level and mapping-level interpretation can be incomplete."
+        ));
+        assert!(report.markdown.contains(
+            "Resonator matrix is still shown, but low-signal snapshots should be treated as inventory-level hints."
+        ));
+    }
+
+    #[test]
+    fn renderer_keeps_resonator_sections_for_meaningful_scope_snapshots() {
+        let old_snapshot = sample_snapshot_with_scope(
+            "4.0.0",
+            None,
+            vec![
+                asset("Content/Character/Encore/Body.mesh", "encore body"),
+                asset("Content/Character/Encore/Hair.mesh", "encore hair"),
+            ],
+            meaningful_scope("local asset-level inventory", 12, 6, 1),
+        );
+        let new_snapshot = sample_snapshot_with_scope(
+            "4.1.0",
+            None,
+            vec![
+                asset("Content/Character/Encore/Body.mesh", "encore body"),
+                asset("Content/Character/Camellya/Body.mesh", "camellya body"),
+            ],
+            meaningful_scope("local asset-level inventory", 14, 7, 1),
+        );
+
+        let report = SnapshotReportRenderer
+            .render(&[old_snapshot, new_snapshot])
+            .expect("render report");
+
+        assert!(report.markdown.contains("## Resonator Matrix"));
+        assert!(report.markdown.contains("| Encore |"));
+        assert!(
+            report
+                .markdown
+                .contains("Scope metadata indicates character/content coverage is present")
+        );
     }
 
     #[test]
@@ -447,6 +621,20 @@ mod tests {
         reuse_version: Option<&str>,
         assets: Vec<SnapshotAsset>,
     ) -> GameSnapshot {
+        sample_snapshot_with_scope(
+            version_id,
+            reuse_version,
+            assets,
+            SnapshotScopeContext::default(),
+        )
+    }
+
+    fn sample_snapshot_with_scope(
+        version_id: &str,
+        reuse_version: Option<&str>,
+        assets: Vec<SnapshotAsset>,
+        scope: SnapshotScopeContext,
+    ) -> GameSnapshot {
         GameSnapshot {
             schema_version: "whashreonator.snapshot.v1".to_string(),
             version_id: version_id.to_string(),
@@ -464,8 +652,49 @@ mod tests {
                     app_id: Some("50004".to_string()),
                 }),
                 resource_manifest: None,
+                scope,
                 notes: Vec::new(),
             },
+        }
+    }
+
+    fn install_level_scope(
+        note: &str,
+        content_like_path_count: usize,
+        character_path_count: usize,
+        non_content_path_count: usize,
+    ) -> SnapshotScopeContext {
+        SnapshotScopeContext {
+            capture_mode: Some("local_filesystem_inventory".to_string()),
+            mostly_install_or_package_level: Some(true),
+            meaningful_content_coverage: Some(false),
+            meaningful_character_coverage: Some(false),
+            coverage: SnapshotCoverageSignals {
+                content_like_path_count,
+                character_path_count,
+                non_content_path_count,
+            },
+            note: Some(note.to_string()),
+        }
+    }
+
+    fn meaningful_scope(
+        note: &str,
+        content_like_path_count: usize,
+        character_path_count: usize,
+        non_content_path_count: usize,
+    ) -> SnapshotScopeContext {
+        SnapshotScopeContext {
+            capture_mode: Some("local_filesystem_inventory".to_string()),
+            mostly_install_or_package_level: Some(false),
+            meaningful_content_coverage: Some(true),
+            meaningful_character_coverage: Some(true),
+            coverage: SnapshotCoverageSignals {
+                content_like_path_count,
+                character_path_count,
+                non_content_path_count,
+            },
+            note: Some(note.to_string()),
         }
     }
 

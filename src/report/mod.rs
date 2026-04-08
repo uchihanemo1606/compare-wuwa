@@ -8,7 +8,7 @@ use crate::{
         SnapshotCompareReason, SnapshotCompareReport,
     },
     inference::InferenceReport,
-    snapshot::GameSnapshot,
+    snapshot::{GameSnapshot, assess_snapshot_scope},
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -19,6 +19,8 @@ pub struct VersionDiffReportV2 {
     pub new_version: VersionSide,
     pub resonators: Vec<ResonatorDiffEntry>,
     pub summary: VersionDiffSummary,
+    #[serde(default)]
+    pub scope_notes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -177,6 +179,7 @@ impl VersionDiffReportBuilder {
             },
             resonators,
             summary,
+            scope_notes: build_scope_notes(old_snapshot, new_snapshot),
         }
     }
 
@@ -454,6 +457,47 @@ fn infer_resonator_name(path: &str) -> Option<String> {
         .map(|window| window[2].to_string())
 }
 
+fn build_scope_notes(old_snapshot: &GameSnapshot, new_snapshot: &GameSnapshot) -> Vec<String> {
+    let old_scope = assess_snapshot_scope(old_snapshot);
+    let new_scope = assess_snapshot_scope(new_snapshot);
+
+    let mut notes = vec![
+        format!(
+            "old snapshot {} scope: mode={} install_or_package_level={} meaningful_content={} meaningful_character={} content_like_paths={} character_paths={} non_content_paths={}",
+            old_snapshot.version_id,
+            old_scope.capture_mode.as_deref().unwrap_or("unknown"),
+            old_scope.mostly_install_or_package_level,
+            old_scope.meaningful_content_coverage,
+            old_scope.meaningful_character_coverage,
+            old_scope.coverage.content_like_path_count,
+            old_scope.coverage.character_path_count,
+            old_scope.coverage.non_content_path_count
+        ),
+        format!(
+            "new snapshot {} scope: mode={} install_or_package_level={} meaningful_content={} meaningful_character={} content_like_paths={} character_paths={} non_content_paths={}",
+            new_snapshot.version_id,
+            new_scope.capture_mode.as_deref().unwrap_or("unknown"),
+            new_scope.mostly_install_or_package_level,
+            new_scope.meaningful_content_coverage,
+            new_scope.meaningful_character_coverage,
+            new_scope.coverage.content_like_path_count,
+            new_scope.coverage.character_path_count,
+            new_scope.coverage.non_content_path_count
+        ),
+    ];
+
+    if old_scope.is_low_signal_for_character_analysis()
+        || new_scope.is_low_signal_for_character_analysis()
+    {
+        notes.push(
+            "scope warning: compare results are based on install/package-level or low-coverage snapshots; deep character-level interpretation may be limited."
+                .to_string(),
+        );
+    }
+
+    notes
+}
+
 fn unchanged_assets<'a>(
     old_snapshot: &'a GameSnapshot,
     new_snapshot: &'a GameSnapshot,
@@ -501,11 +545,12 @@ mod tests {
     use crate::{
         compare::SnapshotComparer,
         inference::{
-            InferenceCompareInput, InferenceKnowledgeInput, InferenceReport, InferenceSummary,
-            InferredMappingHint,
+            InferenceCompareInput, InferenceKnowledgeInput, InferenceReport, InferenceScopeContext,
+            InferenceSummary, InferredMappingHint,
         },
         snapshot::{
-            GameSnapshot, SnapshotAsset, SnapshotContext, SnapshotFingerprint, SnapshotHashFields,
+            GameSnapshot, SnapshotAsset, SnapshotContext, SnapshotCoverageSignals,
+            SnapshotFingerprint, SnapshotHashFields, SnapshotScopeContext,
         },
     };
 
@@ -550,6 +595,12 @@ mod tests {
                 .any(|entry| entry.resonator == "Encore")
         );
         assert!(report.summary.mapping_candidates >= 1);
+        assert!(
+            report
+                .scope_notes
+                .iter()
+                .any(|note| note.contains("scope warning"))
+        );
     }
 
     #[test]
@@ -590,6 +641,7 @@ mod tests {
                 fix_like_commits: 1,
                 discovered_patterns: 1,
             },
+            scope: InferenceScopeContext::default(),
             summary: InferenceSummary {
                 probable_crash_causes: 0,
                 suggested_fixes: 0,
@@ -622,7 +674,71 @@ mod tests {
         assert_eq!(mapping_item.status, DiffStatus::Changed);
     }
 
+    #[test]
+    fn builder_scope_notes_stay_informational_for_meaningful_scope() {
+        let old_snapshot = sample_snapshot_with_scope(
+            "6.0.0",
+            vec![asset(
+                "Content/Character/Encore/Body.mesh",
+                "encore body",
+                Some(120),
+            )],
+            SnapshotScopeContext {
+                capture_mode: Some("local_filesystem_inventory".to_string()),
+                mostly_install_or_package_level: Some(false),
+                meaningful_content_coverage: Some(true),
+                meaningful_character_coverage: Some(true),
+                coverage: SnapshotCoverageSignals {
+                    content_like_path_count: 12,
+                    character_path_count: 6,
+                    non_content_path_count: 1,
+                },
+                note: Some("rich local scan".to_string()),
+            },
+        );
+        let new_snapshot = sample_snapshot_with_scope(
+            "6.1.0",
+            vec![asset(
+                "Content/Character/Encore/Body_v2.mesh",
+                "encore body",
+                Some(140),
+            )],
+            SnapshotScopeContext {
+                capture_mode: Some("local_filesystem_inventory".to_string()),
+                mostly_install_or_package_level: Some(false),
+                meaningful_content_coverage: Some(true),
+                meaningful_character_coverage: Some(true),
+                coverage: SnapshotCoverageSignals {
+                    content_like_path_count: 14,
+                    character_path_count: 7,
+                    non_content_path_count: 1,
+                },
+                note: Some("rich local scan".to_string()),
+            },
+        );
+        let compare_report = SnapshotComparer.compare(&old_snapshot, &new_snapshot);
+
+        let report =
+            VersionDiffReportBuilder.from_compare(&old_snapshot, &new_snapshot, &compare_report);
+
+        assert_eq!(report.scope_notes.len(), 2);
+        assert!(
+            report
+                .scope_notes
+                .iter()
+                .all(|note| !note.contains("scope warning"))
+        );
+    }
+
     fn sample_snapshot(version_id: &str, assets: Vec<SnapshotAsset>) -> GameSnapshot {
+        sample_snapshot_with_scope(version_id, assets, SnapshotScopeContext::default())
+    }
+
+    fn sample_snapshot_with_scope(
+        version_id: &str,
+        assets: Vec<SnapshotAsset>,
+        scope: SnapshotScopeContext,
+    ) -> GameSnapshot {
         GameSnapshot {
             schema_version: "whashreonator.snapshot.v1".to_string(),
             version_id: version_id.to_string(),
@@ -630,7 +746,12 @@ mod tests {
             source_root: version_id.to_string(),
             asset_count: assets.len(),
             assets,
-            context: SnapshotContext::default(),
+            context: SnapshotContext {
+                launcher: None,
+                resource_manifest: None,
+                scope,
+                notes: Vec::new(),
+            },
         }
     }
 

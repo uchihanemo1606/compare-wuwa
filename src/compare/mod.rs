@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     error::AppResult,
-    snapshot::{GameSnapshot, SnapshotAsset, load_snapshot},
+    snapshot::{GameSnapshot, SnapshotAsset, assess_snapshot_scope, load_snapshot},
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -16,11 +16,36 @@ pub struct SnapshotCompareReport {
     pub schema_version: String,
     pub old_snapshot: SnapshotVersionInfo,
     pub new_snapshot: SnapshotVersionInfo,
+    #[serde(default)]
+    pub scope: SnapshotCompareScopeContext,
     pub summary: SnapshotCompareSummary,
     pub added_assets: Vec<SnapshotAssetChange>,
     pub removed_assets: Vec<SnapshotAssetChange>,
     pub changed_assets: Vec<SnapshotAssetChange>,
     pub candidate_mapping_changes: Vec<CandidateMappingChange>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct SnapshotCompareScopeContext {
+    pub old_snapshot: SnapshotCompareScopeInfo,
+    pub new_snapshot: SnapshotCompareScopeInfo,
+    pub low_signal_compare: bool,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct SnapshotCompareScopeInfo {
+    pub capture_mode: Option<String>,
+    pub mostly_install_or_package_level: bool,
+    pub meaningful_content_coverage: bool,
+    pub meaningful_character_coverage: bool,
+    pub content_like_path_count: usize,
+    pub character_path_count: usize,
+    pub non_content_path_count: usize,
+    pub low_signal_for_character_analysis: bool,
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -166,6 +191,7 @@ impl SnapshotComparer {
 
         let candidate_mapping_changes =
             build_candidate_mapping_changes(&removed_assets, &added_assets);
+        let scope = build_compare_scope_context(old_snapshot, new_snapshot);
 
         SnapshotCompareReport {
             schema_version: "whashreonator.snapshot-compare.v1".to_string(),
@@ -179,6 +205,7 @@ impl SnapshotComparer {
                 source_root: new_snapshot.source_root.clone(),
                 asset_count: new_snapshot.asset_count,
             },
+            scope,
             summary: SnapshotCompareSummary {
                 total_old_assets: old_snapshot.asset_count,
                 total_new_assets: new_snapshot.asset_count,
@@ -193,6 +220,65 @@ impl SnapshotComparer {
             changed_assets,
             candidate_mapping_changes,
         }
+    }
+}
+
+fn build_compare_scope_context(
+    old_snapshot: &GameSnapshot,
+    new_snapshot: &GameSnapshot,
+) -> SnapshotCompareScopeContext {
+    let old_scope = assess_snapshot_scope(old_snapshot);
+    let new_scope = assess_snapshot_scope(new_snapshot);
+    let old_low_signal = old_scope.is_low_signal_for_character_analysis();
+    let new_low_signal = new_scope.is_low_signal_for_character_analysis();
+
+    let mut notes = Vec::new();
+    if let Some(note) = old_scope.note.as_deref() {
+        notes.push(format!("old snapshot {}: {note}", old_snapshot.version_id));
+    }
+    if let Some(note) = new_scope.note.as_deref() {
+        notes.push(format!("new snapshot {}: {note}", new_snapshot.version_id));
+    }
+    if old_scope.observed_fallback_used || new_scope.observed_fallback_used {
+        notes.push(
+            "scope metadata was partially inferred from observed paths because explicit scope fields were missing"
+                .to_string(),
+        );
+    }
+    if old_scope.is_low_signal_for_character_analysis()
+        || new_scope.is_low_signal_for_character_analysis()
+    {
+        notes.push(
+            "compare scope includes install/package-level or low-coverage snapshots; deep character-level interpretation is limited"
+                .to_string(),
+        );
+    }
+
+    SnapshotCompareScopeContext {
+        old_snapshot: SnapshotCompareScopeInfo {
+            capture_mode: old_scope.capture_mode.clone(),
+            mostly_install_or_package_level: old_scope.mostly_install_or_package_level,
+            meaningful_content_coverage: old_scope.meaningful_content_coverage,
+            meaningful_character_coverage: old_scope.meaningful_character_coverage,
+            content_like_path_count: old_scope.coverage.content_like_path_count,
+            character_path_count: old_scope.coverage.character_path_count,
+            non_content_path_count: old_scope.coverage.non_content_path_count,
+            low_signal_for_character_analysis: old_low_signal,
+            note: old_scope.note.clone(),
+        },
+        new_snapshot: SnapshotCompareScopeInfo {
+            capture_mode: new_scope.capture_mode.clone(),
+            mostly_install_or_package_level: new_scope.mostly_install_or_package_level,
+            meaningful_content_coverage: new_scope.meaningful_content_coverage,
+            meaningful_character_coverage: new_scope.meaningful_character_coverage,
+            content_like_path_count: new_scope.coverage.content_like_path_count,
+            character_path_count: new_scope.coverage.character_path_count,
+            non_content_path_count: new_scope.coverage.non_content_path_count,
+            low_signal_for_character_analysis: new_low_signal,
+            note: new_scope.note.clone(),
+        },
+        low_signal_compare: old_low_signal || new_low_signal,
+        notes,
     }
 }
 
@@ -637,6 +723,14 @@ mod tests {
         assert_eq!(report.summary.added_assets, 1);
         assert_eq!(report.summary.candidate_mapping_changes, 1);
         assert_eq!(report.changed_assets[0].probable_impact, RiskLevel::High);
+        assert!(report.scope.low_signal_compare);
+        assert!(
+            report
+                .scope
+                .notes
+                .iter()
+                .any(|note| note.contains("low-coverage snapshots"))
+        );
         assert!(
             report.changed_assets[0]
                 .changed_fields

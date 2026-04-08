@@ -8,8 +8,8 @@ use whashreonator::{
     cli::GenerateProposalsArgs,
     compare::RiskLevel,
     inference::{
-        InferenceCompareInput, InferenceKnowledgeInput, InferenceReport, InferenceSummary,
-        InferredMappingHint, ProbableCrashCause, SuggestedFix,
+        InferenceCompareInput, InferenceKnowledgeInput, InferenceReport, InferenceScopeContext,
+        InferenceSummary, InferredMappingHint, ProbableCrashCause, SuggestedFix,
     },
     pipeline::run_generate_proposals_command,
     proposal::{MappingProposalOutput, ProposalPatchDraftOutput, ProposalStatus},
@@ -107,6 +107,7 @@ fn sample_inference_report() -> InferenceReport {
             fix_like_commits: 6,
             discovered_patterns: 3,
         },
+        scope: InferenceScopeContext::default(),
         summary: InferenceSummary {
             probable_crash_causes: 2,
             suggested_fixes: 2,

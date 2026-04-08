@@ -1,15 +1,20 @@
 use std::path::{Path, PathBuf};
 
 use crate::{
+    compare::SnapshotComparer,
     error::AppResult,
+    human_summary::HumanSummaryRenderer,
+    inference::{FixInferenceEngine, InferenceReport},
     output_policy::resolve_artifact_root,
+    proposal::{ProposalArtifacts, ProposalEngine},
     report::{ReportItemType, ResonatorDiffEntry, VersionDiffReportV2},
     report_storage::{ReportStorage, VersionArtifactKind},
     scan::{
         ExecuteVersionScanResult, LocalSnapshotFactory, PrepareVersionScanResult,
         PreparedVersionScan, VersionScanService,
     },
-    snapshot::GameSnapshot,
+    snapshot::{GameSnapshot, assess_snapshot_scope},
+    wwmi::load_wwmi_knowledge,
 };
 
 #[derive(Debug, Clone)]
@@ -111,8 +116,10 @@ impl GuiController {
         &self,
         prepared: &PreparedVersionScan,
         force_rescan: bool,
+        knowledge_path: &str,
     ) -> AppResult<ScanRunResult> {
         let service = VersionScanService::new(self.storage.clone(), LocalSnapshotFactory);
+        let knowledge_path = optional_text(knowledge_path);
 
         match service.execute_scan(prepared, force_rescan)? {
             ExecuteVersionScanResult::Created {
@@ -120,30 +127,42 @@ impl GuiController {
                 snapshot_path,
                 snapshot,
             } => Ok(ScanRunResult::Created {
-                version_id,
+                summary: self.scan_summary_with_phase3(
+                    &version_id,
+                    &render_scan_summary(&snapshot),
+                    knowledge_path.as_deref(),
+                )?,
                 saved_path: snapshot_path,
-                summary: render_scan_summary(&snapshot),
+                version_id,
             }),
             ExecuteVersionScanResult::NoChangesDetected {
                 version_id,
                 snapshot_path,
             } => Ok(ScanRunResult::NoChangesDetected {
-                summary: format!(
-                    "Scan Version {}\nNo changes detected.\nSnapshot: {}",
-                    version_id,
-                    snapshot_path.display()
-                ),
-                version_id,
+                summary: self.scan_summary_with_phase3(
+                    &version_id,
+                    &format!(
+                        "Scan Version {}\nNo changes detected.\nSnapshot: {}",
+                        version_id,
+                        snapshot_path.display()
+                    ),
+                    knowledge_path.as_deref(),
+                )?,
                 saved_path: snapshot_path,
+                version_id,
             }),
             ExecuteVersionScanResult::Overwritten {
                 version_id,
                 snapshot_path,
                 snapshot,
             } => Ok(ScanRunResult::Overwritten {
-                version_id,
+                summary: self.scan_summary_with_phase3(
+                    &version_id,
+                    &render_scan_summary(&snapshot),
+                    knowledge_path.as_deref(),
+                )?,
                 saved_path: snapshot_path,
-                summary: render_scan_summary(&snapshot),
+                version_id,
             }),
         }
     }
@@ -154,10 +173,13 @@ impl GuiController {
             .into_iter()
             .map(|entry| VersionRowView {
                 label: format!(
-                    "wuwa_{} | snapshot={} report_bundle={} buffer={} hash={} artifacts={}",
+                    "wuwa_{} | snapshot={} report_bundle={} inference={} proposal={} summary={} buffer={} hash={} artifacts={}",
                     entry.version_id,
                     yes_no(entry.has_snapshot),
                     yes_no(entry.has_report_bundle),
+                    yes_no(entry.has_inference_data),
+                    yes_no(entry.has_proposal_data),
+                    yes_no(entry.has_human_summary),
                     yes_no(entry.has_buffer_data),
                     yes_no(entry.has_hash_data),
                     entry.artifacts.len()
@@ -171,9 +193,21 @@ impl GuiController {
         let artifacts = self.storage.list_version_artifacts(version_id)?;
         let snapshot = self.storage.load_snapshot_by_version(version_id)?;
         let report = self.storage.load_version_report(version_id)?;
+        let inference = self.storage.load_latest_inference(version_id)?;
+        let mapping_proposal = self.storage.load_latest_mapping_proposal(version_id)?;
+        let patch_draft = self.storage.load_latest_patch_draft(version_id)?;
+        let human_summary = self.storage.load_latest_human_summary(version_id)?;
 
-        let summary =
-            render_version_summary(version_id, snapshot.as_ref(), report.as_ref(), &artifacts);
+        let summary = render_version_summary(
+            version_id,
+            snapshot.as_ref(),
+            report.as_ref(),
+            inference.as_ref(),
+            mapping_proposal.as_ref(),
+            patch_draft.as_ref(),
+            human_summary.as_deref(),
+            &artifacts,
+        );
         let artifacts = render_version_artifact_lines(&artifacts);
 
         Ok(VersionDetailView { summary, artifacts })
@@ -196,6 +230,93 @@ impl GuiController {
     pub fn artifact_root_label(&self) -> String {
         resolve_artifact_root().display().to_string()
     }
+
+    fn scan_summary_with_phase3(
+        &self,
+        scanned_version: &str,
+        scan_summary: &str,
+        knowledge_path: Option<&str>,
+    ) -> AppResult<String> {
+        let Some(knowledge_path) = knowledge_path
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(format!(
+                "{scan_summary}\n\nPhase 3: skipped (knowledge path is empty)."
+            ));
+        };
+        let knowledge_path = Path::new(knowledge_path);
+        if !knowledge_path.exists() {
+            return Ok(format!(
+                "{scan_summary}\n\nPhase 3: skipped (knowledge file not found: {}).",
+                knowledge_path.display()
+            ));
+        }
+
+        let Some(baseline_version) = self.storage.select_baseline_version(scanned_version)? else {
+            return Ok(format!(
+                "{scan_summary}\n\nPhase 3: skipped (no baseline version available for compare)."
+            ));
+        };
+
+        if baseline_version == scanned_version {
+            return Ok(format!(
+                "{scan_summary}\n\nPhase 3: skipped (baseline equals scanned version)."
+            ));
+        }
+
+        let old_snapshot = self
+            .storage
+            .load_snapshot_by_version(&baseline_version)?
+            .ok_or_else(|| {
+                crate::error::AppError::InvalidInput(format!(
+                    "baseline snapshot {} not found",
+                    baseline_version
+                ))
+            })?;
+        let new_snapshot = self
+            .storage
+            .load_snapshot_by_version(scanned_version)?
+            .ok_or_else(|| {
+                crate::error::AppError::InvalidInput(format!(
+                    "scanned snapshot {} not found",
+                    scanned_version
+                ))
+            })?;
+        let compare = SnapshotComparer.compare(&old_snapshot, &new_snapshot);
+        let knowledge = load_wwmi_knowledge(knowledge_path)?;
+        let inference = FixInferenceEngine.infer(&compare, &knowledge);
+        let proposals = ProposalEngine.generate(&inference, 0.85);
+        let human_summary = HumanSummaryRenderer.render(&inference, &proposals);
+        let report = crate::report::VersionDiffReportBuilder.enrich_with_inference(
+            crate::report::VersionDiffReportBuilder.from_compare(
+                &old_snapshot,
+                &new_snapshot,
+                &compare,
+            ),
+            &inference,
+        );
+
+        self.storage.save_phase3_outputs(
+            &report,
+            &old_snapshot,
+            &new_snapshot,
+            &compare,
+            &inference,
+            &proposals,
+            &human_summary,
+        )?;
+
+        let phase3_summary = render_phase3_generation_summary(
+            &baseline_version,
+            scanned_version,
+            &inference,
+            &proposals,
+            compare.scope.low_signal_compare,
+            &compare.scope.notes,
+        );
+        Ok(format!("{scan_summary}\n\n{phase3_summary}"))
+    }
 }
 
 fn yes_no(value: bool) -> &'static str {
@@ -208,24 +329,88 @@ fn optional_text(value: &str) -> Option<String> {
 }
 
 fn render_scan_summary(snapshot: &crate::snapshot::GameSnapshot) -> String {
-    format!(
-        "Scan Version {}\nAssets: {}\nSource root: {}\nLauncher version: {}",
-        snapshot.version_id,
-        snapshot.asset_count,
-        snapshot.source_root,
-        snapshot
-            .context
-            .launcher
-            .as_ref()
-            .map(|launcher| launcher.detected_version.as_str())
-            .unwrap_or("n/a")
-    )
+    let scope = assess_snapshot_scope(snapshot);
+    let mut lines = vec![
+        format!("Scan Version {}", snapshot.version_id),
+        format!("Assets: {}", snapshot.asset_count),
+        format!("Source root: {}", snapshot.source_root),
+        format!(
+            "Launcher version: {}",
+            snapshot
+                .context
+                .launcher
+                .as_ref()
+                .map(|launcher| launcher.detected_version.as_str())
+                .unwrap_or("n/a")
+        ),
+        format!(
+            "Snapshot scope: mode={} install_or_package_level={} meaningful_content={} meaningful_character={}",
+            scope.capture_mode.as_deref().unwrap_or("unknown"),
+            scope.mostly_install_or_package_level,
+            scope.meaningful_content_coverage,
+            scope.meaningful_character_coverage
+        ),
+        format!(
+            "Coverage signals: content_like_paths={} character_paths={} non_content_paths={}",
+            scope.coverage.content_like_path_count,
+            scope.coverage.character_path_count,
+            scope.coverage.non_content_path_count
+        ),
+    ];
+
+    if scope.is_low_signal_for_character_analysis() {
+        lines.push(
+            "Scope caution: this snapshot is install/package-level or low-coverage; deep character-level interpretation may be limited."
+                .to_string(),
+        );
+    }
+    if let Some(note) = scope.note {
+        lines.push(format!("Scope note: {note}"));
+    }
+
+    lines.join("\n")
+}
+
+fn render_phase3_generation_summary(
+    baseline_version: &str,
+    scanned_version: &str,
+    inference: &InferenceReport,
+    proposals: &ProposalArtifacts,
+    low_signal_compare: bool,
+    scope_notes: &[String],
+) -> String {
+    let mut lines = vec![format!(
+        "Phase 3 generated using baseline {} -> {}.\nCrash causes: {} | Suggested fixes: {} | Mapping hints: {}.\nProposed mappings: {} | Needs review: {} | Patch actions: {}.",
+        baseline_version,
+        scanned_version,
+        inference.summary.probable_crash_causes,
+        inference.summary.suggested_fixes,
+        inference.summary.candidate_mapping_hints,
+        proposals.mapping_proposal.summary.proposed_mappings,
+        proposals.mapping_proposal.summary.needs_review_mappings,
+        proposals.patch_draft.actions.len()
+    )];
+    if low_signal_compare {
+        lines.push(
+            "Phase 3 caution: compare scope is install/package-level or low-coverage, so inference/proposal outputs are low-signal and should be reviewed conservatively."
+                .to_string(),
+        );
+        for note in scope_notes.iter().take(2) {
+            lines.push(format!("  scope: {note}"));
+        }
+    }
+
+    lines.join("\n")
 }
 
 fn render_version_summary(
     version_id: &str,
     snapshot: Option<&GameSnapshot>,
     report: Option<&VersionDiffReportV2>,
+    inference: Option<&InferenceReport>,
+    mapping_proposal: Option<&crate::proposal::MappingProposalOutput>,
+    patch_draft: Option<&crate::proposal::ProposalPatchDraftOutput>,
+    human_summary: Option<&str>,
     artifacts: &[crate::report_storage::VersionArtifactEntry],
 ) -> String {
     let mut lines = vec![
@@ -234,10 +419,30 @@ fn render_version_summary(
     ];
 
     if let Some(snapshot) = snapshot {
+        let scope = assess_snapshot_scope(snapshot);
         lines.push(format!(
             "Snapshot: assets={} source_root={}",
             snapshot.asset_count, snapshot.source_root
         ));
+        lines.push(format!(
+            "Snapshot scope: mode={} install_or_package_level={} meaningful_content={} meaningful_character={} content_like_paths={} character_paths={} non_content_paths={}",
+            scope.capture_mode.as_deref().unwrap_or("unknown"),
+            scope.mostly_install_or_package_level,
+            scope.meaningful_content_coverage,
+            scope.meaningful_character_coverage,
+            scope.coverage.content_like_path_count,
+            scope.coverage.character_path_count,
+            scope.coverage.non_content_path_count
+        ));
+        if scope.is_low_signal_for_character_analysis() {
+            lines.push(
+                "Snapshot caution: install/package-level or low-coverage scope; deep character/resonator interpretation may be limited."
+                    .to_string(),
+            );
+        }
+        if let Some(note) = scope.note {
+            lines.push(format!("Snapshot note: {note}"));
+        }
         if let Some(launcher) = snapshot.context.launcher.as_ref() {
             lines.push(format!(
                 "Launcher detected_version={} reuse_version={}",
@@ -267,8 +472,80 @@ fn render_version_summary(
             report.summary.removed_items,
             report.summary.mapping_candidates
         ));
+        if !report.scope_notes.is_empty() {
+            for note in report.scope_notes.iter().take(3) {
+                lines.push(format!("Report scope note: {note}"));
+            }
+        }
     } else {
         lines.push("Latest report bundle: not found".to_string());
+    }
+
+    if let Some(inference) = inference {
+        lines.push(format!(
+            "Inference: crash_causes={} fixes={} mapping_hints={} highest_confidence={:.3}",
+            inference.summary.probable_crash_causes,
+            inference.summary.suggested_fixes,
+            inference.summary.candidate_mapping_hints,
+            inference.summary.highest_confidence
+        ));
+        for cause in inference.probable_crash_causes.iter().take(3) {
+            lines.push(format!(
+                "  crash cause [{}] risk={:?} confidence={:.3} affected={}",
+                cause.code,
+                cause.risk,
+                cause.confidence,
+                cause.affected_assets.len()
+            ));
+        }
+        for fix in inference.suggested_fixes.iter().take(3) {
+            lines.push(format!(
+                "  suggested fix [{}] priority={:?} confidence={:.3} actions={}",
+                fix.code,
+                fix.priority,
+                fix.confidence,
+                fix.actions.len()
+            ));
+        }
+    } else {
+        lines.push("Inference: not found".to_string());
+    }
+
+    if let Some(mapping_proposal) = mapping_proposal {
+        lines.push(format!(
+            "Mapping proposal: proposed={} review={} total={} highest_confidence={:.3}",
+            mapping_proposal.summary.proposed_mappings,
+            mapping_proposal.summary.needs_review_mappings,
+            mapping_proposal.summary.total_mapping_candidates,
+            mapping_proposal.summary.highest_confidence
+        ));
+        for mapping in mapping_proposal.mappings.iter().take(5) {
+            lines.push(format!(
+                "  {} -> {} | status={:?} confidence={:.3}",
+                mapping.old_asset_path, mapping.new_asset_path, mapping.status, mapping.confidence
+            ));
+        }
+    } else {
+        lines.push("Mapping proposal: not found".to_string());
+    }
+
+    if let Some(patch_draft) = patch_draft {
+        lines.push(format!(
+            "Patch draft: actions={} min_confidence={:.3}",
+            patch_draft.actions.len(),
+            patch_draft.min_confidence
+        ));
+    } else {
+        lines.push("Patch draft: not found".to_string());
+    }
+
+    if let Some(summary) = human_summary {
+        lines.push("Human summary preview:".to_string());
+        for line in summary.lines().take(6) {
+            lines.push(format!("  {line}"));
+        }
+    } else {
+        lines.push("Human summary preview: not found".to_string());
     }
 
     lines.join("\n")
@@ -293,6 +570,9 @@ fn artifact_kind_label(kind: VersionArtifactKind) -> &'static str {
     match kind {
         VersionArtifactKind::Snapshot => "snapshot",
         VersionArtifactKind::ReportBundle => "report_bundle",
+        VersionArtifactKind::InferenceData => "inference",
+        VersionArtifactKind::ProposalData => "proposal",
+        VersionArtifactKind::HumanSummary => "human_summary",
         VersionArtifactKind::BufferData => "buffer",
         VersionArtifactKind::HashData => "hash",
         VersionArtifactKind::Auxiliary => "auxiliary",
@@ -312,19 +592,26 @@ pub fn render_detail_view(
         .filter(|entry| filter.is_empty() || entry.resonator.to_ascii_lowercase().contains(&filter))
         .collect::<Vec<_>>();
 
+    let mut summary = format!(
+        "Compare {} -> {}\nResonators: {}\nUnchanged: {}\nChanged: {}\nAdded: {}\nRemoved: {}\nUncertain: {}\nMapping candidates: {}",
+        report.old_version.version_id,
+        report.new_version.version_id,
+        report.summary.resonator_count,
+        report.summary.unchanged_items,
+        report.summary.changed_items,
+        report.summary.added_items,
+        report.summary.removed_items,
+        report.summary.uncertain_items,
+        report.summary.mapping_candidates
+    );
+    if !report.scope_notes.is_empty() {
+        for note in report.scope_notes.iter().take(2) {
+            summary.push_str(&format!("\nScope note: {note}"));
+        }
+    }
+
     ReportDetailView {
-        summary: format!(
-            "Compare {} -> {}\nResonators: {}\nUnchanged: {}\nChanged: {}\nAdded: {}\nRemoved: {}\nUncertain: {}\nMapping candidates: {}",
-            report.old_version.version_id,
-            report.new_version.version_id,
-            report.summary.resonator_count,
-            report.summary.unchanged_items,
-            report.summary.changed_items,
-            report.summary.added_items,
-            report.summary.removed_items,
-            report.summary.uncertain_items,
-            report.summary.mapping_candidates
-        ),
+        summary,
         old_column: render_side_column(&report.old_version.version_id, &resonators, true),
         new_column: render_side_column(&report.new_version.version_id, &resonators, false),
     }
@@ -411,6 +698,10 @@ mod tests {
         snapshot::{
             GameSnapshot, SnapshotAsset, SnapshotContext, SnapshotFingerprint, SnapshotHashFields,
         },
+        wwmi::{
+            WwmiEvidenceCommit, WwmiFixPattern, WwmiKeywordStat, WwmiKnowledgeBase,
+            WwmiKnowledgeRepoInfo, WwmiKnowledgeSummary, WwmiPatternKind,
+        },
     };
 
     use super::{GuiController, ScanForm, ScanRunResult, render_detail_view};
@@ -463,10 +754,15 @@ mod tests {
                     }],
                 }],
             }],
+            scope_notes: vec![
+                "scope warning: compare results are based on install/package-level snapshots"
+                    .to_string(),
+            ],
         };
 
         let detail = render_detail_view(&report, "");
         assert!(detail.summary.contains("Compare 2.4.0 -> 2.5.0"));
+        assert!(detail.summary.contains("Scope note: scope warning"));
         assert!(detail.old_column.contains("Resonator: Encore"));
         assert!(detail.new_column.contains("Body_v2.mesh"));
     }
@@ -494,8 +790,13 @@ mod tests {
             other => panic!("expected ready, got {other:?}"),
         };
 
-        let result = controller.run_scan(&prepared, false).expect("run scan");
-        assert!(matches!(result, ScanRunResult::Created { .. }));
+        let result = controller.run_scan(&prepared, false, "").expect("run scan");
+        let summary = match result {
+            ScanRunResult::Created { summary, .. } => summary,
+            other => panic!("expected created, got {other:?}"),
+        };
+        assert!(summary.contains("Snapshot scope: mode="));
+        assert!(summary.contains("Coverage signals:"));
 
         let versions = controller.list_versions().expect("list versions");
         assert!(versions.iter().any(|version| version.version_id == "3.2.1"));
@@ -523,6 +824,97 @@ mod tests {
             .compare_versions("3.2.5", "3.3.1", "")
             .expect("compare");
         assert!(detail.summary.contains("Compare 3.2.5 -> 3.3.1"));
+        assert!(detail.summary.contains("Scope note:"));
+
+        let _ = fs::remove_dir_all(test_root);
+    }
+
+    #[test]
+    fn scan_auto_generates_phase3_outputs_and_open_version_renders_them() {
+        let test_root = unique_test_dir();
+        let storage = ReportStorage::with_legacy_root(
+            test_root.join("out").join("report"),
+            test_root.join("out").join("reports"),
+        );
+        let controller = GuiController::new(storage.clone());
+        storage
+            .save_snapshot_for_version(&sample_snapshot("3.2.1", 1))
+            .expect("seed baseline snapshot");
+        let game_root = test_root.join("game");
+        seed_game_root(&game_root, "3.3.1");
+        let knowledge_path = test_root.join("out").join("wwmi-knowledge.json");
+        fs::create_dir_all(knowledge_path.parent().expect("knowledge parent"))
+            .expect("create knowledge dir");
+        fs::write(
+            &knowledge_path,
+            serde_json::to_string_pretty(&sample_knowledge()).expect("serialize knowledge"),
+        )
+        .expect("write knowledge");
+
+        let prepare = controller
+            .prepare_scan(&ScanForm {
+                source_root: game_root.display().to_string(),
+                version_override: String::new(),
+                knowledge_path: knowledge_path.display().to_string(),
+            })
+            .expect("prepare scan");
+        let prepared = match prepare {
+            super::ScanStartResult::Ready(prepared) => prepared,
+            other => panic!("expected ready, got {other:?}"),
+        };
+
+        let result = controller
+            .run_scan(&prepared, false, &knowledge_path.display().to_string())
+            .expect("run scan with phase3");
+        let summary = match result {
+            ScanRunResult::Created { summary, .. } => summary,
+            other => panic!("expected created result, got {other:?}"),
+        };
+        assert!(summary.contains("Phase 3 generated using baseline 3.2.1 -> 3.3.1"));
+        assert!(summary.contains("Snapshot scope: mode="));
+        assert!(summary.contains("Phase 3 caution: compare scope is install/package-level"));
+
+        let detail = controller.open_version("3.3.1").expect("open version");
+        assert!(detail.summary.contains("Snapshot scope: mode="));
+        assert!(detail.summary.contains("Inference: crash_causes="));
+        assert!(detail.summary.contains("Mapping proposal: proposed="));
+        assert!(detail.summary.contains("Human summary preview:"));
+        assert!(
+            detail
+                .artifacts
+                .iter()
+                .any(|line| line.contains("inference |"))
+        );
+        assert!(
+            detail
+                .artifacts
+                .iter()
+                .any(|line| line.contains("proposal |"))
+        );
+        assert!(
+            detail
+                .artifacts
+                .iter()
+                .any(|line| line.contains("human_summary |"))
+        );
+
+        let mapping_proposal = storage
+            .load_latest_mapping_proposal("3.3.1")
+            .expect("load mapping proposal")
+            .expect("mapping proposal exists");
+        assert_eq!(
+            mapping_proposal.schema_version,
+            "whashreonator.mapping-proposal.v1"
+        );
+        let patch_draft = storage
+            .load_latest_patch_draft("3.3.1")
+            .expect("load patch draft")
+            .expect("patch draft exists");
+        assert_eq!(
+            patch_draft.schema_version,
+            "whashreonator.proposal-patch-draft.v1"
+        );
+        assert!(patch_draft.actions.len() >= mapping_proposal.mappings.len());
 
         let _ = fs::remove_dir_all(test_root);
     }
@@ -597,5 +989,54 @@ mod tests {
             .as_nanos();
 
         std::env::temp_dir().join(format!("whashreonator-gui-app-test-{nanos}"))
+    }
+
+    fn sample_knowledge() -> WwmiKnowledgeBase {
+        WwmiKnowledgeBase {
+            schema_version: "whashreonator.wwmi-knowledge.v1".to_string(),
+            generated_at_unix_ms: 1,
+            repo: WwmiKnowledgeRepoInfo {
+                input: "repo".to_string(),
+                resolved_path: "repo".to_string(),
+                origin_url: None,
+            },
+            summary: WwmiKnowledgeSummary {
+                analyzed_commits: 4,
+                fix_like_commits: 2,
+                discovered_patterns: 2,
+            },
+            patterns: vec![
+                WwmiFixPattern {
+                    kind: WwmiPatternKind::MappingOrHashUpdate,
+                    description: "mapping".to_string(),
+                    frequency: 2,
+                    average_fix_likelihood: 0.8,
+                    example_commits: vec!["abc".to_string()],
+                },
+                WwmiFixPattern {
+                    kind: WwmiPatternKind::BufferLayoutOrCapacityFix,
+                    description: "buffer".to_string(),
+                    frequency: 1,
+                    average_fix_likelihood: 0.7,
+                    example_commits: vec!["def".to_string()],
+                },
+            ],
+            keyword_stats: vec![WwmiKeywordStat {
+                keyword: "mapping".to_string(),
+                count: 2,
+            }],
+            evidence_commits: vec![WwmiEvidenceCommit {
+                hash: "abc".to_string(),
+                subject: "fix mapping".to_string(),
+                unix_time: 1,
+                decorations: String::new(),
+                commit_url: None,
+                fix_likelihood: 0.8,
+                changed_files: vec!["WWMI/d3dx.ini".to_string()],
+                detected_patterns: vec![WwmiPatternKind::MappingOrHashUpdate],
+                detected_keywords: vec!["mapping".to_string()],
+                reasons: vec!["subject contains fix".to_string()],
+            }],
+        }
     }
 }

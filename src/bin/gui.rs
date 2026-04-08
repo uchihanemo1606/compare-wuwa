@@ -299,7 +299,10 @@ fn main() -> Result<(), slint::PlatformError> {
             match controller.prepare_scan(&form) {
                 Ok(ScanStartResult::Ready(prepared)) => {
                     pending_scan.borrow_mut().replace(prepared.clone());
-                    let scanned_version = apply_scan_result(&window, controller.run_scan(&prepared, false));
+                    let scanned_version = apply_scan_result(
+                        &window,
+                        controller.run_scan(&prepared, false, &window.get_knowledge_path().to_string()),
+                    );
                     pending_scan.borrow_mut().take();
                     refresh_version_library(
                         &window,
@@ -352,7 +355,10 @@ fn main() -> Result<(), slint::PlatformError> {
 
             window.set_show_confirm_dialog(false);
             window.set_status_text("Re-scan confirmed".into());
-            let scanned_version = apply_scan_result(&window, controller.run_scan(&prepared, true));
+            let scanned_version = apply_scan_result(
+                &window,
+                controller.run_scan(&prepared, true, &window.get_knowledge_path().to_string()),
+            );
             pending_scan.borrow_mut().take();
             refresh_version_library(
                 &window,
