@@ -25,10 +25,32 @@ pub trait SnapshotAssetExtractor {
     fn extract_snapshot_assets(&self, path: &Path) -> AppResult<Vec<AssetRecord>>;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LocalSnapshotCaptureScope {
+    #[default]
+    FullInventory,
+    ContentFocused,
+    CharacterFocused,
+}
+
+impl LocalSnapshotCaptureScope {
+    pub fn capture_mode(self) -> &'static str {
+        match self {
+            LocalSnapshotCaptureScope::FullInventory => "local_filesystem_inventory",
+            LocalSnapshotCaptureScope::ContentFocused => {
+                "local_filesystem_inventory_content_focused"
+            }
+            LocalSnapshotCaptureScope::CharacterFocused => {
+                "local_filesystem_inventory_character_focused"
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SnapshotExtractionMode {
     /// Current default implementation: recursive local filesystem inventory.
-    InstallFilesystemInventory,
+    InstallFilesystemInventory(LocalSnapshotCaptureScope),
     /// Hook for tests or future adapter-based ingestion of already prepared assets.
     PreparedAssetList,
     /// Future extension point; proprietary format parsing is intentionally not implemented yet.
@@ -38,7 +60,7 @@ pub enum SnapshotExtractionMode {
 impl SnapshotExtractionMode {
     pub fn capture_mode(self) -> &'static str {
         match self {
-            SnapshotExtractionMode::InstallFilesystemInventory => "local_filesystem_inventory",
+            SnapshotExtractionMode::InstallFilesystemInventory(scope) => scope.capture_mode(),
             SnapshotExtractionMode::PreparedAssetList => "prepared_asset_list_inventory",
             SnapshotExtractionMode::AssetLevelExtractorPlaceholder => {
                 "asset_level_extractor_placeholder"
@@ -56,6 +78,14 @@ pub struct JsonFileIngestSource;
 /// proprietary containers (for example `.pak`) into semantic asset-level records.
 #[derive(Debug, Default, Clone)]
 pub struct LocalSnapshotIngestSource;
+
+/// Optional local capture filter layered on top of install/package-level filesystem inventory.
+///
+/// This remains path-based filtering only; it does not perform semantic asset extraction.
+#[derive(Debug, Clone, Copy)]
+pub struct FilteredLocalSnapshotAssetExtractor {
+    capture_scope: LocalSnapshotCaptureScope,
+}
 
 #[derive(Debug, Clone)]
 pub struct PreparedSnapshotAssetExtractor {
@@ -92,11 +122,28 @@ impl IngestSource for JsonFileIngestSource {
 
 impl SnapshotAssetExtractor for LocalSnapshotIngestSource {
     fn extraction_mode(&self) -> SnapshotExtractionMode {
-        SnapshotExtractionMode::InstallFilesystemInventory
+        SnapshotExtractionMode::InstallFilesystemInventory(LocalSnapshotCaptureScope::FullInventory)
     }
 
     fn extract_snapshot_assets(&self, path: &Path) -> AppResult<Vec<AssetRecord>> {
         scan_local_assets(path)
+    }
+}
+
+impl FilteredLocalSnapshotAssetExtractor {
+    pub fn new(capture_scope: LocalSnapshotCaptureScope) -> Self {
+        Self { capture_scope }
+    }
+}
+
+impl SnapshotAssetExtractor for FilteredLocalSnapshotAssetExtractor {
+    fn extraction_mode(&self) -> SnapshotExtractionMode {
+        SnapshotExtractionMode::InstallFilesystemInventory(self.capture_scope)
+    }
+
+    fn extract_snapshot_assets(&self, path: &Path) -> AppResult<Vec<AssetRecord>> {
+        let assets = LocalSnapshotIngestSource.extract_snapshot_assets(path)?;
+        Ok(filter_assets_by_capture_scope(assets, self.capture_scope))
     }
 }
 
@@ -268,6 +315,42 @@ fn normalize_relative_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
+fn filter_assets_by_capture_scope(
+    assets: Vec<AssetRecord>,
+    capture_scope: LocalSnapshotCaptureScope,
+) -> Vec<AssetRecord> {
+    match capture_scope {
+        LocalSnapshotCaptureScope::FullInventory => assets,
+        LocalSnapshotCaptureScope::ContentFocused => assets
+            .into_iter()
+            .filter(|asset| is_content_like_path(&asset.path))
+            .collect(),
+        LocalSnapshotCaptureScope::CharacterFocused => assets
+            .into_iter()
+            .filter(|asset| is_character_like_path(&asset.path))
+            .collect(),
+    }
+}
+
+fn is_content_like_path(path: &str) -> bool {
+    path.split('/')
+        .filter(|segment| !segment.is_empty())
+        .any(|segment| segment.eq_ignore_ascii_case("content"))
+}
+
+fn is_character_like_path(path: &str) -> bool {
+    let segments = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+
+    segments.windows(3).any(|window| {
+        window[0].eq_ignore_ascii_case("content")
+            && window[1].eq_ignore_ascii_case("character")
+            && !window[2].is_empty()
+    })
+}
+
 fn should_skip_dir(relative: &Path) -> bool {
     relative
         .components()
@@ -299,8 +382,9 @@ mod tests {
     };
 
     use super::{
-        AssetLevelSnapshotExtractorPlaceholder, AssetListSource, PreparedSnapshotAssetExtractor,
-        scan_local_assets,
+        AssetLevelSnapshotExtractorPlaceholder, AssetListSource,
+        FilteredLocalSnapshotAssetExtractor, LocalSnapshotCaptureScope,
+        PreparedSnapshotAssetExtractor, scan_local_assets,
     };
 
     #[test]
@@ -357,6 +441,75 @@ mod tests {
                 .to_string()
                 .contains("asset-level extraction is not implemented yet")
         );
+    }
+
+    #[test]
+    fn filtered_local_extractor_defaults_to_full_inventory() {
+        let test_root = unique_test_dir();
+        seed_file(&test_root, "Client/Config/DefaultGame.ini");
+        seed_file(&test_root, "Content/Character/Encore/Body.mesh");
+
+        let extractor =
+            FilteredLocalSnapshotAssetExtractor::new(LocalSnapshotCaptureScope::FullInventory);
+        let assets = extractor
+            .load_assets(&test_root)
+            .expect("full-inventory extraction");
+
+        assert_eq!(assets.len(), 2);
+        assert!(
+            assets
+                .iter()
+                .any(|asset| asset.path == "Client/Config/DefaultGame.ini")
+        );
+        assert!(
+            assets
+                .iter()
+                .any(|asset| asset.path == "Content/Character/Encore/Body.mesh")
+        );
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[test]
+    fn filtered_local_extractor_supports_content_focused_scope() {
+        let test_root = unique_test_dir();
+        seed_file(&test_root, "Client/Config/DefaultGame.ini");
+        seed_file(&test_root, "Content/Character/Encore/Body.mesh");
+        seed_file(&test_root, "Content/Weapon/Sword.weapon");
+
+        let extractor =
+            FilteredLocalSnapshotAssetExtractor::new(LocalSnapshotCaptureScope::ContentFocused);
+        let assets = extractor
+            .load_assets(&test_root)
+            .expect("content-focused extraction");
+
+        assert_eq!(assets.len(), 2);
+        assert!(
+            assets
+                .iter()
+                .all(|asset| asset.path.starts_with("Content/"))
+        );
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[test]
+    fn filtered_local_extractor_supports_character_focused_scope() {
+        let test_root = unique_test_dir();
+        seed_file(&test_root, "Content/Character/Encore/Body.mesh");
+        seed_file(&test_root, "Content/Weapon/Sword.weapon");
+        seed_file(&test_root, "Client/Config/DefaultGame.ini");
+
+        let extractor =
+            FilteredLocalSnapshotAssetExtractor::new(LocalSnapshotCaptureScope::CharacterFocused);
+        let assets = extractor
+            .load_assets(&test_root)
+            .expect("character-focused extraction");
+
+        assert_eq!(assets.len(), 1);
+        assert_eq!(assets[0].path, "Content/Character/Encore/Body.mesh");
+
+        let _ = fs::remove_dir_all(&test_root);
     }
 
     fn seed_file(root: &Path, relative_path: &str) {

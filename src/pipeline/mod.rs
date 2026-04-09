@@ -5,7 +5,7 @@ use tracing::info;
 use crate::{
     cli::{
         CompareSnapshotsArgs, ExtractWwmiKnowledgeArgs, GenerateProposalsArgs, InferFixesArgs,
-        MapArgs, MapLocalArgs, SnapshotArgs, SnapshotReportArgs,
+        MapArgs, MapLocalArgs, SnapshotArgs, SnapshotCaptureScopeArg, SnapshotReportArgs,
     },
     compare::{SnapshotCompareReport, SnapshotComparer},
     config::AppConfig,
@@ -20,11 +20,14 @@ use crate::{
     fingerprint::{DefaultFingerprinter, Fingerprinter},
     human_summary::HumanSummaryRenderer,
     inference::{FixInferenceEngine, InferenceReport, load_inference_report},
-    ingest::{AssetSourceSpec, IngestSource, JsonFileIngestSource, load_bundle_from_sources},
+    ingest::{
+        AssetSourceSpec, IngestSource, JsonFileIngestSource, LocalSnapshotCaptureScope,
+        load_bundle_from_sources,
+    },
     matcher::{HeuristicMatcher, Matcher},
     proposal::{ProposalArtifacts, ProposalEngine},
     report::{VersionDiffReportBuilder, VersionDiffReportV2},
-    snapshot::{GameSnapshot, create_local_snapshot},
+    snapshot::{GameSnapshot, create_local_snapshot_with_capture_scope},
     snapshot_report::{SnapshotInventoryReport, SnapshotReportRenderer, load_snapshots},
     validator::{ThresholdValidator, Validator},
     wwmi::{WwmiKnowledgeBase, WwmiKnowledgeExtractor, WwmiRepoInput},
@@ -164,7 +167,11 @@ pub fn run_map_command(args: &MapArgs) -> AppResult<()> {
 }
 
 pub fn run_snapshot_command(args: &SnapshotArgs) -> AppResult<GameSnapshot> {
-    let snapshot = create_local_snapshot(&args.version_id, args.source_root.as_path())?;
+    let snapshot = create_local_snapshot_with_capture_scope(
+        &args.version_id,
+        args.source_root.as_path(),
+        to_local_capture_scope(args.capture_scope),
+    )?;
     export_snapshot_output(&snapshot, args.output.as_path())?;
     info!(
         output = %args.output.display(),
@@ -174,6 +181,14 @@ pub fn run_snapshot_command(args: &SnapshotArgs) -> AppResult<GameSnapshot> {
     );
 
     Ok(snapshot)
+}
+
+fn to_local_capture_scope(value: SnapshotCaptureScopeArg) -> LocalSnapshotCaptureScope {
+    match value {
+        SnapshotCaptureScopeArg::Full => LocalSnapshotCaptureScope::FullInventory,
+        SnapshotCaptureScopeArg::Content => LocalSnapshotCaptureScope::ContentFocused,
+        SnapshotCaptureScopeArg::Character => LocalSnapshotCaptureScope::CharacterFocused,
+    }
 }
 
 pub fn run_snapshot_report_command(

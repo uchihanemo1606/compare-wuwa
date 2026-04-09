@@ -301,7 +301,11 @@ fn main() -> Result<(), slint::PlatformError> {
                     pending_scan.borrow_mut().replace(prepared.clone());
                     let scanned_version = apply_scan_result(
                         &window,
-                        controller.run_scan(&prepared, false, &window.get_knowledge_path().to_string()),
+                        controller.run_scan(
+                            &prepared,
+                            false,
+                            &window.get_knowledge_path().to_string(),
+                        ),
                     );
                     pending_scan.borrow_mut().take();
                     refresh_version_library(

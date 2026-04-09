@@ -5,7 +5,7 @@ use std::{
 };
 
 use whashreonator::{
-    cli::{SnapshotArgs, SnapshotReportArgs},
+    cli::{SnapshotArgs, SnapshotCaptureScopeArg, SnapshotReportArgs},
     pipeline::{run_snapshot_command, run_snapshot_report_command},
 };
 
@@ -66,12 +66,14 @@ fn snapshot_report_flags_install_level_snapshots_as_low_signal() {
         source_root: old_root,
         version_id: "3.0.0".to_string(),
         output: old_snapshot.clone(),
+        capture_scope: SnapshotCaptureScopeArg::Full,
     })
     .expect("export old snapshot");
     run_snapshot_command(&SnapshotArgs {
         source_root: new_root,
         version_id: "3.1.0".to_string(),
         output: new_snapshot.clone(),
+        capture_scope: SnapshotCaptureScopeArg::Full,
     })
     .expect("export new snapshot");
 

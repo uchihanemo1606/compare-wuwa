@@ -805,6 +805,49 @@ mod tests {
     }
 
     #[test]
+    fn controller_scan_uses_full_inventory_for_version_library_flow() {
+        let test_root = unique_test_dir();
+        let storage = ReportStorage::with_legacy_root(
+            test_root.join("out").join("report"),
+            test_root.join("out").join("reports"),
+        );
+        let controller = GuiController::new(storage);
+        let game_root = test_root.join("game");
+        seed_game_root(&game_root, "3.2.2");
+        let non_content_path = game_root
+            .join("Client")
+            .join("Binaries")
+            .join("Win64")
+            .join("Game.exe");
+        fs::create_dir_all(non_content_path.parent().expect("non-content parent"))
+            .expect("create non-content parent");
+        fs::write(&non_content_path, b"exe").expect("write non-content asset");
+
+        let prepare = controller
+            .prepare_scan(&ScanForm {
+                source_root: game_root.display().to_string(),
+                version_override: String::new(),
+                knowledge_path: String::new(),
+            })
+            .expect("prepare scan");
+        let prepared = match prepare {
+            super::ScanStartResult::Ready(prepared) => prepared,
+            other => panic!("expected ready, got {other:?}"),
+        };
+
+        let result = controller.run_scan(&prepared, false, "").expect("run scan");
+        let summary = match result {
+            ScanRunResult::Created { summary, .. } => summary,
+            other => panic!("expected created, got {other:?}"),
+        };
+
+        assert!(summary.contains("mode=local_filesystem_inventory"));
+        assert!(summary.contains("non_content_paths=2"));
+
+        let _ = fs::remove_dir_all(test_root);
+    }
+
+    #[test]
     fn controller_compares_two_versions_from_storage() {
         let test_root = unique_test_dir();
         let storage = ReportStorage::with_legacy_root(
@@ -864,7 +907,11 @@ mod tests {
         };
 
         let result = controller
-            .run_scan(&prepared, false, &knowledge_path.display().to_string())
+            .run_scan(
+                &prepared,
+                false,
+                &knowledge_path.display().to_string(),
+            )
             .expect("run scan with phase3");
         let summary = match result {
             ScanRunResult::Created { summary, .. } => summary,

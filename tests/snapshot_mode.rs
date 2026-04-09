@@ -4,7 +4,11 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use whashreonator::{cli::SnapshotArgs, pipeline::run_snapshot_command, snapshot::GameSnapshot};
+use whashreonator::{
+    cli::{SnapshotArgs, SnapshotCaptureScopeArg},
+    pipeline::run_snapshot_command,
+    snapshot::GameSnapshot,
+};
 
 #[test]
 fn snapshot_command_exports_machine_readable_snapshot() {
@@ -14,11 +18,13 @@ fn snapshot_command_exports_machine_readable_snapshot() {
 
     seed_local_asset(&source_root, "Content/Character/HeroA/Body.mesh");
     seed_local_asset(&source_root, "Content/Weapon/Sword.weapon");
+    seed_local_asset(&source_root, "Client/Config/DefaultGame.ini");
 
     let snapshot = run_snapshot_command(&SnapshotArgs {
         source_root: source_root.clone(),
         version_id: "2.4.0".to_string(),
         output: output_path.clone(),
+        capture_scope: SnapshotCaptureScopeArg::Full,
     })
     .expect("run snapshot command");
 
@@ -27,8 +33,8 @@ fn snapshot_command_exports_machine_readable_snapshot() {
 
     assert_eq!(snapshot.schema_version, "whashreonator.snapshot.v1");
     assert_eq!(snapshot.version_id, "2.4.0");
-    assert_eq!(snapshot.asset_count, 2);
-    assert_eq!(parsed.asset_count, 2);
+    assert_eq!(snapshot.asset_count, 3);
+    assert_eq!(parsed.asset_count, 3);
     assert_eq!(parsed.version_id, "2.4.0");
     assert_eq!(
         parsed.context.scope.capture_mode.as_deref(),
@@ -36,7 +42,7 @@ fn snapshot_command_exports_machine_readable_snapshot() {
     );
     assert_eq!(parsed.context.scope.coverage.content_like_path_count, 2);
     assert_eq!(parsed.context.scope.coverage.character_path_count, 1);
-    assert_eq!(parsed.context.scope.coverage.non_content_path_count, 0);
+    assert_eq!(parsed.context.scope.coverage.non_content_path_count, 1);
     assert_eq!(
         parsed.context.scope.mostly_install_or_package_level,
         Some(true)
@@ -46,6 +52,12 @@ fn snapshot_command_exports_machine_readable_snapshot() {
             .assets
             .iter()
             .any(|asset| asset.path == "Content/Character/HeroA/Body.mesh")
+    );
+    assert!(
+        parsed
+            .assets
+            .iter()
+            .any(|asset| asset.path == "Client/Config/DefaultGame.ini")
     );
     assert!(
         parsed
@@ -83,6 +95,7 @@ fn snapshot_command_auto_detects_version_and_enriches_hashes() {
         source_root: source_root.clone(),
         version_id: "auto".to_string(),
         output: output_path.clone(),
+        capture_scope: SnapshotCaptureScopeArg::Full,
     })
     .expect("run snapshot command");
 
@@ -130,6 +143,95 @@ fn snapshot_command_auto_detects_version_and_enriches_hashes() {
         asset.path == "Client/Content/Paks/pakchunk0-WindowsNoEditor.pak"
             && asset.hash_fields.asset_hash.as_deref() == Some("abc123")
     }));
+
+    let _ = fs::remove_dir_all(&test_root);
+}
+
+#[test]
+fn snapshot_command_supports_content_focused_capture_scope() {
+    let test_root = unique_test_dir();
+    let source_root = test_root.join("game");
+    let output_path = test_root.join("out").join("snapshot-content.json");
+
+    seed_local_asset(&source_root, "Client/Config/DefaultGame.ini");
+    seed_local_asset(&source_root, "Content/Character/HeroA/Body.mesh");
+    seed_local_asset(&source_root, "Content/Weapon/Sword.weapon");
+
+    let snapshot = run_snapshot_command(&SnapshotArgs {
+        source_root: source_root.clone(),
+        version_id: "2.4.0".to_string(),
+        output: output_path.clone(),
+        capture_scope: SnapshotCaptureScopeArg::Content,
+    })
+    .expect("run content-focused snapshot command");
+
+    let output = fs::read_to_string(&output_path).expect("read snapshot output");
+    let parsed: GameSnapshot = serde_json::from_str(&output).expect("parse snapshot json");
+
+    assert_eq!(snapshot.asset_count, 2);
+    assert_eq!(parsed.asset_count, 2);
+    assert!(
+        parsed
+            .assets
+            .iter()
+            .all(|asset| asset.path.starts_with("Content/"))
+    );
+    assert_eq!(
+        parsed.context.scope.capture_mode.as_deref(),
+        Some("local_filesystem_inventory_content_focused")
+    );
+    assert_eq!(parsed.context.scope.coverage.content_like_path_count, 2);
+    assert_eq!(parsed.context.scope.coverage.character_path_count, 1);
+    assert_eq!(parsed.context.scope.coverage.non_content_path_count, 0);
+    assert!(
+        parsed
+            .context
+            .scope
+            .note
+            .as_deref()
+            .is_some_and(|note| { note.contains("path-based filtering only") })
+    );
+
+    let _ = fs::remove_dir_all(&test_root);
+}
+
+#[test]
+fn snapshot_command_supports_character_focused_capture_scope() {
+    let test_root = unique_test_dir();
+    let source_root = test_root.join("game");
+    let output_path = test_root.join("out").join("snapshot-character.json");
+
+    seed_local_asset(&source_root, "Client/Config/DefaultGame.ini");
+    seed_local_asset(&source_root, "Content/Weapon/Sword.weapon");
+    seed_local_asset(&source_root, "Content/Character/HeroA/Body.mesh");
+    seed_local_asset(&source_root, "Content/Character/HeroB/Body.mesh");
+
+    let snapshot = run_snapshot_command(&SnapshotArgs {
+        source_root: source_root.clone(),
+        version_id: "2.4.0".to_string(),
+        output: output_path.clone(),
+        capture_scope: SnapshotCaptureScopeArg::Character,
+    })
+    .expect("run character-focused snapshot command");
+
+    let output = fs::read_to_string(&output_path).expect("read snapshot output");
+    let parsed: GameSnapshot = serde_json::from_str(&output).expect("parse snapshot json");
+
+    assert_eq!(snapshot.asset_count, 2);
+    assert_eq!(parsed.asset_count, 2);
+    assert!(
+        parsed
+            .assets
+            .iter()
+            .all(|asset| { asset.path.starts_with("Content/Character/") })
+    );
+    assert_eq!(
+        parsed.context.scope.capture_mode.as_deref(),
+        Some("local_filesystem_inventory_character_focused")
+    );
+    assert_eq!(parsed.context.scope.coverage.content_like_path_count, 2);
+    assert_eq!(parsed.context.scope.coverage.character_path_count, 2);
+    assert_eq!(parsed.context.scope.coverage.non_content_path_count, 0);
 
     let _ = fs::remove_dir_all(&test_root);
 }

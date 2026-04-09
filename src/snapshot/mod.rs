@@ -11,7 +11,10 @@ use crate::{
     domain::{AssetMetadata, AssetRecord},
     error::{AppError, AppResult},
     fingerprint::{AssetFingerprint, DefaultFingerprinter, Fingerprinter},
-    ingest::{LocalSnapshotIngestSource, SnapshotAssetExtractor},
+    ingest::{
+        FilteredLocalSnapshotAssetExtractor, LocalSnapshotCaptureScope, LocalSnapshotIngestSource,
+        SnapshotAssetExtractor,
+    },
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -188,9 +191,31 @@ where
 }
 
 pub fn create_local_snapshot(version_id: &str, source_root: &Path) -> AppResult<GameSnapshot> {
+    create_local_snapshot_with_capture_scope(
+        version_id,
+        source_root,
+        LocalSnapshotCaptureScope::FullInventory,
+    )
+}
+
+pub fn create_local_snapshot_with_capture_scope(
+    version_id: &str,
+    source_root: &Path,
+    capture_scope: LocalSnapshotCaptureScope,
+) -> AppResult<GameSnapshot> {
     // Current default path remains install/package-level filesystem inventory.
-    let mut snapshot =
-        create_snapshot_with_extractor(version_id, source_root, LocalSnapshotIngestSource)?;
+    let mut snapshot = match capture_scope {
+        LocalSnapshotCaptureScope::FullInventory => {
+            create_snapshot_with_extractor(version_id, source_root, LocalSnapshotIngestSource)?
+        }
+        LocalSnapshotCaptureScope::ContentFocused | LocalSnapshotCaptureScope::CharacterFocused => {
+            create_snapshot_with_extractor(
+                version_id,
+                source_root,
+                FilteredLocalSnapshotAssetExtractor::new(capture_scope),
+            )?
+        }
+    };
     enrich_snapshot_from_game_root(&mut snapshot, source_root)?;
     annotate_local_snapshot_scope(&mut snapshot);
     Ok(snapshot)
@@ -352,8 +377,14 @@ fn annotate_local_snapshot_scope(snapshot: &mut GameSnapshot) {
         coverage.character_path_count >= MIN_MEANINGFUL_CHARACTER_PATH_COUNT;
     let mostly_install_or_package_level =
         !(meaningful_content_coverage && meaningful_character_coverage);
+    let capture_mode = snapshot
+        .context
+        .scope
+        .capture_mode
+        .clone()
+        .unwrap_or_else(|| "local_filesystem_inventory".to_string());
 
-    let note = if mostly_install_or_package_level {
+    let mut note = if mostly_install_or_package_level {
         format!(
             "local snapshot looks mostly install/package-level (content-like paths: {}, character-like paths: {}, non-content paths: {})",
             coverage.content_like_path_count,
@@ -368,9 +399,15 @@ fn annotate_local_snapshot_scope(snapshot: &mut GameSnapshot) {
             coverage.non_content_path_count
         )
     };
+    if capture_mode != "local_filesystem_inventory" {
+        note.push_str(&format!(
+            "; capture mode '{}' narrows paths with path-based filtering only (not deep semantic extraction)",
+            capture_mode
+        ));
+    }
 
     snapshot.context.scope = SnapshotScopeContext {
-        capture_mode: Some("local_filesystem_inventory".to_string()),
+        capture_mode: Some(capture_mode),
         mostly_install_or_package_level: Some(mostly_install_or_package_level),
         meaningful_content_coverage: Some(meaningful_content_coverage),
         meaningful_character_coverage: Some(meaningful_character_coverage),
@@ -535,12 +572,12 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use crate::ingest::PreparedSnapshotAssetExtractor;
+    use crate::ingest::{LocalSnapshotCaptureScope, PreparedSnapshotAssetExtractor};
 
     use super::{
         GameSnapshot, SnapshotAsset, SnapshotContext, SnapshotFingerprint, SnapshotHashFields,
         SnapshotScopeContext, assess_snapshot_scope, create_local_snapshot,
-        create_snapshot_with_extractor, load_snapshot,
+        create_local_snapshot_with_capture_scope, create_snapshot_with_extractor, load_snapshot,
     };
 
     #[test]
@@ -705,6 +742,74 @@ mod tests {
 
         assert_eq!(snapshot.context.notes, vec!["legacy note".to_string()]);
         assert_eq!(snapshot.context.scope, SnapshotScopeContext::default());
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[test]
+    fn create_local_snapshot_with_content_focus_filters_non_content_paths() {
+        let test_root = unique_test_dir();
+        let local_root = test_root.join("game");
+        seed_local_asset(&local_root, "Client/Config/DefaultGame.ini");
+        seed_local_asset(&local_root, "Content/Character/HeroA/Body.mesh");
+        seed_local_asset(&local_root, "Content/Weapon/Sword.weapon");
+
+        let snapshot = create_local_snapshot_with_capture_scope(
+            "2.4.0",
+            &local_root,
+            LocalSnapshotCaptureScope::ContentFocused,
+        )
+        .expect("create content-focused snapshot");
+
+        assert_eq!(snapshot.asset_count, 2);
+        assert!(
+            snapshot
+                .assets
+                .iter()
+                .all(|asset| asset.path.starts_with("Content/"))
+        );
+        assert_eq!(
+            snapshot.context.scope.capture_mode.as_deref(),
+            Some("local_filesystem_inventory_content_focused")
+        );
+        assert_eq!(snapshot.context.scope.coverage.content_like_path_count, 2);
+        assert_eq!(snapshot.context.scope.coverage.non_content_path_count, 0);
+        assert!(
+            snapshot
+                .context
+                .scope
+                .note
+                .as_deref()
+                .is_some_and(|note| note.contains("path-based filtering only"))
+        );
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[test]
+    fn create_local_snapshot_with_character_focus_keeps_character_paths_only() {
+        let test_root = unique_test_dir();
+        let local_root = test_root.join("game");
+        seed_local_asset(&local_root, "Content/Character/HeroA/Body.mesh");
+        seed_local_asset(&local_root, "Content/Weapon/Sword.weapon");
+        seed_local_asset(&local_root, "Client/Config/DefaultGame.ini");
+
+        let snapshot = create_local_snapshot_with_capture_scope(
+            "2.4.0",
+            &local_root,
+            LocalSnapshotCaptureScope::CharacterFocused,
+        )
+        .expect("create character-focused snapshot");
+
+        assert_eq!(snapshot.asset_count, 1);
+        assert_eq!(snapshot.assets[0].path, "Content/Character/HeroA/Body.mesh");
+        assert_eq!(
+            snapshot.context.scope.capture_mode.as_deref(),
+            Some("local_filesystem_inventory_character_focused")
+        );
+        assert_eq!(snapshot.context.scope.coverage.content_like_path_count, 1);
+        assert_eq!(snapshot.context.scope.coverage.character_path_count, 1);
+        assert_eq!(snapshot.context.scope.coverage.non_content_path_count, 0);
 
         let _ = fs::remove_dir_all(&test_root);
     }

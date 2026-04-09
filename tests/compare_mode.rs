@@ -5,7 +5,7 @@ use std::{
 };
 
 use whashreonator::{
-    cli::{CompareSnapshotsArgs, SnapshotArgs},
+    cli::{CompareSnapshotsArgs, SnapshotArgs, SnapshotCaptureScopeArg},
     compare::SnapshotCompareReport,
     pipeline::{run_compare_snapshots_command, run_snapshot_command},
 };
@@ -28,12 +28,14 @@ fn compare_snapshots_command_exports_change_categories() {
         source_root: old_root,
         version_id: "2.4.0".to_string(),
         output: old_snapshot_path.clone(),
+        capture_scope: SnapshotCaptureScopeArg::Full,
     })
     .expect("create old snapshot");
     run_snapshot_command(&SnapshotArgs {
         source_root: new_root,
         version_id: "2.5.0".to_string(),
         output: new_snapshot_path.clone(),
+        capture_scope: SnapshotCaptureScopeArg::Full,
     })
     .expect("create new snapshot");
 

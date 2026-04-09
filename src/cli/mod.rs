@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{ArgAction, Args, Parser, Subcommand};
+use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -63,6 +63,15 @@ pub struct SnapshotArgs {
     pub version_id: String,
     #[arg(long)]
     pub output: PathBuf,
+    #[arg(long, value_enum, default_value_t = SnapshotCaptureScopeArg::Full)]
+    pub capture_scope: SnapshotCaptureScopeArg,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum SnapshotCaptureScopeArg {
+    Full,
+    Content,
+    Character,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -115,4 +124,53 @@ pub struct GenerateProposalsArgs {
     pub summary_output: Option<PathBuf>,
     #[arg(long, default_value_t = 0.85)]
     pub min_confidence: f32,
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::{Cli, Command, SnapshotCaptureScopeArg};
+
+    #[test]
+    fn snapshot_command_defaults_capture_scope_to_full() {
+        let cli = Cli::parse_from([
+            "whashreonator",
+            "snapshot",
+            "--source-root",
+            "D:/fake-game",
+            "--version-id",
+            "2.4.0",
+            "--output",
+            "out/snapshot.json",
+        ]);
+
+        let Command::Snapshot(args) = cli.command else {
+            panic!("expected snapshot command");
+        };
+
+        assert_eq!(args.capture_scope, SnapshotCaptureScopeArg::Full);
+    }
+
+    #[test]
+    fn snapshot_command_parses_capture_scope_option() {
+        let cli = Cli::parse_from([
+            "whashreonator",
+            "snapshot",
+            "--source-root",
+            "D:/fake-game",
+            "--version-id",
+            "2.4.0",
+            "--output",
+            "out/snapshot.json",
+            "--capture-scope",
+            "character",
+        ]);
+
+        let Command::Snapshot(args) = cli.command else {
+            panic!("expected snapshot command");
+        };
+
+        assert_eq!(args.capture_scope, SnapshotCaptureScopeArg::Character);
+    }
 }
