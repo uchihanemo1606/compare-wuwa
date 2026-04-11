@@ -7,11 +7,14 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    compare::RiskLevel,
+    compare::{RemapCompatibility, RiskLevel},
     error::{AppError, AppResult},
     inference::{
-        InferenceCompareInput, InferenceKnowledgeInput, InferenceReport, load_inference_report,
+        InferenceCompareInput, InferenceKnowledgeInput, InferenceReport,
+        InferredMappingContinuityContext, InferredMappingHint, ProbableCrashCause,
+        load_inference_report,
     },
+    report::VersionContinuityRelation,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -47,6 +50,10 @@ pub struct MappingProposalEntry {
     pub old_asset_path: String,
     pub new_asset_path: String,
     pub confidence: f32,
+    #[serde(default)]
+    pub compatibility: RemapCompatibility,
+    #[serde(default)]
+    pub continuity: Option<InferredMappingContinuityContext>,
     pub status: ProposalStatus,
     pub reasons: Vec<String>,
     pub evidence: Vec<String>,
@@ -87,6 +94,23 @@ pub struct ProposalArtifacts {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ProposalEngine;
 
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct ContinuityProposalCaution {
+    instability_cause: bool,
+    repeated_layout_drift: bool,
+    terminal_history: bool,
+    review_required_history: bool,
+}
+
+impl ContinuityProposalCaution {
+    fn blocks_auto_proposal(&self) -> bool {
+        self.instability_cause
+            || self.repeated_layout_drift
+            || self.terminal_history
+            || self.review_required_history
+    }
+}
+
 impl ProposalEngine {
     pub fn generate_files(
         &self,
@@ -106,10 +130,17 @@ impl ProposalEngine {
             .suggested_fixes
             .iter()
             .any(|fix| fix.code == "review_candidate_asset_remaps");
-        let layout_fix_available = report
+        let continuity_fix_available = report
             .suggested_fixes
             .iter()
-            .any(|fix| fix.code == "review_buffer_layout_and_runtime_guards");
+            .any(|fix| fix.code == "review_continuity_thread_history_before_repair");
+        let layout_fix_available = report.suggested_fixes.iter().any(|fix| {
+            matches!(
+                fix.code.as_str(),
+                "review_buffer_layout_and_runtime_guards"
+                    | "validate_candidate_remaps_against_layout"
+            )
+        });
 
         let mut mappings = report
             .candidate_mapping_hints
@@ -117,10 +148,14 @@ impl ProposalEngine {
             .map(|hint| {
                 let blocked = blocked_paths.contains(&hint.old_asset_path)
                     || blocked_paths.contains(&hint.new_asset_path);
+                let continuity_caution = continuity_proposal_caution(report, hint);
                 let strong_low_signal_justification =
                     has_strong_low_signal_justification(hint, min_confidence, blocked);
-                let status = if !blocked
+                let compatibility_allows_proposal = hint.compatibility.supports_auto_proposal();
+                let status = if compatibility_allows_proposal
+                    && !blocked
                     && !hint.ambiguous
+                    && !continuity_caution.blocks_auto_proposal()
                     && hint.confidence >= min_confidence
                     && (!low_signal_compare || strong_low_signal_justification)
                 {
@@ -130,10 +165,17 @@ impl ProposalEngine {
                 };
 
                 let mut reasons = hint.reasons.clone();
-                if blocked {
+                if !compatibility_allows_proposal {
+                    reasons.push(format!(
+                        "compatibility assessment is {}; keep this mapping in review state",
+                        compatibility_label(&hint.compatibility)
+                    ));
+                } else if blocked {
                     reasons.push(
                         "high-risk structural drift affects one of the mapped assets; keep this mapping in review state".to_string(),
                     );
+                } else if continuity_caution.blocks_auto_proposal() {
+                    reasons.extend(continuity_caution_reasons(&continuity_caution));
                 } else if hint.ambiguous {
                     reasons.push(
                         "multiple remap candidates remain too close after compare scoring; keep this mapping in review state".to_string(),
@@ -167,6 +209,9 @@ impl ProposalEngine {
                 if blocked {
                     evidence.extend(blocking_evidence(report, &hint.old_asset_path, &hint.new_asset_path));
                 }
+                if continuity_caution.blocks_auto_proposal() {
+                    evidence.extend(continuity_caution_evidence(report, hint));
+                }
                 if hint.ambiguous {
                     evidence.push(format!(
                         "mapping hint marked ambiguous with confidence gap {}",
@@ -191,6 +236,9 @@ impl ProposalEngine {
                 if remap_fix_available {
                     related_fix_codes.push("review_candidate_asset_remaps".to_string());
                 }
+                if continuity_fix_available && continuity_caution.blocks_auto_proposal() {
+                    related_fix_codes.push("review_continuity_thread_history_before_repair".to_string());
+                }
                 if blocked && layout_fix_available {
                     related_fix_codes.push("review_buffer_layout_and_runtime_guards".to_string());
                 }
@@ -199,6 +247,8 @@ impl ProposalEngine {
                     old_asset_path: hint.old_asset_path.clone(),
                     new_asset_path: hint.new_asset_path.clone(),
                     confidence: hint.confidence,
+                    compatibility: hint.compatibility.clone(),
+                    continuity: hint.continuity.clone(),
                     status,
                     reasons,
                     evidence,
@@ -309,7 +359,10 @@ fn structurally_blocked_paths(report: &InferenceReport) -> BTreeSet<String> {
             cause.risk == RiskLevel::High
                 && matches!(
                     cause.code.as_str(),
-                    "buffer_layout_changed" | "asset_signature_or_hash_changed"
+                    "buffer_layout_changed"
+                        | "asset_signature_or_hash_changed"
+                        | "candidate_remap_structural_drift"
+                        | "candidate_remap_identity_conflict"
                 )
         })
         .flat_map(|cause| cause.affected_assets.iter().cloned())
@@ -341,6 +394,176 @@ fn blocking_evidence(
         .collect()
 }
 
+fn continuity_proposal_caution(
+    report: &InferenceReport,
+    hint: &InferredMappingHint,
+) -> ContinuityProposalCaution {
+    let instability_cause = report.probable_crash_causes.iter().any(|cause| {
+        cause.code == "continuity_thread_instability" && cause_matches_hint(cause, hint)
+    });
+    if let Some(continuity) = hint.continuity.as_ref() {
+        return ContinuityProposalCaution {
+            instability_cause,
+            repeated_layout_drift: continuity.total_layout_drift_steps >= 2,
+            terminal_history: continuity.terminal_after_current
+                || continuity.terminal_relation.is_some(),
+            review_required_history: continuity.review_required_history,
+        };
+    }
+
+    let legacy = legacy_continuity_proposal_caution(hint);
+    ContinuityProposalCaution {
+        instability_cause,
+        repeated_layout_drift: legacy.repeated_layout_drift,
+        terminal_history: legacy.terminal_history,
+        review_required_history: legacy.review_required_history,
+    }
+}
+
+fn legacy_continuity_proposal_caution(hint: &InferredMappingHint) -> ContinuityProposalCaution {
+    let repeated_layout_drift = hint
+        .reasons
+        .iter()
+        .chain(hint.evidence.iter())
+        .any(|item| item.contains("repeated layout drift"));
+    let terminal_history = hint.reasons.iter().chain(hint.evidence.iter()).any(|item| {
+        item.contains("terminal state")
+            || item.contains("later marks this thread as")
+            || item.contains("later terminates")
+    });
+    let review_required_history = hint
+        .reasons
+        .iter()
+        .chain(hint.evidence.iter())
+        .any(|item| item.contains("review-required"));
+
+    ContinuityProposalCaution {
+        instability_cause: false,
+        repeated_layout_drift,
+        terminal_history,
+        review_required_history,
+    }
+}
+
+fn continuity_caution_reasons(caution: &ContinuityProposalCaution) -> Vec<String> {
+    let mut reasons = Vec::new();
+
+    if caution.instability_cause {
+        reasons.push(
+            "continuity-backed inference flagged broader thread instability for this mapping; keep it in review state"
+                .to_string(),
+        );
+    }
+    if caution.repeated_layout_drift {
+        reasons.push(
+            "broader continuity history shows repeated layout drift on this asset thread; keep this mapping in review state"
+                .to_string(),
+        );
+    }
+    if caution.terminal_history {
+        reasons.push(
+            "broader continuity history reaches a later terminal state for this thread; do not auto-promote this mapping"
+                .to_string(),
+        );
+    }
+    if caution.review_required_history {
+        reasons.push(
+            "broader continuity history already marked this thread review-required; keep review-first behavior"
+                .to_string(),
+        );
+    }
+
+    reasons
+}
+
+fn continuity_caution_evidence(
+    report: &InferenceReport,
+    hint: &InferredMappingHint,
+) -> Vec<String> {
+    let mut evidence = BTreeSet::<String>::new();
+
+    if let Some(continuity) = hint.continuity.as_ref() {
+        if let (Some(first_seen), Some(latest_observed)) = (
+            continuity.first_seen_version.as_deref(),
+            continuity.latest_observed_version.as_deref(),
+        ) {
+            evidence.insert(format!(
+                "structured continuity thread span: {} -> {}",
+                first_seen, latest_observed
+            ));
+        }
+        if continuity.total_layout_drift_steps >= 2 {
+            evidence.insert(format!(
+                "structured continuity history records {} layout-drift step(s)",
+                continuity.total_layout_drift_steps
+            ));
+        }
+        if continuity.review_required_history {
+            evidence.insert(
+                "structured continuity history already marked this thread review-required"
+                    .to_string(),
+            );
+        }
+        if let Some(relation) = continuity.terminal_relation.as_ref() {
+            evidence.insert(format!(
+                "structured continuity history reaches terminal state {} in {}",
+                continuity_relation_label(relation),
+                continuity.terminal_version.as_deref().unwrap_or("unknown")
+            ));
+        }
+    }
+
+    for cause in report.probable_crash_causes.iter().filter(|cause| {
+        cause.code == "continuity_thread_instability" && cause_matches_hint(cause, hint)
+    }) {
+        evidence.insert(format!(
+            "continuity-backed crash cause {} with confidence {:.3}: {}",
+            cause.code, cause.confidence, cause.summary
+        ));
+        for item in cause.evidence.iter().take(3) {
+            evidence.insert(item.clone());
+        }
+    }
+
+    if continuity_proposal_caution(report, hint).blocks_auto_proposal() {
+        for fix in report
+            .suggested_fixes
+            .iter()
+            .filter(|fix| fix.code == "review_continuity_thread_history_before_repair")
+        {
+            evidence.insert(format!(
+                "continuity-backed fix {} with confidence {:.3}: {}",
+                fix.code, fix.confidence, fix.summary
+            ));
+            for item in fix.evidence.iter().take(2) {
+                evidence.insert(item.clone());
+            }
+        }
+    }
+
+    evidence.into_iter().collect()
+}
+
+fn cause_matches_hint(cause: &ProbableCrashCause, hint: &InferredMappingHint) -> bool {
+    cause
+        .affected_assets
+        .iter()
+        .any(|asset| asset == &hint.old_asset_path || asset == &hint.new_asset_path)
+}
+
+fn continuity_relation_label(relation: &VersionContinuityRelation) -> &'static str {
+    match relation {
+        VersionContinuityRelation::Persisted => "persisted",
+        VersionContinuityRelation::RenameOrRepath => "rename/repath",
+        VersionContinuityRelation::ContainerMovement => "container movement",
+        VersionContinuityRelation::LayoutDrift => "layout drift",
+        VersionContinuityRelation::Replacement => "replacement",
+        VersionContinuityRelation::Ambiguous => "ambiguous",
+        VersionContinuityRelation::InsufficientEvidence => "insufficient evidence",
+        VersionContinuityRelation::Removed => "removed",
+    }
+}
+
 fn has_strong_low_signal_justification(
     hint: &crate::inference::InferredMappingHint,
     min_confidence: f32,
@@ -350,7 +573,31 @@ fn has_strong_low_signal_justification(
         return false;
     }
 
-    let strong_confidence_threshold = (min_confidence + 0.03).max(0.90).clamp(0.0, 1.0);
+    if hint.compatibility != RemapCompatibility::LikelyCompatible {
+        return false;
+    }
+
+    let has_path_and_name_anchor = has_reason_code(&hint.reasons, "normalized_name_exact")
+        && has_reason_code(&hint.reasons, "same_parent_directory");
+    let has_identity_anchor = has_reason_code(&hint.reasons, "signature_exact")
+        || has_reason_code(&hint.reasons, "asset_hash_exact");
+    let has_structural_compatibility =
+        has_reason_code(&hint.reasons, "structural_layout_compatible")
+            || has_reason_code(&hint.reasons, "buffer_layout_compatible");
+    let has_conflict = has_reason_code(&hint.reasons, "identity_conflict_detected")
+        || has_reason_code(&hint.reasons, "same_asset_but_structural_drift")
+        || has_reason_code(&hint.reasons, "buffer_layout_validation_needed")
+        || has_reason_code(&hint.reasons, "weak_identity_evidence");
+
+    if has_conflict {
+        return false;
+    }
+
+    let strong_confidence_threshold = if has_path_and_name_anchor && has_structural_compatibility {
+        (min_confidence + 0.02).max(0.88).clamp(0.0, 1.0)
+    } else {
+        (min_confidence + 0.03).max(0.90).clamp(0.0, 1.0)
+    };
     if hint.confidence < strong_confidence_threshold {
         return false;
     }
@@ -359,8 +606,17 @@ fn has_strong_low_signal_justification(
         return false;
     }
 
-    has_reason_code(&hint.reasons, "normalized_name_exact")
-        && has_reason_code(&hint.reasons, "same_parent_directory")
+    (has_path_and_name_anchor && has_structural_compatibility) || has_identity_anchor
+}
+
+fn compatibility_label(compatibility: &RemapCompatibility) -> &'static str {
+    match compatibility {
+        RemapCompatibility::LikelyCompatible => "likely compatible",
+        RemapCompatibility::CompatibleWithCaution => "compatible with caution",
+        RemapCompatibility::StructurallyRisky => "structurally risky",
+        RemapCompatibility::IncompatibleBlocked => "incompatible/blocked",
+        RemapCompatibility::InsufficientEvidence => "insufficient evidence",
+    }
 }
 
 fn has_reason_code(reasons: &[String], code: &str) -> bool {
@@ -380,11 +636,13 @@ fn current_unix_ms() -> AppResult<u128> {
 #[cfg(test)]
 mod tests {
     use crate::{
-        compare::RiskLevel,
+        compare::{RemapCompatibility, RiskLevel},
         inference::{
             InferenceCompareInput, InferenceKnowledgeInput, InferenceReport, InferenceScopeContext,
-            InferenceSummary, InferredMappingHint, ProbableCrashCause, SuggestedFix,
+            InferenceSummary, InferredMappingContinuityContext, InferredMappingHint,
+            ProbableCrashCause, SuggestedFix,
         },
+        report::VersionContinuityRelation,
         wwmi::WwmiPatternKind,
     };
 
@@ -453,9 +711,11 @@ mod tests {
                     old_asset_path: "Content/Weapon/Sword.weapon".to_string(),
                     new_asset_path: "Content/Weapon/Sword_v2.weapon".to_string(),
                     confidence: 0.93,
+                    compatibility: RemapCompatibility::CompatibleWithCaution,
                     needs_review: true,
                     ambiguous: false,
                     confidence_gap: None,
+                    continuity: None,
                     reasons: vec!["normalized_name_exact: same logical asset".to_string()],
                     evidence: vec!["compare candidate confidence 0.930".to_string()],
                 },
@@ -463,9 +723,11 @@ mod tests {
                     old_asset_path: "Content/Character/HeroA/Body.mesh".to_string(),
                     new_asset_path: "Content/Character/HeroA/Body_v2.mesh".to_string(),
                     confidence: 0.95,
+                    compatibility: RemapCompatibility::StructurallyRisky,
                     needs_review: true,
                     ambiguous: false,
                     confidence_gap: None,
+                    continuity: None,
                     reasons: vec!["same_parent_directory: same folder".to_string()],
                     evidence: vec!["compare candidate confidence 0.950".to_string()],
                 },
@@ -547,9 +809,11 @@ mod tests {
                     old_asset_path: "Client/Content/Paks/pakchunk0-WindowsNoEditor.pak".to_string(),
                     new_asset_path: "Client/Content/Paks/pakchunk1-WindowsNoEditor.pak".to_string(),
                     confidence: 0.93,
+                    compatibility: RemapCompatibility::InsufficientEvidence,
                     needs_review: true,
                     ambiguous: false,
                     confidence_gap: Some(0.20),
+                    continuity: None,
                     reasons: vec![
                         "same_parent_directory: same folder".to_string(),
                         "path_token_overlap: overlap".to_string(),
@@ -560,12 +824,15 @@ mod tests {
                     old_asset_path: "Content/Character/Encore/Hair.mesh".to_string(),
                     new_asset_path: "Content/Character/Encore/Hair_LOD0.mesh".to_string(),
                     confidence: 0.96,
+                    compatibility: RemapCompatibility::LikelyCompatible,
                     needs_review: true,
                     ambiguous: false,
                     confidence_gap: Some(0.25),
+                    continuity: None,
                     reasons: vec![
                         "normalized_name_exact: encore hair".to_string(),
                         "same_parent_directory: same folder".to_string(),
+                        "structural_layout_compatible: vertex_count, index_count, material_slots, section_count".to_string(),
                     ],
                     evidence: vec!["compare candidate confidence 0.960".to_string()],
                 },
@@ -595,5 +862,349 @@ mod tests {
             .find(|entry| entry.old_asset_path.contains("Hair.mesh"))
             .expect("strong mapping");
         assert_eq!(strong_mapping.status, ProposalStatus::Proposed);
+    }
+
+    #[test]
+    fn proposal_engine_keeps_structurally_drifted_remaps_in_review() {
+        let report = InferenceReport {
+            schema_version: "whashreonator.inference.v1".to_string(),
+            generated_at_unix_ms: 1,
+            compare_input: InferenceCompareInput {
+                old_version_id: "6.0.0".to_string(),
+                new_version_id: "6.1.0".to_string(),
+                changed_assets: 0,
+                added_assets: 1,
+                removed_assets: 1,
+                candidate_mapping_changes: 1,
+            },
+            knowledge_input: InferenceKnowledgeInput {
+                repo: "repo".to_string(),
+                analyzed_commits: 2,
+                fix_like_commits: 2,
+                discovered_patterns: 2,
+            },
+            scope: InferenceScopeContext::default(),
+            summary: InferenceSummary {
+                probable_crash_causes: 1,
+                suggested_fixes: 1,
+                candidate_mapping_hints: 1,
+                highest_confidence: 0.94,
+            },
+            probable_crash_causes: vec![ProbableCrashCause {
+                code: "candidate_remap_structural_drift".to_string(),
+                summary: "candidate remap has structural drift".to_string(),
+                confidence: 0.94,
+                risk: RiskLevel::High,
+                affected_assets: vec![
+                    "Content/Character/Encore/Body.mesh".to_string(),
+                    "Content/Character/Encore/Body_v2.mesh".to_string(),
+                ],
+                related_patterns: vec![WwmiPatternKind::BufferLayoutOrCapacityFix],
+                reasons: vec!["structural drift detected".to_string()],
+                evidence: vec!["compare found structural drift".to_string()],
+            }],
+            suggested_fixes: vec![SuggestedFix {
+                code: "validate_candidate_remaps_against_layout".to_string(),
+                summary: "validate remap against layout".to_string(),
+                confidence: 0.93,
+                priority: RiskLevel::High,
+                related_patterns: vec![WwmiPatternKind::BufferLayoutOrCapacityFix],
+                actions: vec!["compare layout".to_string()],
+                reasons: vec!["remap is not layout-safe yet".to_string()],
+                evidence: vec!["compare found drift".to_string()],
+            }],
+            candidate_mapping_hints: vec![InferredMappingHint {
+                old_asset_path: "Content/Character/Encore/Body.mesh".to_string(),
+                new_asset_path: "Content/Character/Encore/Body_v2.mesh".to_string(),
+                confidence: 0.94,
+                compatibility: RemapCompatibility::StructurallyRisky,
+                needs_review: true,
+                ambiguous: false,
+                confidence_gap: Some(0.25),
+                continuity: None,
+                reasons: vec![
+                    "signature_exact: exact identity anchor".to_string(),
+                    "same_asset_but_structural_drift: structure changed".to_string(),
+                ],
+                evidence: vec!["compare candidate confidence 0.940".to_string()],
+            }],
+        };
+
+        let artifacts = ProposalEngine.generate(&report, 0.90);
+
+        assert_eq!(artifacts.mapping_proposal.summary.proposed_mappings, 0);
+        assert_eq!(
+            artifacts.mapping_proposal.mappings[0].status,
+            ProposalStatus::NeedsReview
+        );
+        assert!(
+            artifacts.mapping_proposal.mappings[0]
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("review"))
+        );
+    }
+
+    #[test]
+    fn proposal_engine_uses_compatibility_not_confidence_alone() {
+        let report = InferenceReport {
+            schema_version: "whashreonator.inference.v1".to_string(),
+            generated_at_unix_ms: 1,
+            compare_input: InferenceCompareInput {
+                old_version_id: "7.0.0".to_string(),
+                new_version_id: "7.1.0".to_string(),
+                changed_assets: 0,
+                added_assets: 1,
+                removed_assets: 1,
+                candidate_mapping_changes: 2,
+            },
+            knowledge_input: InferenceKnowledgeInput {
+                repo: "repo".to_string(),
+                analyzed_commits: 2,
+                fix_like_commits: 2,
+                discovered_patterns: 2,
+            },
+            scope: InferenceScopeContext::default(),
+            summary: InferenceSummary {
+                probable_crash_causes: 0,
+                suggested_fixes: 0,
+                candidate_mapping_hints: 2,
+                highest_confidence: 0.97,
+            },
+            probable_crash_causes: Vec::new(),
+            suggested_fixes: Vec::new(),
+            candidate_mapping_hints: vec![
+                InferredMappingHint {
+                    old_asset_path: "Content/Character/Encore/Hair.mesh".to_string(),
+                    new_asset_path: "Content/Character/Encore/Hair_LOD0.mesh".to_string(),
+                    confidence: 0.97,
+                    compatibility: RemapCompatibility::LikelyCompatible,
+                    needs_review: false,
+                    ambiguous: false,
+                    confidence_gap: Some(0.20),
+                    continuity: None,
+                    reasons: vec![
+                        "normalized_name_exact: encore hair".to_string(),
+                        "same_parent_directory: same folder".to_string(),
+                        "structural_layout_compatible: vertex_count".to_string(),
+                    ],
+                    evidence: vec!["compare candidate confidence 0.970".to_string()],
+                },
+                InferredMappingHint {
+                    old_asset_path: "Content/Character/Encore/Face.mesh".to_string(),
+                    new_asset_path: "Content/Character/Encore/Face_LOD0.mesh".to_string(),
+                    confidence: 0.97,
+                    compatibility: RemapCompatibility::InsufficientEvidence,
+                    needs_review: false,
+                    ambiguous: false,
+                    confidence_gap: Some(0.20),
+                    continuity: None,
+                    reasons: vec![
+                        "weak_identity_evidence: weak".to_string(),
+                        "path_token_overlap: overlap".to_string(),
+                    ],
+                    evidence: vec!["compare candidate confidence 0.970".to_string()],
+                },
+            ],
+        };
+
+        let artifacts = ProposalEngine.generate(&report, 0.90);
+        let compatible = artifacts
+            .mapping_proposal
+            .mappings
+            .iter()
+            .find(|entry| entry.old_asset_path.ends_with("Hair.mesh"))
+            .expect("compatible mapping");
+        let insufficient = artifacts
+            .mapping_proposal
+            .mappings
+            .iter()
+            .find(|entry| entry.old_asset_path.ends_with("Face.mesh"))
+            .expect("insufficient mapping");
+
+        assert_eq!(compatible.status, ProposalStatus::Proposed);
+        assert_eq!(
+            compatible.compatibility,
+            RemapCompatibility::LikelyCompatible
+        );
+        assert_eq!(insufficient.status, ProposalStatus::NeedsReview);
+        assert_eq!(
+            insufficient.compatibility,
+            RemapCompatibility::InsufficientEvidence
+        );
+    }
+
+    #[test]
+    fn proposal_engine_keeps_continuity_unstable_mapping_in_review() {
+        let report = InferenceReport {
+            schema_version: "whashreonator.inference.v1".to_string(),
+            generated_at_unix_ms: 1,
+            compare_input: InferenceCompareInput {
+                old_version_id: "8.0.0".to_string(),
+                new_version_id: "8.1.0".to_string(),
+                changed_assets: 0,
+                added_assets: 1,
+                removed_assets: 1,
+                candidate_mapping_changes: 1,
+            },
+            knowledge_input: InferenceKnowledgeInput {
+                repo: "repo".to_string(),
+                analyzed_commits: 3,
+                fix_like_commits: 2,
+                discovered_patterns: 2,
+            },
+            scope: InferenceScopeContext::default(),
+            summary: InferenceSummary {
+                probable_crash_causes: 1,
+                suggested_fixes: 1,
+                candidate_mapping_hints: 1,
+                highest_confidence: 0.95,
+            },
+            probable_crash_causes: vec![ProbableCrashCause {
+                code: "continuity_thread_instability".to_string(),
+                summary: "broader thread history is unstable".to_string(),
+                confidence: 0.84,
+                risk: RiskLevel::High,
+                affected_assets: vec!["Content/Character/Encore/Body.mesh".to_string()],
+                related_patterns: vec![WwmiPatternKind::MappingOrHashUpdate],
+                reasons: vec!["continuity surfaces unstable thread history".to_string()],
+                evidence: vec!["continuity thread Content/Character/Encore/Body_v2.mesh spans 7.0.0 -> 8.2.0; later terminates as removed in 8.2.0".to_string()],
+            }],
+            suggested_fixes: vec![SuggestedFix {
+                code: "review_continuity_thread_history_before_repair".to_string(),
+                summary: "review continuity history".to_string(),
+                confidence: 0.82,
+                priority: RiskLevel::High,
+                related_patterns: vec![WwmiPatternKind::MappingOrHashUpdate],
+                actions: vec!["inspect continuity milestones".to_string()],
+                reasons: vec!["broader thread history is unstable".to_string()],
+                evidence: vec!["continuity thread later terminates as removed in 8.2.0".to_string()],
+            }],
+            candidate_mapping_hints: vec![InferredMappingHint {
+                old_asset_path: "Content/Character/Encore/Body.mesh".to_string(),
+                new_asset_path: "Content/Character/Encore/Body_v2.mesh".to_string(),
+                confidence: 0.95,
+                compatibility: RemapCompatibility::CompatibleWithCaution,
+                needs_review: true,
+                ambiguous: false,
+                confidence_gap: Some(0.20),
+                continuity: Some(InferredMappingContinuityContext {
+                    thread_id: Some("encore_body".to_string()),
+                    first_seen_version: Some("7.0.0".to_string()),
+                    latest_observed_version: Some("8.2.0".to_string()),
+                    latest_live_version: None,
+                    stable_before_current_change: false,
+                    total_rename_steps: 1,
+                    total_container_movement_steps: 0,
+                    total_layout_drift_steps: 0,
+                    review_required_history: true,
+                    terminal_relation: Some(VersionContinuityRelation::Removed),
+                    terminal_version: Some("8.2.0".to_string()),
+                    terminal_after_current: true,
+                    instability_detected: true,
+                }),
+                reasons: vec![
+                    "normalized_name_exact: encore body".to_string(),
+                    "same_parent_directory: same folder".to_string(),
+                ],
+                evidence: vec!["compare candidate confidence 0.950".to_string()],
+            }],
+        };
+
+        let artifacts = ProposalEngine.generate(&report, 0.90);
+        let mapping = artifacts
+            .mapping_proposal
+            .mappings
+            .first()
+            .expect("mapping exists");
+
+        assert_eq!(mapping.status, ProposalStatus::NeedsReview);
+        assert!(
+            mapping
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("terminal state"))
+        );
+        assert!(
+            mapping
+                .evidence
+                .iter()
+                .any(|item| item.contains("continuity-backed crash cause"))
+        );
+        assert!(
+            mapping
+                .related_fix_codes
+                .iter()
+                .any(|code| code == "review_continuity_thread_history_before_repair")
+        );
+    }
+
+    #[test]
+    fn proposal_engine_does_not_penalize_stable_continuity_context_by_itself() {
+        let report = InferenceReport {
+            schema_version: "whashreonator.inference.v1".to_string(),
+            generated_at_unix_ms: 1,
+            compare_input: InferenceCompareInput {
+                old_version_id: "9.0.0".to_string(),
+                new_version_id: "9.1.0".to_string(),
+                changed_assets: 0,
+                added_assets: 1,
+                removed_assets: 1,
+                candidate_mapping_changes: 1,
+            },
+            knowledge_input: InferenceKnowledgeInput {
+                repo: "repo".to_string(),
+                analyzed_commits: 2,
+                fix_like_commits: 1,
+                discovered_patterns: 1,
+            },
+            scope: InferenceScopeContext::default(),
+            summary: InferenceSummary {
+                probable_crash_causes: 0,
+                suggested_fixes: 0,
+                candidate_mapping_hints: 1,
+                highest_confidence: 0.94,
+            },
+            probable_crash_causes: Vec::new(),
+            suggested_fixes: Vec::new(),
+            candidate_mapping_hints: vec![InferredMappingHint {
+                old_asset_path: "Content/Character/Encore/Hair.mesh".to_string(),
+                new_asset_path: "Content/Character/Encore/Hair_LOD0.mesh".to_string(),
+                confidence: 0.94,
+                compatibility: RemapCompatibility::LikelyCompatible,
+                needs_review: true,
+                ambiguous: false,
+                confidence_gap: Some(0.24),
+                continuity: Some(InferredMappingContinuityContext {
+                    thread_id: Some("encore_hair".to_string()),
+                    first_seen_version: Some("8.0.0".to_string()),
+                    latest_observed_version: Some("9.1.0".to_string()),
+                    latest_live_version: Some("9.1.0".to_string()),
+                    stable_before_current_change: true,
+                    total_rename_steps: 1,
+                    total_container_movement_steps: 0,
+                    total_layout_drift_steps: 0,
+                    review_required_history: false,
+                    terminal_relation: None,
+                    terminal_version: None,
+                    terminal_after_current: false,
+                    instability_detected: false,
+                }),
+                reasons: vec![
+                    "normalized_name_exact: encore hair".to_string(),
+                    "same_parent_directory: same folder".to_string(),
+                ],
+                evidence: vec!["compare candidate confidence 0.940".to_string()],
+            }],
+        };
+
+        let artifacts = ProposalEngine.generate(&report, 0.90);
+        let mapping = artifacts
+            .mapping_proposal
+            .mappings
+            .first()
+            .expect("mapping exists");
+
+        assert_eq!(mapping.status, ProposalStatus::Proposed);
     }
 }

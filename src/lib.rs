@@ -32,12 +32,18 @@ pub fn run(cli: Cli) -> AppResult<()> {
             pipeline::run_map_command(&args)?;
         }
         Command::Snapshot(args) => {
-            let snapshot = pipeline::run_snapshot_command(&args)?;
+            let result = pipeline::run_snapshot_command(&args)?;
             println!(
                 "snapshot exported: version={} assets={}",
-                snapshot.version_id, snapshot.asset_count
+                result.snapshot.version_id, result.snapshot.asset_count
             );
             println!("wrote snapshot: {}", args.output.display());
+            if let Some(path) = result.stored_snapshot_path.as_deref() {
+                println!("stored snapshot: {}", path.display());
+            }
+            if let Some(path) = result.stored_prepared_inventory_path.as_deref() {
+                println!("stored prepared-inventory: {}", path.display());
+            }
         }
         Command::SnapshotReport(args) => {
             let report = pipeline::run_snapshot_report_command(&args)?;

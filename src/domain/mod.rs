@@ -25,6 +25,81 @@ pub struct AssetMetadata {
     pub index_count: Option<u32>,
     pub material_slots: Option<u32>,
     pub section_count: Option<u32>,
+    pub vertex_stride: Option<u32>,
+    pub vertex_buffer_count: Option<u32>,
+    pub index_format: Option<String>,
+    pub primitive_topology: Option<String>,
+    pub layout_markers: Vec<String>,
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub internal_structure: AssetInternalStructure,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct AssetInternalStructure {
+    pub section_labels: Vec<String>,
+    pub buffer_roles: Vec<String>,
+    pub binding_targets: Vec<String>,
+    pub subresource_roles: Vec<String>,
+    pub has_skeleton: Option<bool>,
+    pub has_shapekey_data: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct AssetHashFields {
+    pub asset_hash: Option<String>,
+    pub shader_hash: Option<String>,
+    pub signature: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct AssetSourceContext {
+    pub extraction_tool: Option<String>,
+    pub source_root: Option<String>,
+    pub source_path: Option<String>,
+    pub container_path: Option<String>,
+    pub source_kind: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExtractedAssetRecord {
+    #[serde(flatten)]
+    pub asset: AssetRecord,
+    #[serde(default)]
+    pub hash_fields: AssetHashFields,
+    #[serde(default)]
+    pub source: AssetSourceContext,
+}
+
+impl From<AssetRecord> for ExtractedAssetRecord {
+    fn from(asset: AssetRecord) -> Self {
+        Self {
+            asset,
+            hash_fields: AssetHashFields::default(),
+            source: AssetSourceContext::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct PreparedAssetInventory {
+    pub schema_version: String,
+    #[serde(default)]
+    pub context: PreparedAssetInventoryContext,
+    #[serde(default)]
+    pub assets: Vec<ExtractedAssetRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct PreparedAssetInventoryContext {
+    pub extraction_tool: Option<String>,
+    pub extraction_kind: Option<String>,
+    pub source_root: Option<String>,
     pub tags: Vec<String>,
 }
 

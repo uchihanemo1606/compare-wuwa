@@ -28,11 +28,23 @@ pub fn default_artifact_root() -> &'static str {
 
 pub fn resolve_artifact_root() -> PathBuf {
     let project_root = detect_project_root().unwrap_or_else(fallback_current_dir);
-    artifact_root_for_project(&project_root, active_profile())
+    let exe_dir = detect_executable_dir().unwrap_or_else(|| project_root.clone());
+    artifact_root_for_runtime(&project_root, &exe_dir, active_profile())
 }
 
 pub fn resolve_report_store_root() -> PathBuf {
     resolve_artifact_root().join("report")
+}
+
+pub fn artifact_root_for_runtime(
+    project_root: &Path,
+    executable_dir: &Path,
+    profile: BuildProfile,
+) -> PathBuf {
+    match profile {
+        BuildProfile::DebugLike => project_root.join("out"),
+        BuildProfile::Release => executable_dir.to_path_buf(),
+    }
 }
 
 pub fn artifact_root_for_project(project_root: &Path, profile: BuildProfile) -> PathBuf {
@@ -150,6 +162,12 @@ fn detect_project_root() -> Option<PathBuf> {
     None
 }
 
+fn detect_executable_dir() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|parent| parent.to_path_buf()))
+}
+
 fn find_project_root(start: &Path) -> Option<PathBuf> {
     for candidate in start.ancestors() {
         if candidate.join("Cargo.toml").exists() {
@@ -168,8 +186,8 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        BuildProfile, active_profile, artifact_root_for_project, default_artifact_root,
-        validate_artifact_output_path,
+        BuildProfile, active_profile, artifact_root_for_runtime, default_artifact_root,
+        resolve_report_store_root, validate_artifact_output_path,
     };
 
     #[test]
@@ -191,13 +209,41 @@ mod tests {
     }
 
     #[test]
-    fn artifact_root_for_release_does_not_duplicate_release_segment() {
-        let root = artifact_root_for_project(Path::new("D:/repo"), BuildProfile::Release);
+    fn artifact_root_for_runtime_uses_executable_dir_for_release() {
+        let root = artifact_root_for_runtime(
+            Path::new("D:/repo"),
+            Path::new("D:/repo/release"),
+            BuildProfile::Release,
+        );
         let rendered = root
             .to_string_lossy()
             .to_ascii_lowercase()
             .replace('\\', "/");
         assert!(rendered.ends_with("/repo/release"));
         assert!(!rendered.contains("/release/release"));
+    }
+
+    #[test]
+    fn artifact_root_for_runtime_keeps_debug_under_project_out() {
+        let root = artifact_root_for_runtime(
+            Path::new("D:/repo"),
+            Path::new("D:/repo/release"),
+            BuildProfile::DebugLike,
+        );
+        let rendered = root
+            .to_string_lossy()
+            .to_ascii_lowercase()
+            .replace('\\', "/");
+        assert!(rendered.ends_with("/repo/out"));
+    }
+
+    #[test]
+    fn report_store_root_is_nested_under_artifact_root() {
+        let root = resolve_report_store_root();
+        let rendered = root
+            .to_string_lossy()
+            .to_ascii_lowercase()
+            .replace('\\', "/");
+        assert!(rendered.ends_with("/report"));
     }
 }

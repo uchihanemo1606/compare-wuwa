@@ -9,7 +9,7 @@ use crate::{
     inference::InferenceReport,
     output_policy::validate_artifact_output_path,
     proposal::{MappingProposalOutput, ProposalPatchDraftOutput},
-    report::VersionDiffReportV2,
+    report::{VersionContinuityArtifact, VersionDiffReportV2},
     snapshot::GameSnapshot,
     wwmi::WwmiKnowledgeBase,
 };
@@ -71,6 +71,13 @@ pub fn export_proposal_patch_draft_output(
 
 pub fn export_version_diff_report_v2(report: &VersionDiffReportV2, output: &Path) -> AppResult<()> {
     write_pretty_json(output, report)
+}
+
+pub fn export_version_continuity_output(
+    artifact: &VersionContinuityArtifact,
+    output: &Path,
+) -> AppResult<()> {
+    write_pretty_json(output, artifact)
 }
 
 pub fn export_text_output(content: &str, output: &Path) -> AppResult<()> {

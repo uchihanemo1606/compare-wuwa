@@ -391,6 +391,7 @@ mod tests {
                 material_slots: Some(1),
                 section_count: Some(1),
                 tags: Vec::new(),
+                ..Default::default()
             },
             fingerprint: SnapshotFingerprint {
                 normalized_kind: Some("mesh".to_string()),
@@ -402,8 +403,10 @@ mod tests {
                 index_count: Some(2),
                 material_slots: Some(1),
                 section_count: Some(1),
+                ..Default::default()
             },
             hash_fields: SnapshotHashFields::default(),
+            source: crate::domain::AssetSourceContext::default(),
         }];
 
         GameSnapshot {

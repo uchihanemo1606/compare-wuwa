@@ -29,6 +29,9 @@ fn compare_snapshots_command_exports_change_categories() {
         version_id: "2.4.0".to_string(),
         output: old_snapshot_path.clone(),
         capture_scope: SnapshotCaptureScopeArg::Full,
+        prepared_inventory: None,
+        store_in_report: false,
+        report_root: None,
     })
     .expect("create old snapshot");
     run_snapshot_command(&SnapshotArgs {
@@ -36,6 +39,9 @@ fn compare_snapshots_command_exports_change_categories() {
         version_id: "2.5.0".to_string(),
         output: new_snapshot_path.clone(),
         capture_scope: SnapshotCaptureScopeArg::Full,
+        prepared_inventory: None,
+        store_in_report: false,
+        report_root: None,
     })
     .expect("create new snapshot");
 

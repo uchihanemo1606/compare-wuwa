@@ -12,6 +12,8 @@ use crate::{
     repo::{GitRepoHistorySource, RepoCommit, RepoHistorySource},
 };
 
+pub mod dependency;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WwmiRepoInput {
     Local(PathBuf),

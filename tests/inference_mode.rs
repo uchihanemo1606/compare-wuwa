@@ -7,12 +7,18 @@ use std::{
 use whashreonator::{
     cli::InferFixesArgs,
     compare::{
-        CandidateMappingChange, RiskLevel, SnapshotAssetChange, SnapshotAssetSummary,
-        SnapshotChangeType, SnapshotCompareReason, SnapshotCompareReport,
-        SnapshotCompareScopeContext, SnapshotCompareSummary, SnapshotVersionInfo,
+        CandidateMappingChange, RemapCompatibility, RiskLevel, SnapshotAssetChange,
+        SnapshotAssetSummary, SnapshotChangeType, SnapshotCompareReason, SnapshotCompareReport,
+        SnapshotCompareScopeContext, SnapshotCompareSummary, SnapshotComparer, SnapshotVersionInfo,
     },
+    domain::{AssetInternalStructure, AssetMetadata, AssetSourceContext},
     inference::InferenceReport,
     pipeline::run_infer_fixes_command,
+    report::VersionDiffReportBuilder,
+    report_storage::ReportStorage,
+    snapshot::{
+        GameSnapshot, SnapshotAsset, SnapshotContext, SnapshotFingerprint, SnapshotHashFields,
+    },
     wwmi::{
         WwmiEvidenceCommit, WwmiFixPattern, WwmiKeywordStat, WwmiKnowledgeBase,
         WwmiKnowledgeRepoInfo, WwmiKnowledgeSummary, WwmiPatternKind,
@@ -42,6 +48,8 @@ fn infer_fixes_command_exports_crash_causes_and_suggested_fixes() {
     let report = run_infer_fixes_command(&InferFixesArgs {
         compare_report: compare_path,
         wwmi_knowledge: knowledge_path,
+        continuity_artifact: None,
+        report_root: None,
         output: output_path.clone(),
     })
     .expect("run inference command");
@@ -64,6 +72,87 @@ fn infer_fixes_command_exports_crash_causes_and_suggested_fixes() {
     );
     assert_eq!(parsed.candidate_mapping_hints.len(), 1);
     assert!(!parsed.scope.low_signal_compare);
+    assert!(
+        parsed
+            .probable_crash_causes
+            .iter()
+            .all(|cause| cause.code != "continuity_thread_instability")
+    );
+
+    let _ = fs::remove_dir_all(&test_root);
+}
+
+#[test]
+fn infer_fixes_command_uses_report_root_continuity_history() {
+    let test_root = unique_test_dir();
+    let report_root = test_root.join("out").join("report");
+    let storage = ReportStorage::new(report_root.clone());
+    let knowledge_path = test_root.join("knowledge.json");
+    let output_path = test_root.join("out").join("inference-with-continuity.json");
+
+    fs::create_dir_all(&test_root).expect("create test root");
+    fs::write(
+        &knowledge_path,
+        serde_json::to_string_pretty(&sample_knowledge()).expect("serialize knowledge"),
+    )
+    .expect("write knowledge report");
+
+    let snapshot_a = continuity_snapshot("4.0.0", "Content/Character/Encore/Body.mesh", "body");
+    let snapshot_b =
+        continuity_snapshot("4.1.0", "Content/Character/Encore/Body_LOD0.mesh", "body");
+    let snapshot_c = empty_snapshot("4.2.0");
+
+    let compare_ab = SnapshotComparer.compare(&snapshot_a, &snapshot_b);
+    let report_ab = VersionDiffReportBuilder.from_compare(&snapshot_a, &snapshot_b, &compare_ab);
+    let saved_ab = storage
+        .save_run(&report_ab, &snapshot_a, &snapshot_b, &compare_ab, None)
+        .expect("save ab");
+
+    let compare_bc = SnapshotComparer.compare(&snapshot_b, &snapshot_c);
+    let report_bc = VersionDiffReportBuilder.from_compare(&snapshot_b, &snapshot_c, &compare_bc);
+    storage
+        .save_run(&report_bc, &snapshot_b, &snapshot_c, &compare_bc, None)
+        .expect("save bc");
+
+    let report = run_infer_fixes_command(&InferFixesArgs {
+        compare_report: saved_ab.directory.join("compare.v1.json"),
+        wwmi_knowledge: knowledge_path,
+        continuity_artifact: None,
+        report_root: Some(report_root),
+        output: output_path.clone(),
+    })
+    .expect("run inference command with continuity");
+
+    let output = fs::read_to_string(&output_path).expect("read inference output");
+    let parsed: InferenceReport = serde_json::from_str(&output).expect("parse inference report");
+    let hint = parsed
+        .candidate_mapping_hints
+        .iter()
+        .find(|hint| hint.old_asset_path.ends_with("Body.mesh"))
+        .expect("body mapping hint");
+
+    assert!(
+        report
+            .probable_crash_causes
+            .iter()
+            .any(|cause| cause.code == "continuity_thread_instability")
+    );
+    assert!(
+        parsed
+            .suggested_fixes
+            .iter()
+            .any(|fix| fix.code == "review_continuity_thread_history_before_repair")
+    );
+    assert!(
+        hint.reasons
+            .iter()
+            .any(|reason| reason.contains("removed in 4.2.0"))
+    );
+    assert!(
+        hint.evidence
+            .iter()
+            .any(|evidence| evidence.contains("spans 4.0.0 -> 4.2.0"))
+    );
 
     let _ = fs::remove_dir_all(&test_root);
 }
@@ -90,6 +179,21 @@ fn sample_compare_report() -> SnapshotCompareReport {
             removed_assets: 1,
             changed_assets: 1,
             candidate_mapping_changes: 1,
+            identity_changed_assets: 0,
+            layout_changed_assets: 0,
+            structural_changed_assets: 1,
+            naming_only_changed_assets: 0,
+            cosmetic_only_changed_assets: 0,
+            provenance_changed_assets: 0,
+            container_moved_assets: 0,
+            lineage_rename_or_repath_assets: 0,
+            lineage_container_movement_assets: 0,
+            lineage_layout_drift_assets: 0,
+            lineage_replacement_assets: 0,
+            lineage_ambiguous_assets: 0,
+            lineage_insufficient_evidence_assets: 0,
+            ambiguous_candidate_mapping_changes: 0,
+            high_confidence_candidate_mapping_changes: 0,
         },
         added_assets: Vec::new(),
         removed_assets: vec![SnapshotAssetChange {
@@ -100,6 +204,7 @@ fn sample_compare_report() -> SnapshotCompareReport {
             probable_impact: RiskLevel::Medium,
             crash_risk: RiskLevel::Medium,
             suspected_mapping_change: true,
+            lineage: whashreonator::compare::AssetLineageKind::InsufficientEvidence,
             reasons: vec![SnapshotCompareReason {
                 code: "asset_removed".to_string(),
                 message: "asset removed".to_string(),
@@ -113,6 +218,7 @@ fn sample_compare_report() -> SnapshotCompareReport {
             probable_impact: RiskLevel::High,
             crash_risk: RiskLevel::High,
             suspected_mapping_change: true,
+            lineage: whashreonator::compare::AssetLineageKind::Replacement,
             reasons: vec![SnapshotCompareReason {
                 code: "vertex_count_changed".to_string(),
                 message: "vertex count changed".to_string(),
@@ -122,6 +228,8 @@ fn sample_compare_report() -> SnapshotCompareReport {
             old_asset: asset_summary("Content/Weapon/Sword.weapon"),
             new_asset: asset_summary("Content/Weapon/Sword_v2.weapon"),
             confidence: 0.82,
+            compatibility: RemapCompatibility::CompatibleWithCaution,
+            lineage: whashreonator::compare::AssetLineageKind::RenameOrRepath,
             reasons: vec![SnapshotCompareReason {
                 code: "normalized_name_exact".to_string(),
                 message: "normalized name matched".to_string(),
@@ -194,13 +302,78 @@ fn asset_summary(path: &str) -> SnapshotAssetSummary {
         id: path.to_string(),
         path: path.to_string(),
         kind: Some("mesh".to_string()),
+        logical_name: Some("Asset".to_string()),
         normalized_name: Some("asset".to_string()),
         vertex_count: Some(1000),
         index_count: Some(2000),
         material_slots: Some(1),
         section_count: Some(1),
+        vertex_stride: None,
+        vertex_buffer_count: None,
+        index_format: None,
+        primitive_topology: None,
+        layout_markers: Vec::new(),
+        internal_structure: AssetInternalStructure::default(),
         asset_hash: None,
         shader_hash: None,
+        signature: None,
+        tags: vec!["character".to_string()],
+        source: AssetSourceContext::default(),
+    }
+}
+
+fn continuity_snapshot(version_id: &str, path: &str, logical_name: &str) -> GameSnapshot {
+    GameSnapshot {
+        schema_version: "whashreonator.snapshot.v1".to_string(),
+        version_id: version_id.to_string(),
+        created_at_unix_ms: 1,
+        source_root: "root".to_string(),
+        asset_count: 1,
+        assets: vec![SnapshotAsset {
+            id: path.to_string(),
+            path: path.to_string(),
+            kind: Some("mesh".to_string()),
+            metadata: AssetMetadata {
+                logical_name: Some(logical_name.to_string()),
+                vertex_count: Some(120),
+                index_count: Some(240),
+                material_slots: Some(1),
+                section_count: Some(1),
+                tags: vec!["character".to_string()],
+                ..Default::default()
+            },
+            fingerprint: SnapshotFingerprint {
+                normalized_kind: Some("mesh".to_string()),
+                normalized_name: Some(logical_name.to_string()),
+                name_tokens: vec![logical_name.to_string()],
+                path_tokens: path.split('/').map(ToOwned::to_owned).collect(),
+                tags: vec!["character".to_string()],
+                vertex_count: Some(120),
+                index_count: Some(240),
+                material_slots: Some(1),
+                section_count: Some(1),
+                ..Default::default()
+            },
+            hash_fields: SnapshotHashFields {
+                asset_hash: Some(format!("hash-{path}")),
+                shader_hash: Some("shader-shared".to_string()),
+                signature: Some(format!("sig-{logical_name}")),
+            },
+            source: AssetSourceContext::default(),
+        }],
+        context: SnapshotContext::default(),
+    }
+}
+
+fn empty_snapshot(version_id: &str) -> GameSnapshot {
+    GameSnapshot {
+        schema_version: "whashreonator.snapshot.v1".to_string(),
+        version_id: version_id.to_string(),
+        created_at_unix_ms: 1,
+        source_root: "root".to_string(),
+        asset_count: 0,
+        assets: Vec::new(),
+        context: SnapshotContext::default(),
     }
 }
 

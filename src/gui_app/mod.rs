@@ -173,10 +173,11 @@ impl GuiController {
             .into_iter()
             .map(|entry| VersionRowView {
                 label: format!(
-                    "wuwa_{} | snapshot={} report_bundle={} inference={} proposal={} summary={} buffer={} hash={} artifacts={}",
+                    "wuwa_{} | snapshot={} report_bundle={} continuity={} inference={} proposal={} summary={} buffer={} hash={} artifacts={}",
                     entry.version_id,
                     yes_no(entry.has_snapshot),
                     yes_no(entry.has_report_bundle),
+                    yes_no(entry.has_continuity_data),
                     yes_no(entry.has_inference_data),
                     yes_no(entry.has_proposal_data),
                     yes_no(entry.has_human_summary),
@@ -285,7 +286,11 @@ impl GuiController {
             })?;
         let compare = SnapshotComparer.compare(&old_snapshot, &new_snapshot);
         let knowledge = load_wwmi_knowledge(knowledge_path)?;
-        let inference = FixInferenceEngine.infer(&compare, &knowledge);
+        let continuity = self
+            .storage
+            .load_version_continuity_index_for_pair(&baseline_version, scanned_version)?;
+        let inference =
+            FixInferenceEngine.infer_with_continuity(&compare, &knowledge, continuity.as_ref());
         let proposals = ProposalEngine.generate(&inference, 0.85);
         let human_summary = HumanSummaryRenderer.render(&inference, &proposals);
         let report = crate::report::VersionDiffReportBuilder.enrich_with_inference(
@@ -399,6 +404,33 @@ fn render_phase3_generation_summary(
             lines.push(format!("  scope: {note}"));
         }
     }
+    let continuity_review_mappings = proposals
+        .mapping_proposal
+        .mappings
+        .iter()
+        .filter(|mapping| mapping_has_continuity_caution(mapping))
+        .count();
+    if !continuity_causes(inference).is_empty()
+        || continuity_fix(inference).is_some()
+        || continuity_review_mappings > 0
+    {
+        lines.push(format!(
+            "Phase 3 continuity caution: broader thread history is keeping {} mapping(s) review-first.",
+            continuity_review_mappings
+        ));
+        if let Some(cause) = continuity_causes(inference).first() {
+            lines.push(format!(
+                "  continuity cause [{}] confidence={:.3}",
+                cause.code, cause.confidence
+            ));
+        }
+        if let Some(fix) = continuity_fix(inference) {
+            lines.push(format!(
+                "  continuity fix [{}] confidence={:.3}",
+                fix.code, fix.confidence
+            ));
+        }
+    }
 
     lines.join("\n")
 }
@@ -507,6 +539,26 @@ fn render_version_summary(
                 fix.actions.len()
             ));
         }
+        let continuity_causes = continuity_causes(inference);
+        if !continuity_causes.is_empty() || continuity_fix(inference).is_some() {
+            lines.push(format!(
+                "Continuity caution: unstable_causes={} review_fix={} ",
+                continuity_causes.len(),
+                yes_no(continuity_fix(inference).is_some())
+            ));
+            if let Some(cause) = continuity_causes.first() {
+                lines.push(format!(
+                    "  continuity cause [{}] risk={:?} confidence={:.3}",
+                    cause.code, cause.risk, cause.confidence
+                ));
+            }
+            if let Some(fix) = continuity_fix(inference) {
+                lines.push(format!(
+                    "  continuity fix [{}] priority={:?} confidence={:.3}",
+                    fix.code, fix.priority, fix.confidence
+                ));
+            }
+        }
     } else {
         lines.push("Inference: not found".to_string());
     }
@@ -524,6 +576,27 @@ fn render_version_summary(
                 "  {} -> {} | status={:?} confidence={:.3}",
                 mapping.old_asset_path, mapping.new_asset_path, mapping.status, mapping.confidence
             ));
+        }
+        let continuity_review_mappings = mapping_proposal
+            .mappings
+            .iter()
+            .filter(|mapping| mapping_has_continuity_caution(mapping))
+            .collect::<Vec<_>>();
+        if !continuity_review_mappings.is_empty() {
+            lines.push(format!(
+                "  continuity-backed review mappings={}",
+                continuity_review_mappings.len()
+            ));
+            for mapping in continuity_review_mappings.into_iter().take(2) {
+                lines.push(format!(
+                    "  continuity review {} -> {} | {}",
+                    mapping.old_asset_path,
+                    mapping.new_asset_path,
+                    mapping_continuity_note(mapping).unwrap_or_else(|| {
+                        "broader continuity history keeps this mapping review-first".to_string()
+                    })
+                ));
+            }
         }
     } else {
         lines.push("Mapping proposal: not found".to_string());
@@ -570,6 +643,7 @@ fn artifact_kind_label(kind: VersionArtifactKind) -> &'static str {
     match kind {
         VersionArtifactKind::Snapshot => "snapshot",
         VersionArtifactKind::ReportBundle => "report_bundle",
+        VersionArtifactKind::ContinuityData => "continuity",
         VersionArtifactKind::InferenceData => "inference",
         VersionArtifactKind::ProposalData => "proposal",
         VersionArtifactKind::HumanSummary => "human_summary",
@@ -578,6 +652,96 @@ fn artifact_kind_label(kind: VersionArtifactKind) -> &'static str {
         VersionArtifactKind::Auxiliary => "auxiliary",
         VersionArtifactKind::LegacySnapshot => "legacy_snapshot",
         VersionArtifactKind::LegacyReportBundle => "legacy_report_bundle",
+    }
+}
+
+fn continuity_causes(inference: &InferenceReport) -> Vec<&crate::inference::ProbableCrashCause> {
+    inference
+        .probable_crash_causes
+        .iter()
+        .filter(|cause| cause.code == "continuity_thread_instability")
+        .collect()
+}
+
+fn continuity_fix(inference: &InferenceReport) -> Option<&crate::inference::SuggestedFix> {
+    inference
+        .suggested_fixes
+        .iter()
+        .find(|fix| fix.code == "review_continuity_thread_history_before_repair")
+}
+
+fn mapping_has_continuity_caution(mapping: &crate::proposal::MappingProposalEntry) -> bool {
+    mapping
+        .continuity
+        .as_ref()
+        .is_some_and(|continuity| continuity.has_review_caution())
+        || mapping_continuity_note(mapping).is_some()
+}
+
+fn mapping_continuity_note(mapping: &crate::proposal::MappingProposalEntry) -> Option<String> {
+    mapping
+        .continuity
+        .as_ref()
+        .and_then(structured_continuity_note)
+        .or_else(|| {
+            mapping
+                .reasons
+                .iter()
+                .find(|reason| is_legacy_continuity_text(reason))
+                .cloned()
+        })
+        .or_else(|| {
+            mapping
+                .evidence
+                .iter()
+                .find(|evidence| is_legacy_continuity_text(evidence))
+                .cloned()
+        })
+}
+
+fn structured_continuity_note(
+    continuity: &crate::inference::InferredMappingContinuityContext,
+) -> Option<String> {
+    if continuity.total_layout_drift_steps >= 2 {
+        Some(format!(
+            "repeated layout drift across {} continuity step(s) keeps this mapping review-first",
+            continuity.total_layout_drift_steps
+        ))
+    } else if let Some(relation) = continuity.terminal_relation.as_ref() {
+        let timing = if continuity.terminal_after_current {
+            "later terminal"
+        } else {
+            "terminal"
+        };
+        Some(format!(
+            "{timing} state {} in {} keeps this mapping review-first",
+            continuity_relation_label(relation),
+            continuity.terminal_version.as_deref().unwrap_or("unknown")
+        ))
+    } else if continuity.review_required_history {
+        Some("review-required thread history keeps this mapping review-first".to_string())
+    } else {
+        None
+    }
+}
+
+fn is_legacy_continuity_text(value: &str) -> bool {
+    value.contains("continuity")
+        || value.contains("terminal state")
+        || value.contains("review-required")
+        || value.contains("repeated layout drift")
+}
+
+fn continuity_relation_label(relation: &crate::report::VersionContinuityRelation) -> &'static str {
+    match relation {
+        crate::report::VersionContinuityRelation::Persisted => "persisted",
+        crate::report::VersionContinuityRelation::RenameOrRepath => "rename/repath",
+        crate::report::VersionContinuityRelation::ContainerMovement => "container movement",
+        crate::report::VersionContinuityRelation::LayoutDrift => "layout drift",
+        crate::report::VersionContinuityRelation::Replacement => "replacement",
+        crate::report::VersionContinuityRelation::Ambiguous => "ambiguous",
+        crate::report::VersionContinuityRelation::InsufficientEvidence => "insufficient evidence",
+        crate::report::VersionContinuityRelation::Removed => "removed",
     }
 }
 
@@ -689,10 +853,16 @@ mod tests {
 
     use crate::{
         domain::AssetMetadata,
+        inference::{
+            InferenceCompareInput, InferenceKnowledgeInput, InferenceReport, InferenceScopeContext,
+            InferenceSummary, InferredMappingContinuityContext, InferredMappingHint,
+            ProbableCrashCause, SuggestedFix,
+        },
+        proposal::ProposalEngine,
         report::{
             DiffStatus, ReportItemType, ReportReason, ResonatorDiffEntry, ResonatorItemDiff,
-            ResonatorVersionView, TechnicalMetadata, VersionDiffReportV2, VersionDiffSummary,
-            VersionSide, VersionedItem,
+            ResonatorVersionView, TechnicalMetadata, VersionContinuityRelation,
+            VersionDiffReportV2, VersionDiffSummary, VersionSide, VersionedItem,
         },
         report_storage::ReportStorage,
         snapshot::{
@@ -721,6 +891,7 @@ mod tests {
                 source_root: "new".to_string(),
                 asset_count: 1,
             },
+            lineage: Default::default(),
             summary: VersionDiffSummary {
                 resonator_count: 1,
                 unchanged_items: 0,
@@ -746,6 +917,7 @@ mod tests {
                     item_type: ReportItemType::Asset,
                     status: DiffStatus::Changed,
                     confidence: Some(0.9),
+                    compatibility: None,
                     old: Some(item("Content/Character/Encore/Body.mesh")),
                     new: Some(item("Content/Character/Encore/Body_v2.mesh")),
                     reasons: vec![ReportReason {
@@ -758,6 +930,7 @@ mod tests {
                 "scope warning: compare results are based on install/package-level snapshots"
                     .to_string(),
             ],
+            review: Default::default(),
         };
 
         let detail = render_detail_view(&report, "");
@@ -873,6 +1046,50 @@ mod tests {
     }
 
     #[test]
+    fn phase3_generation_summary_surfaces_continuity_caution() {
+        let inference = continuity_flagged_inference();
+        let proposals = ProposalEngine.generate(&inference, 0.85);
+
+        let summary = super::render_phase3_generation_summary(
+            "8.0.0",
+            "8.1.0",
+            &inference,
+            &proposals,
+            false,
+            &[],
+        );
+
+        assert!(summary.contains("Phase 3 continuity caution"));
+        assert!(summary.contains("review-first"));
+        assert!(summary.contains("continuity cause [continuity_thread_instability]"));
+        assert!(
+            summary.contains("continuity fix [review_continuity_thread_history_before_repair]")
+        );
+    }
+
+    #[test]
+    fn version_summary_surfaces_continuity_backed_review_behavior() {
+        let inference = continuity_flagged_inference();
+        let proposals = ProposalEngine.generate(&inference, 0.85);
+
+        let summary = super::render_version_summary(
+            "8.1.0",
+            None,
+            None,
+            Some(&inference),
+            Some(&proposals.mapping_proposal),
+            Some(&proposals.patch_draft),
+            Some("# summary"),
+            &[],
+        );
+
+        assert!(summary.contains("Continuity caution: unstable_causes=1 review_fix=yes"));
+        assert!(summary.contains("continuity cause [continuity_thread_instability]"));
+        assert!(summary.contains("continuity-backed review mappings=1"));
+        assert!(summary.contains("continuity review Content/Character/Encore/Body.mesh -> Content/Character/Encore/Body_v2.mesh"));
+    }
+
+    #[test]
     fn scan_auto_generates_phase3_outputs_and_open_version_renders_them() {
         let test_root = unique_test_dir();
         let storage = ReportStorage::with_legacy_root(
@@ -907,11 +1124,7 @@ mod tests {
         };
 
         let result = controller
-            .run_scan(
-                &prepared,
-                false,
-                &knowledge_path.display().to_string(),
-            )
+            .run_scan(&prepared, false, &knowledge_path.display().to_string())
             .expect("run scan with phase3");
         let summary = match result {
             ScanRunResult::Created { summary, .. } => summary,
@@ -1002,6 +1215,7 @@ mod tests {
                     material_slots: Some(1),
                     section_count: Some(1),
                     tags: Vec::new(),
+                    ..Default::default()
                 },
                 fingerprint: SnapshotFingerprint {
                     normalized_kind: Some("mesh".to_string()),
@@ -1013,8 +1227,10 @@ mod tests {
                     index_count: Some(1),
                     material_slots: Some(1),
                     section_count: Some(1),
+                    ..Default::default()
                 },
                 hash_fields: SnapshotHashFields::default(),
+                source: crate::domain::AssetSourceContext::default(),
             }],
             context: SnapshotContext::default(),
         }
@@ -1083,6 +1299,85 @@ mod tests {
                 detected_patterns: vec![WwmiPatternKind::MappingOrHashUpdate],
                 detected_keywords: vec!["mapping".to_string()],
                 reasons: vec!["subject contains fix".to_string()],
+            }],
+        }
+    }
+
+    fn continuity_flagged_inference() -> InferenceReport {
+        InferenceReport {
+            schema_version: "whashreonator.inference.v1".to_string(),
+            generated_at_unix_ms: 1,
+            compare_input: InferenceCompareInput {
+                old_version_id: "8.0.0".to_string(),
+                new_version_id: "8.1.0".to_string(),
+                changed_assets: 0,
+                added_assets: 1,
+                removed_assets: 1,
+                candidate_mapping_changes: 1,
+            },
+            knowledge_input: InferenceKnowledgeInput {
+                repo: "repo".to_string(),
+                analyzed_commits: 4,
+                fix_like_commits: 2,
+                discovered_patterns: 2,
+            },
+            scope: InferenceScopeContext::default(),
+            summary: InferenceSummary {
+                probable_crash_causes: 1,
+                suggested_fixes: 1,
+                candidate_mapping_hints: 1,
+                highest_confidence: 0.90,
+            },
+            probable_crash_causes: vec![ProbableCrashCause {
+                code: "continuity_thread_instability".to_string(),
+                summary: "broader continuity history is unstable".to_string(),
+                confidence: 0.83,
+                risk: crate::compare::RiskLevel::High,
+                affected_assets: vec!["Content/Character/Encore/Body.mesh".to_string()],
+                related_patterns: vec![WwmiPatternKind::MappingOrHashUpdate],
+                reasons: vec!["continuity surfaces unstable thread history".to_string()],
+                evidence: vec![
+                    "continuity thread Content/Character/Encore/Body_v2.mesh spans 7.0.0 -> 8.2.0"
+                        .to_string(),
+                ],
+            }],
+            suggested_fixes: vec![SuggestedFix {
+                code: "review_continuity_thread_history_before_repair".to_string(),
+                summary: "review broader continuity history".to_string(),
+                confidence: 0.81,
+                priority: crate::compare::RiskLevel::High,
+                related_patterns: vec![WwmiPatternKind::MappingOrHashUpdate],
+                actions: vec!["inspect continuity milestones".to_string()],
+                reasons: vec!["thread later terminates".to_string()],
+                evidence: vec![
+                    "continuity thread later terminates as removed in 8.2.0".to_string(),
+                ],
+            }],
+            candidate_mapping_hints: vec![InferredMappingHint {
+                old_asset_path: "Content/Character/Encore/Body.mesh".to_string(),
+                new_asset_path: "Content/Character/Encore/Body_v2.mesh".to_string(),
+                confidence: 0.90,
+                compatibility: crate::compare::RemapCompatibility::CompatibleWithCaution,
+                needs_review: true,
+                ambiguous: false,
+                confidence_gap: Some(0.18),
+                continuity: Some(InferredMappingContinuityContext {
+                    thread_id: Some("encore_body".to_string()),
+                    first_seen_version: Some("7.0.0".to_string()),
+                    latest_observed_version: Some("8.2.0".to_string()),
+                    latest_live_version: None,
+                    stable_before_current_change: false,
+                    total_rename_steps: 1,
+                    total_container_movement_steps: 0,
+                    total_layout_drift_steps: 0,
+                    review_required_history: true,
+                    terminal_relation: Some(VersionContinuityRelation::Removed),
+                    terminal_version: Some("8.2.0".to_string()),
+                    terminal_after_current: true,
+                    instability_detected: true,
+                }),
+                reasons: vec!["same_parent_directory: same folder".to_string()],
+                evidence: vec!["compare candidate confidence 0.900".to_string()],
             }],
         }
     }

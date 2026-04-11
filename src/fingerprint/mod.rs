@@ -1,6 +1,6 @@
 use std::{collections::BTreeSet, path::Path};
 
-use crate::domain::AssetRecord;
+use crate::domain::{AssetInternalStructure, AssetRecord};
 
 pub trait Fingerprinter {
     fn fingerprint(&self, asset: &AssetRecord) -> AssetFingerprint;
@@ -21,6 +21,12 @@ pub struct AssetFingerprint {
     pub index_count: Option<u32>,
     pub material_slots: Option<u32>,
     pub section_count: Option<u32>,
+    pub vertex_stride: Option<u32>,
+    pub vertex_buffer_count: Option<u32>,
+    pub index_format: Option<String>,
+    pub primitive_topology: Option<String>,
+    pub layout_markers: BTreeSet<String>,
+    pub internal_structure: AssetInternalStructure,
 }
 
 impl Fingerprinter for DefaultFingerprinter {
@@ -49,6 +55,18 @@ impl Fingerprinter for DefaultFingerprinter {
             index_count: asset.metadata.index_count,
             material_slots: asset.metadata.material_slots,
             section_count: asset.metadata.section_count,
+            vertex_stride: asset.metadata.vertex_stride,
+            vertex_buffer_count: asset.metadata.vertex_buffer_count,
+            index_format: asset.metadata.index_format.clone(),
+            primitive_topology: asset.metadata.primitive_topology.clone(),
+            layout_markers: asset
+                .metadata
+                .layout_markers
+                .iter()
+                .map(|marker| normalize_text(marker))
+                .filter(|marker| !marker.is_empty())
+                .collect(),
+            internal_structure: normalize_internal_structure(&asset.metadata.internal_structure),
         }
     }
 }
@@ -80,6 +98,27 @@ pub(crate) fn tokenize(value: &str) -> BTreeSet<String> {
         .filter(|token| !token.is_empty())
         .map(ToOwned::to_owned)
         .collect()
+}
+
+fn normalize_internal_structure(structure: &AssetInternalStructure) -> AssetInternalStructure {
+    AssetInternalStructure {
+        section_labels: normalize_text_list(&structure.section_labels),
+        buffer_roles: normalize_text_list(&structure.buffer_roles),
+        binding_targets: normalize_text_list(&structure.binding_targets),
+        subresource_roles: normalize_text_list(&structure.subresource_roles),
+        has_skeleton: structure.has_skeleton,
+        has_shapekey_data: structure.has_shapekey_data,
+    }
+}
+
+fn normalize_text_list(values: &[String]) -> Vec<String> {
+    let mut normalized = values
+        .iter()
+        .map(|value| normalize_text(value))
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    normalized.sort_unstable();
+    normalized
 }
 
 #[cfg(test)]

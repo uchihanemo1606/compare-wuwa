@@ -67,6 +67,9 @@ fn snapshot_report_flags_install_level_snapshots_as_low_signal() {
         version_id: "3.0.0".to_string(),
         output: old_snapshot.clone(),
         capture_scope: SnapshotCaptureScopeArg::Full,
+        prepared_inventory: None,
+        store_in_report: false,
+        report_root: None,
     })
     .expect("export old snapshot");
     run_snapshot_command(&SnapshotArgs {
@@ -74,6 +77,9 @@ fn snapshot_report_flags_install_level_snapshots_as_low_signal() {
         version_id: "3.1.0".to_string(),
         output: new_snapshot.clone(),
         capture_scope: SnapshotCaptureScopeArg::Full,
+        prepared_inventory: None,
+        store_in_report: false,
+        report_root: None,
     })
     .expect("export new snapshot");
 

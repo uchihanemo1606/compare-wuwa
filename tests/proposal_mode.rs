@@ -6,13 +6,15 @@ use std::{
 
 use whashreonator::{
     cli::GenerateProposalsArgs,
-    compare::RiskLevel,
+    compare::{RemapCompatibility, RiskLevel},
     inference::{
         InferenceCompareInput, InferenceKnowledgeInput, InferenceReport, InferenceScopeContext,
-        InferenceSummary, InferredMappingHint, ProbableCrashCause, SuggestedFix,
+        InferenceSummary, InferredMappingContinuityContext, InferredMappingHint,
+        ProbableCrashCause, SuggestedFix,
     },
     pipeline::run_generate_proposals_command,
     proposal::{MappingProposalOutput, ProposalPatchDraftOutput, ProposalStatus},
+    report::VersionContinuityRelation,
     wwmi::WwmiPatternKind,
 };
 
@@ -85,6 +87,62 @@ fn generate_proposals_command_exports_mapping_and_patch_draft() {
     assert!(summary_output.contains("## Fix Before Remap"));
     assert!(summary_output.contains("## Safe To Try Now"));
     assert!(summary_output.contains("Content/Weapon/Sword.weapon"));
+
+    let _ = fs::remove_dir_all(&test_root);
+}
+
+#[test]
+fn generate_proposals_command_keeps_continuity_unstable_mapping_in_review() {
+    let test_root = unique_test_dir();
+    let inference_path = test_root.join("tmp").join("inference.json");
+    let mapping_output_path = test_root.join("out").join("mapping-proposal.json");
+    let summary_output_path = test_root.join("out").join("summary.md");
+
+    fs::create_dir_all(test_root.join("tmp")).expect("create temp input root");
+    fs::write(
+        &inference_path,
+        serde_json::to_string_pretty(&continuity_flagged_inference_report())
+            .expect("serialize inference"),
+    )
+    .expect("write inference report");
+
+    run_generate_proposals_command(&GenerateProposalsArgs {
+        inference_report: inference_path,
+        mapping_output: Some(mapping_output_path.clone()),
+        patch_draft_output: None,
+        summary_output: Some(summary_output_path.clone()),
+        min_confidence: 0.85,
+    })
+    .expect("run continuity-aware generate proposals command");
+
+    let mapping_output =
+        fs::read_to_string(&mapping_output_path).expect("read mapping proposal output");
+    let summary_output = fs::read_to_string(&summary_output_path).expect("read summary output");
+
+    let parsed_mapping: MappingProposalOutput =
+        serde_json::from_str(&mapping_output).expect("parse mapping proposal output");
+    let mapping = parsed_mapping
+        .mappings
+        .iter()
+        .find(|entry| entry.old_asset_path == "Content/Character/Encore/Body.mesh")
+        .expect("continuity mapping exists");
+
+    assert_eq!(mapping.status, ProposalStatus::NeedsReview);
+    assert!(
+        mapping
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("continuity"))
+    );
+    assert!(
+        mapping
+            .related_fix_codes
+            .iter()
+            .any(|code| code == "review_continuity_thread_history_before_repair")
+    );
+    assert!(summary_output.contains("Continuity-backed caution"));
+    assert!(summary_output.contains("### Continuity Caution"));
+    assert!(summary_output.contains("broader continuity history"));
 
     let _ = fs::remove_dir_all(&test_root);
 }
@@ -165,9 +223,11 @@ fn sample_inference_report() -> InferenceReport {
                 old_asset_path: "Content/Weapon/Sword.weapon".to_string(),
                 new_asset_path: "Content/Weapon/Sword_v2.weapon".to_string(),
                 confidence: 0.94,
+                compatibility: RemapCompatibility::LikelyCompatible,
                 needs_review: true,
                 ambiguous: false,
                 confidence_gap: None,
+                continuity: None,
                 reasons: vec!["normalized_name_exact: same logical asset".to_string()],
                 evidence: vec!["compare candidate confidence 0.940".to_string()],
             },
@@ -175,13 +235,92 @@ fn sample_inference_report() -> InferenceReport {
                 old_asset_path: "Content/Character/HeroA/Body.mesh".to_string(),
                 new_asset_path: "Content/Character/HeroA/Body_v2.mesh".to_string(),
                 confidence: 0.95,
+                compatibility: RemapCompatibility::StructurallyRisky,
                 needs_review: true,
                 ambiguous: false,
                 confidence_gap: None,
+                continuity: None,
                 reasons: vec!["same_parent_directory: same folder".to_string()],
                 evidence: vec!["compare candidate confidence 0.950".to_string()],
             },
         ],
+    }
+}
+
+fn continuity_flagged_inference_report() -> InferenceReport {
+    InferenceReport {
+        schema_version: "whashreonator.inference.v1".to_string(),
+        generated_at_unix_ms: 1,
+        compare_input: InferenceCompareInput {
+            old_version_id: "8.0.0".to_string(),
+            new_version_id: "8.1.0".to_string(),
+            changed_assets: 0,
+            added_assets: 1,
+            removed_assets: 1,
+            candidate_mapping_changes: 1,
+        },
+        knowledge_input: InferenceKnowledgeInput {
+            repo: "repo".to_string(),
+            analyzed_commits: 4,
+            fix_like_commits: 2,
+            discovered_patterns: 2,
+        },
+        scope: InferenceScopeContext::default(),
+        summary: InferenceSummary {
+            probable_crash_causes: 1,
+            suggested_fixes: 1,
+            candidate_mapping_hints: 1,
+            highest_confidence: 0.92,
+        },
+        probable_crash_causes: vec![ProbableCrashCause {
+            code: "continuity_thread_instability".to_string(),
+            summary: "broader continuity history is unstable".to_string(),
+            confidence: 0.84,
+            risk: RiskLevel::High,
+            affected_assets: vec!["Content/Character/Encore/Body.mesh".to_string()],
+            related_patterns: vec![WwmiPatternKind::MappingOrHashUpdate],
+            reasons: vec!["continuity surfaces unstable thread history".to_string()],
+            evidence: vec!["continuity thread Content/Character/Encore/Body_v2.mesh spans 7.0.0 -> 8.2.0; later terminates as removed in 8.2.0".to_string()],
+        }],
+        suggested_fixes: vec![SuggestedFix {
+            code: "review_continuity_thread_history_before_repair".to_string(),
+            summary: "review broader continuity history".to_string(),
+            confidence: 0.81,
+            priority: RiskLevel::High,
+            related_patterns: vec![WwmiPatternKind::MappingOrHashUpdate],
+            actions: vec!["inspect continuity milestones".to_string()],
+            reasons: vec!["unstable thread history".to_string()],
+            evidence: vec!["continuity thread later terminates as removed in 8.2.0".to_string()],
+        }],
+        candidate_mapping_hints: vec![InferredMappingHint {
+            old_asset_path: "Content/Character/Encore/Body.mesh".to_string(),
+            new_asset_path: "Content/Character/Encore/Body_v2.mesh".to_string(),
+            confidence: 0.92,
+            compatibility: RemapCompatibility::CompatibleWithCaution,
+            needs_review: true,
+            ambiguous: false,
+            confidence_gap: Some(0.18),
+            continuity: Some(InferredMappingContinuityContext {
+                thread_id: Some("encore_body".to_string()),
+                first_seen_version: Some("7.0.0".to_string()),
+                latest_observed_version: Some("8.2.0".to_string()),
+                latest_live_version: None,
+                stable_before_current_change: false,
+                total_rename_steps: 1,
+                total_container_movement_steps: 0,
+                total_layout_drift_steps: 0,
+                review_required_history: true,
+                terminal_relation: Some(VersionContinuityRelation::Removed),
+                terminal_version: Some("8.2.0".to_string()),
+                terminal_after_current: true,
+                instability_detected: true,
+            }),
+            reasons: vec![
+                "normalized_name_exact: encore body".to_string(),
+                "same_parent_directory: same folder".to_string(),
+            ],
+            evidence: vec!["compare candidate confidence 0.920".to_string()],
+        }],
     }
 }
 

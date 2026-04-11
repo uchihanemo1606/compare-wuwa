@@ -258,6 +258,7 @@ mod tests {
                 material_slots: Some(2),
                 section_count: Some(1),
                 tags: vec!["hero".to_string(), "body".to_string()],
+                ..Default::default()
             },
         }
     }

@@ -8,12 +8,12 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    domain::{AssetMetadata, AssetRecord},
+    domain::{AssetInternalStructure, AssetMetadata, AssetRecord, AssetSourceContext},
     error::{AppError, AppResult},
     fingerprint::{AssetFingerprint, DefaultFingerprinter, Fingerprinter},
     ingest::{
         FilteredLocalSnapshotAssetExtractor, LocalSnapshotCaptureScope, LocalSnapshotIngestSource,
-        SnapshotAssetExtractor,
+        PreparedSnapshotAssetExtractor, SnapshotAssetExtractor,
     },
 };
 
@@ -37,9 +37,11 @@ pub struct SnapshotAsset {
     pub metadata: AssetMetadata,
     pub fingerprint: SnapshotFingerprint,
     pub hash_fields: SnapshotHashFields,
+    #[serde(default)]
+    pub source: AssetSourceContext,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct SnapshotFingerprint {
     pub normalized_kind: Option<String>,
     pub normalized_name: Option<String>,
@@ -50,6 +52,18 @@ pub struct SnapshotFingerprint {
     pub index_count: Option<u32>,
     pub material_slots: Option<u32>,
     pub section_count: Option<u32>,
+    #[serde(default)]
+    pub vertex_stride: Option<u32>,
+    #[serde(default)]
+    pub vertex_buffer_count: Option<u32>,
+    #[serde(default)]
+    pub index_format: Option<String>,
+    #[serde(default)]
+    pub primitive_topology: Option<String>,
+    #[serde(default)]
+    pub layout_markers: Vec<String>,
+    #[serde(default)]
+    pub internal_structure: AssetInternalStructure,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -57,6 +71,7 @@ pub struct SnapshotFingerprint {
 pub struct SnapshotHashFields {
     pub asset_hash: Option<String>,
     pub shader_hash: Option<String>,
+    pub signature: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -150,13 +165,21 @@ where
         }
 
         let extraction_mode = self.asset_source.extraction_mode();
+        let scope_note = self.asset_source.scope_note();
         let assets = self.asset_source.extract_snapshot_assets(source_root)?;
         let snapshot_assets = assets
             .iter()
-            .map(|asset| SnapshotAsset::from_asset(asset, self.fingerprinter.fingerprint(asset)))
+            .map(|asset| {
+                SnapshotAsset::from_asset(
+                    &asset.asset,
+                    self.fingerprinter.fingerprint(&asset.asset),
+                    &asset.hash_fields,
+                    &asset.source,
+                )
+            })
             .collect::<Vec<_>>();
 
-        Ok(GameSnapshot {
+        let mut snapshot = GameSnapshot {
             schema_version: "whashreonator.snapshot.v1".to_string(),
             version_id: version_id.trim().to_string(),
             created_at_unix_ms: current_unix_ms()?,
@@ -172,7 +195,10 @@ where
                 },
                 notes: Vec::new(),
             },
-        })
+        };
+
+        annotate_snapshot_scope_from_extractor(&mut snapshot, extraction_mode, scope_note);
+        Ok(snapshot)
     }
 }
 
@@ -221,6 +247,38 @@ pub fn create_local_snapshot_with_capture_scope(
     Ok(snapshot)
 }
 
+pub fn create_prepared_snapshot(
+    version_id: &str,
+    source_root: &Path,
+    extractor: PreparedSnapshotAssetExtractor,
+) -> AppResult<GameSnapshot> {
+    create_snapshot_with_extractor(version_id, source_root, extractor)
+}
+
+pub fn create_prepared_snapshot_from_inventory(
+    version_id: &str,
+    source_root: &Path,
+    inventory: crate::domain::PreparedAssetInventory,
+) -> AppResult<GameSnapshot> {
+    create_prepared_snapshot(
+        version_id,
+        source_root,
+        PreparedSnapshotAssetExtractor::from_inventory(inventory)?,
+    )
+}
+
+pub fn create_prepared_snapshot_from_file(
+    version_id: &str,
+    source_root: &Path,
+    inventory_path: &Path,
+) -> AppResult<GameSnapshot> {
+    create_prepared_snapshot(
+        version_id,
+        source_root,
+        PreparedSnapshotAssetExtractor::from_json(inventory_path)?,
+    )
+}
+
 pub fn detect_game_version(source_root: &Path) -> AppResult<String> {
     load_launcher_context(source_root)?
         .map(|launcher| launcher.detected_version)
@@ -260,7 +318,12 @@ pub fn load_snapshot(path: &Path) -> AppResult<GameSnapshot> {
 }
 
 impl SnapshotAsset {
-    fn from_asset(asset: &AssetRecord, fingerprint: AssetFingerprint) -> Self {
+    fn from_asset(
+        asset: &AssetRecord,
+        fingerprint: AssetFingerprint,
+        hash_fields: &crate::domain::AssetHashFields,
+        source: &AssetSourceContext,
+    ) -> Self {
         Self {
             id: asset.id.clone(),
             path: asset.path.clone(),
@@ -276,10 +339,53 @@ impl SnapshotAsset {
                 index_count: fingerprint.index_count,
                 material_slots: fingerprint.material_slots,
                 section_count: fingerprint.section_count,
+                vertex_stride: fingerprint.vertex_stride,
+                vertex_buffer_count: fingerprint.vertex_buffer_count,
+                index_format: fingerprint.index_format,
+                primitive_topology: fingerprint.primitive_topology,
+                layout_markers: fingerprint.layout_markers.into_iter().collect(),
+                internal_structure: fingerprint.internal_structure,
             },
-            hash_fields: SnapshotHashFields::default(),
+            hash_fields: SnapshotHashFields {
+                asset_hash: hash_fields.asset_hash.clone(),
+                shader_hash: hash_fields.shader_hash.clone(),
+                signature: hash_fields.signature.clone(),
+            },
+            source: source.clone(),
         }
     }
+}
+
+fn annotate_snapshot_scope_from_extractor(
+    snapshot: &mut GameSnapshot,
+    extraction_mode: crate::ingest::SnapshotExtractionMode,
+    scope_note: Option<String>,
+) {
+    if !matches!(
+        extraction_mode,
+        crate::ingest::SnapshotExtractionMode::PreparedAssetList
+    ) {
+        return;
+    }
+
+    let coverage = compute_scope_coverage(snapshot);
+    let prepared_note = scope_note.unwrap_or_else(|| {
+        "prepared asset-level records were ingested through the extractor seam".to_string()
+    });
+
+    snapshot.context.scope = SnapshotScopeContext {
+        capture_mode: Some(extraction_mode.capture_mode().to_string()),
+        mostly_install_or_package_level: Some(false),
+        meaningful_content_coverage: Some(coverage.content_like_path_count > 0),
+        meaningful_character_coverage: Some(coverage.character_path_count > 0),
+        coverage,
+        note: Some(format!(
+            "{prepared_note}; snapshot is asset-level prepared input, not raw install/package inventory"
+        )),
+    };
+    snapshot.context.notes.push(
+        "prepared asset-level snapshot created from externally extracted records".to_string(),
+    );
 }
 
 fn enrich_snapshot_from_game_root(
@@ -577,7 +683,8 @@ mod tests {
     use super::{
         GameSnapshot, SnapshotAsset, SnapshotContext, SnapshotFingerprint, SnapshotHashFields,
         SnapshotScopeContext, assess_snapshot_scope, create_local_snapshot,
-        create_local_snapshot_with_capture_scope, create_snapshot_with_extractor, load_snapshot,
+        create_local_snapshot_with_capture_scope, create_prepared_snapshot_from_file,
+        create_snapshot_with_extractor, load_snapshot,
     };
 
     #[test]
@@ -691,12 +798,15 @@ mod tests {
     fn create_snapshot_with_extractor_accepts_prepared_extension_point() {
         let test_root = unique_test_dir();
         fs::create_dir_all(&test_root).expect("create test root");
-        let extractor = PreparedSnapshotAssetExtractor::new(vec![crate::domain::AssetRecord {
-            id: "asset-1".to_string(),
-            path: "Content/Character/Encore/Body.mesh".to_string(),
-            kind: Some("mesh".to_string()),
-            metadata: crate::domain::AssetMetadata::default(),
-        }])
+        let extractor = PreparedSnapshotAssetExtractor::new(vec![
+            crate::domain::AssetRecord {
+                id: "asset-1".to_string(),
+                path: "Content/Character/Encore/Body.mesh".to_string(),
+                kind: Some("mesh".to_string()),
+                metadata: crate::domain::AssetMetadata::default(),
+            }
+            .into(),
+        ])
         .expect("build prepared extractor");
 
         let snapshot =
@@ -708,12 +818,131 @@ mod tests {
             snapshot.context.scope.capture_mode.as_deref(),
             Some("prepared_asset_list_inventory")
         );
+        assert_eq!(
+            snapshot.context.scope.mostly_install_or_package_level,
+            Some(false)
+        );
         assert!(
             snapshot
                 .context
                 .scope
-                .mostly_install_or_package_level
-                .is_none()
+                .note
+                .as_deref()
+                .is_some_and(|note| note.contains("asset-level"))
+        );
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[test]
+    fn prepared_asset_inventory_creates_richer_asset_level_snapshot() {
+        let test_root = unique_test_dir();
+        fs::create_dir_all(&test_root).expect("create test root");
+        let inventory_path = test_root.join("prepared-assets.json");
+        fs::write(
+            &inventory_path,
+            r#"{
+                "schema_version":"whashreonator.prepared-assets.v1",
+                "context":{
+                    "extraction_tool":"fixture-extractor",
+                    "extraction_kind":"asset_records",
+                    "source_root":"D:/prepared"
+                },
+                "assets":[
+                    {
+                        "id":"mesh:encore:body",
+                        "path":"Content/Character/Encore/Body.mesh",
+                        "kind":"mesh",
+                        "metadata":{
+                            "logical_name":"Encore Body",
+                            "vertex_count":120,
+                            "index_count":240,
+                            "material_slots":2,
+                            "section_count":3,
+                            "tags":["character","prepared"]
+                        },
+                        "hash_fields":{
+                            "asset_hash":"asset-md5",
+                            "shader_hash":"shader-md5",
+                            "signature":"sig-001"
+                        },
+                        "source":{
+                            "extraction_tool":"fixture-extractor",
+                            "source_root":"D:/prepared",
+                            "source_path":"Content/Character/Encore/Body.mesh",
+                            "source_kind":"mesh_record",
+                            "container_path":"pakchunk0-WindowsNoEditor.pak"
+                        }
+                    }
+                ]
+            }"#,
+        )
+        .expect("write prepared inventory");
+
+        let snapshot = create_prepared_snapshot_from_file("6.0.0", &test_root, &inventory_path)
+            .expect("snapshot");
+
+        assert_eq!(snapshot.asset_count, 1);
+        assert_eq!(
+            snapshot.context.scope.capture_mode.as_deref(),
+            Some("prepared_asset_list_inventory")
+        );
+        assert_eq!(
+            snapshot.context.scope.mostly_install_or_package_level,
+            Some(false)
+        );
+        assert_eq!(
+            snapshot.context.scope.meaningful_content_coverage,
+            Some(true)
+        );
+        assert_eq!(
+            snapshot.context.scope.meaningful_character_coverage,
+            Some(true)
+        );
+        assert!(
+            snapshot
+                .context
+                .scope
+                .note
+                .as_deref()
+                .is_some_and(|note| note.contains("fixture-extractor"))
+        );
+        assert_eq!(snapshot.assets[0].metadata.vertex_count, Some(120));
+        assert_eq!(snapshot.assets[0].fingerprint.vertex_count, Some(120));
+        assert_eq!(snapshot.assets[0].fingerprint.index_count, Some(240));
+        assert_eq!(snapshot.assets[0].fingerprint.material_slots, Some(2));
+        assert_eq!(snapshot.assets[0].fingerprint.section_count, Some(3));
+        assert_eq!(
+            snapshot.assets[0].hash_fields.asset_hash.as_deref(),
+            Some("asset-md5")
+        );
+        assert_eq!(
+            snapshot.assets[0].hash_fields.shader_hash.as_deref(),
+            Some("shader-md5")
+        );
+        assert_eq!(
+            snapshot.assets[0].hash_fields.signature.as_deref(),
+            Some("sig-001")
+        );
+        assert_eq!(
+            snapshot.assets[0].source.extraction_tool.as_deref(),
+            Some("fixture-extractor")
+        );
+        assert_eq!(
+            snapshot.assets[0].source.source_root.as_deref(),
+            Some("D:/prepared")
+        );
+        assert_eq!(
+            snapshot.assets[0].source.source_path.as_deref(),
+            Some("Content/Character/Encore/Body.mesh")
+        );
+        assert_eq!(
+            snapshot.assets[0].source.source_kind.as_deref(),
+            Some("mesh_record")
+        );
+        assert_eq!(
+            snapshot.assets[0].source.container_path.as_deref(),
+            Some("pakchunk0-WindowsNoEditor.pak")
         );
 
         let _ = fs::remove_dir_all(&test_root);
@@ -838,8 +1067,10 @@ mod tests {
                         index_count: None,
                         material_slots: None,
                         section_count: None,
+                        ..Default::default()
                     },
                     hash_fields: SnapshotHashFields::default(),
+                    source: crate::domain::AssetSourceContext::default(),
                 },
                 SnapshotAsset {
                     id: "b".to_string(),
@@ -856,8 +1087,10 @@ mod tests {
                         index_count: None,
                         material_slots: None,
                         section_count: None,
+                        ..Default::default()
                     },
                     hash_fields: SnapshotHashFields::default(),
+                    source: crate::domain::AssetSourceContext::default(),
                 },
             ],
             context: SnapshotContext::default(),

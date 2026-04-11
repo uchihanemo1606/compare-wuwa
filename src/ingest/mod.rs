@@ -4,7 +4,10 @@ use std::{
 };
 
 use crate::{
-    domain::{AssetBundle, AssetMetadata, AssetRecord},
+    domain::{
+        AssetBundle, AssetHashFields, AssetMetadata, AssetRecord, ExtractedAssetRecord,
+        PreparedAssetInventory,
+    },
     error::{AppError, AppResult},
 };
 
@@ -22,7 +25,11 @@ pub trait AssetListSource {
 /// inventory, but the trait provides a concrete seam for future asset-level extractors.
 pub trait SnapshotAssetExtractor {
     fn extraction_mode(&self) -> SnapshotExtractionMode;
-    fn extract_snapshot_assets(&self, path: &Path) -> AppResult<Vec<AssetRecord>>;
+    fn extract_snapshot_assets(&self, path: &Path) -> AppResult<Vec<ExtractedAssetRecord>>;
+
+    fn scope_note(&self) -> Option<String> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -89,7 +96,8 @@ pub struct FilteredLocalSnapshotAssetExtractor {
 
 #[derive(Debug, Clone)]
 pub struct PreparedSnapshotAssetExtractor {
-    assets: Vec<AssetRecord>,
+    assets: Vec<ExtractedAssetRecord>,
+    scope_note: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -125,7 +133,7 @@ impl SnapshotAssetExtractor for LocalSnapshotIngestSource {
         SnapshotExtractionMode::InstallFilesystemInventory(LocalSnapshotCaptureScope::FullInventory)
     }
 
-    fn extract_snapshot_assets(&self, path: &Path) -> AppResult<Vec<AssetRecord>> {
+    fn extract_snapshot_assets(&self, path: &Path) -> AppResult<Vec<ExtractedAssetRecord>> {
         scan_local_assets(path)
     }
 }
@@ -141,16 +149,31 @@ impl SnapshotAssetExtractor for FilteredLocalSnapshotAssetExtractor {
         SnapshotExtractionMode::InstallFilesystemInventory(self.capture_scope)
     }
 
-    fn extract_snapshot_assets(&self, path: &Path) -> AppResult<Vec<AssetRecord>> {
+    fn extract_snapshot_assets(&self, path: &Path) -> AppResult<Vec<ExtractedAssetRecord>> {
         let assets = LocalSnapshotIngestSource.extract_snapshot_assets(path)?;
         Ok(filter_assets_by_capture_scope(assets, self.capture_scope))
     }
 }
 
 impl PreparedSnapshotAssetExtractor {
-    pub fn new(assets: Vec<AssetRecord>) -> AppResult<Self> {
-        validate_assets("prepared_assets", &assets)?;
-        Ok(Self { assets })
+    pub fn new(assets: Vec<ExtractedAssetRecord>) -> AppResult<Self> {
+        validate_extracted_assets("prepared_assets", &assets)?;
+        Ok(Self {
+            assets,
+            scope_note: None,
+        })
+    }
+
+    pub fn from_inventory(inventory: PreparedAssetInventory) -> AppResult<Self> {
+        let scope_note = prepared_inventory_scope_note(&inventory);
+        let mut extractor = Self::new(inventory.assets)?;
+        extractor.scope_note = scope_note;
+        Ok(extractor)
+    }
+
+    pub fn from_json(path: &Path) -> AppResult<Self> {
+        let inventory = load_prepared_asset_inventory(path)?;
+        Self::from_inventory(inventory)
     }
 }
 
@@ -159,8 +182,12 @@ impl SnapshotAssetExtractor for PreparedSnapshotAssetExtractor {
         SnapshotExtractionMode::PreparedAssetList
     }
 
-    fn extract_snapshot_assets(&self, _path: &Path) -> AppResult<Vec<AssetRecord>> {
+    fn extract_snapshot_assets(&self, _path: &Path) -> AppResult<Vec<ExtractedAssetRecord>> {
         Ok(self.assets.clone())
+    }
+
+    fn scope_note(&self) -> Option<String> {
+        self.scope_note.clone()
     }
 }
 
@@ -169,7 +196,7 @@ impl SnapshotAssetExtractor for AssetLevelSnapshotExtractorPlaceholder {
         SnapshotExtractionMode::AssetLevelExtractorPlaceholder
     }
 
-    fn extract_snapshot_assets(&self, path: &Path) -> AppResult<Vec<AssetRecord>> {
+    fn extract_snapshot_assets(&self, path: &Path) -> AppResult<Vec<ExtractedAssetRecord>> {
         Err(AppError::InvalidInput(format!(
             "asset-level extraction is not implemented yet for {}; keep using install-level inventory extraction until a real parser is integrated",
             path.display()
@@ -182,8 +209,18 @@ where
     T: SnapshotAssetExtractor,
 {
     fn load_assets(&self, path: &Path) -> AppResult<Vec<AssetRecord>> {
-        self.extract_snapshot_assets(path)
+        Ok(self
+            .extract_snapshot_assets(path)?
+            .into_iter()
+            .map(|record| record.asset)
+            .collect())
     }
+}
+
+pub fn load_prepared_asset_inventory(path: &Path) -> AppResult<PreparedAssetInventory> {
+    let inventory: PreparedAssetInventory = serde_json::from_str(&fs::read_to_string(path)?)?;
+    validate_extracted_assets("prepared_inventory.assets", &inventory.assets)?;
+    Ok(inventory)
 }
 
 pub fn load_bundle_from_sources(
@@ -235,7 +272,40 @@ fn validate_assets(label: &str, assets: &[AssetRecord]) -> AppResult<()> {
     Ok(())
 }
 
-fn scan_local_assets(root: &Path) -> AppResult<Vec<AssetRecord>> {
+fn validate_extracted_assets(label: &str, assets: &[ExtractedAssetRecord]) -> AppResult<()> {
+    let plain_assets = assets
+        .iter()
+        .map(|record| record.asset.clone())
+        .collect::<Vec<_>>();
+    validate_assets(label, &plain_assets)?;
+
+    for (index, asset) in assets.iter().enumerate() {
+        validate_optional_field(
+            &format!("{label}[{index}].hash_fields.asset_hash"),
+            asset.hash_fields.asset_hash.as_deref(),
+        )?;
+        validate_optional_field(
+            &format!("{label}[{index}].hash_fields.shader_hash"),
+            asset.hash_fields.shader_hash.as_deref(),
+        )?;
+        validate_optional_field(
+            &format!("{label}[{index}].hash_fields.signature"),
+            asset.hash_fields.signature.as_deref(),
+        )?;
+    }
+
+    Ok(())
+}
+
+fn validate_optional_field(label: &str, value: Option<&str>) -> AppResult<()> {
+    if value.is_some_and(|value| value.trim().is_empty()) {
+        return Err(AppError::InvalidInput(format!("{label} must not be blank")));
+    }
+
+    Ok(())
+}
+
+fn scan_local_assets(root: &Path) -> AppResult<Vec<ExtractedAssetRecord>> {
     if !root.exists() {
         return Err(AppError::InvalidInput(format!(
             "local source root does not exist: {}",
@@ -253,15 +323,16 @@ fn scan_local_assets(root: &Path) -> AppResult<Vec<AssetRecord>> {
     let mut assets = Vec::new();
     scan_dir(root, root, &mut assets)?;
     assets.sort_by(|left, right| {
-        left.path
-            .cmp(&right.path)
-            .then_with(|| left.id.cmp(&right.id))
+        left.asset
+            .path
+            .cmp(&right.asset.path)
+            .then_with(|| left.asset.id.cmp(&right.asset.id))
     });
-    validate_assets("local_assets", &assets)?;
+    validate_extracted_assets("local_assets", &assets)?;
     Ok(assets)
 }
 
-fn scan_dir(root: &Path, current: &Path, assets: &mut Vec<AssetRecord>) -> AppResult<()> {
+fn scan_dir(root: &Path, current: &Path, assets: &mut Vec<ExtractedAssetRecord>) -> AppResult<()> {
     for entry in fs::read_dir(current)? {
         let entry = entry?;
         let path = entry.path();
@@ -286,7 +357,7 @@ fn scan_dir(root: &Path, current: &Path, assets: &mut Vec<AssetRecord>) -> AppRe
     Ok(())
 }
 
-fn build_local_asset(root: &Path, path: &Path) -> AppResult<AssetRecord> {
+fn build_local_asset(root: &Path, path: &Path) -> AppResult<ExtractedAssetRecord> {
     let relative = path.strip_prefix(root).map_err(|_| {
         AppError::InvalidInput(format!(
             "failed to normalize local asset path relative to root: {}",
@@ -295,19 +366,23 @@ fn build_local_asset(root: &Path, path: &Path) -> AppResult<AssetRecord> {
     })?;
     let relative_path = normalize_relative_path(relative);
 
-    Ok(AssetRecord {
-        id: relative_path.clone(),
-        path: relative_path,
-        kind: path
-            .extension()
-            .and_then(|value| value.to_str())
-            .map(|value| value.to_ascii_lowercase()),
-        metadata: AssetMetadata {
-            logical_name: path
-                .file_stem()
-                .map(|value| value.to_string_lossy().into_owned()),
-            ..AssetMetadata::default()
+    Ok(ExtractedAssetRecord {
+        asset: AssetRecord {
+            id: relative_path.clone(),
+            path: relative_path,
+            kind: path
+                .extension()
+                .and_then(|value| value.to_str())
+                .map(|value| value.to_ascii_lowercase()),
+            metadata: AssetMetadata {
+                logical_name: path
+                    .file_stem()
+                    .map(|value| value.to_string_lossy().into_owned()),
+                ..AssetMetadata::default()
+            },
         },
+        hash_fields: AssetHashFields::default(),
+        source: crate::domain::AssetSourceContext::default(),
     })
 }
 
@@ -316,19 +391,44 @@ fn normalize_relative_path(path: &Path) -> String {
 }
 
 fn filter_assets_by_capture_scope(
-    assets: Vec<AssetRecord>,
+    assets: Vec<ExtractedAssetRecord>,
     capture_scope: LocalSnapshotCaptureScope,
-) -> Vec<AssetRecord> {
+) -> Vec<ExtractedAssetRecord> {
     match capture_scope {
         LocalSnapshotCaptureScope::FullInventory => assets,
         LocalSnapshotCaptureScope::ContentFocused => assets
             .into_iter()
-            .filter(|asset| is_content_like_path(&asset.path))
+            .filter(|asset| is_content_like_path(&asset.asset.path))
             .collect(),
         LocalSnapshotCaptureScope::CharacterFocused => assets
             .into_iter()
-            .filter(|asset| is_character_like_path(&asset.path))
+            .filter(|asset| is_character_like_path(&asset.asset.path))
             .collect(),
+    }
+}
+
+fn prepared_inventory_scope_note(inventory: &PreparedAssetInventory) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(tool) = inventory.context.extraction_tool.as_deref() {
+        parts.push(format!("tool={tool}"));
+    }
+    if let Some(kind) = inventory.context.extraction_kind.as_deref() {
+        parts.push(format!("kind={kind}"));
+    }
+    if let Some(source_root) = inventory.context.source_root.as_deref() {
+        parts.push(format!("source_root={source_root}"));
+    }
+    if !inventory.context.tags.is_empty() {
+        parts.push(format!("tags={}", inventory.context.tags.join(",")));
+    }
+
+    if parts.is_empty() {
+        Some("prepared asset-level records were ingested through the extractor seam".to_string())
+    } else {
+        Some(format!(
+            "prepared asset-level records were ingested through the extractor seam ({})",
+            parts.join(", ")
+        ))
     }
 }
 
@@ -384,7 +484,7 @@ mod tests {
     use super::{
         AssetLevelSnapshotExtractorPlaceholder, AssetListSource,
         FilteredLocalSnapshotAssetExtractor, LocalSnapshotCaptureScope,
-        PreparedSnapshotAssetExtractor, scan_local_assets,
+        PreparedSnapshotAssetExtractor, load_prepared_asset_inventory, scan_local_assets,
     };
 
     #[test]
@@ -405,7 +505,7 @@ mod tests {
 
         assert_eq!(assets.len(), 1);
         assert_eq!(
-            assets[0].path,
+            assets[0].asset.path,
             "Client/Content/Paks/pakchunk0-WindowsNoEditor.pak"
         );
 
@@ -414,13 +514,18 @@ mod tests {
 
     #[test]
     fn prepared_snapshot_asset_extractor_returns_seeded_assets() {
-        let extractor = PreparedSnapshotAssetExtractor::new(vec![crate::domain::AssetRecord {
-            id: "asset-1".to_string(),
-            path: "Content/Character/Encore/Body.mesh".to_string(),
-            kind: Some("mesh".to_string()),
-            metadata: crate::domain::AssetMetadata::default(),
-        }])
-        .expect("build prepared extractor");
+        let extractor =
+            PreparedSnapshotAssetExtractor::new(vec![crate::domain::ExtractedAssetRecord {
+                asset: crate::domain::AssetRecord {
+                    id: "asset-1".to_string(),
+                    path: "Content/Character/Encore/Body.mesh".to_string(),
+                    kind: Some("mesh".to_string()),
+                    metadata: crate::domain::AssetMetadata::default(),
+                },
+                hash_fields: crate::domain::AssetHashFields::default(),
+                source: crate::domain::AssetSourceContext::default(),
+            }])
+            .expect("build prepared extractor");
 
         let loaded = extractor
             .load_assets(Path::new("ignored"))
@@ -428,6 +533,65 @@ mod tests {
 
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].path, "Content/Character/Encore/Body.mesh");
+    }
+
+    #[test]
+    fn prepared_asset_inventory_loader_accepts_richer_asset_records() {
+        let test_root = unique_test_dir();
+        fs::create_dir_all(&test_root).expect("create test root");
+        let inventory_path = test_root.join("prepared-assets.json");
+        fs::write(
+            &inventory_path,
+            r#"{
+                "schema_version":"whashreonator.prepared-assets.v1",
+                "context":{
+                    "extraction_tool":"fixture-extractor",
+                    "extraction_kind":"asset_records",
+                    "source_root":"D:/prepared"
+                },
+                "assets":[
+                    {
+                        "id":"mesh:encore:body",
+                        "path":"Content/Character/Encore/Body.mesh",
+                        "kind":"mesh",
+                        "metadata":{
+                            "logical_name":"Encore Body",
+                            "vertex_count":120,
+                            "index_count":240,
+                            "material_slots":2,
+                            "section_count":3,
+                            "tags":["character","prepared"]
+                        },
+                        "hash_fields":{
+                            "asset_hash":"asset-md5",
+                            "shader_hash":"shader-md5",
+                            "signature":"sig-001"
+                        },
+                        "source":{
+                            "extraction_tool":"fixture-extractor",
+                            "source_kind":"mesh_record",
+                            "container_path":"pakchunk0-WindowsNoEditor.pak"
+                        }
+                    }
+                ]
+            }"#,
+        )
+        .expect("write prepared inventory");
+
+        let inventory = load_prepared_asset_inventory(&inventory_path).expect("load inventory");
+
+        assert_eq!(inventory.assets.len(), 1);
+        assert_eq!(inventory.assets[0].asset.id, "mesh:encore:body");
+        assert_eq!(
+            inventory.assets[0].hash_fields.signature.as_deref(),
+            Some("sig-001")
+        );
+        assert_eq!(
+            inventory.assets[0].source.container_path.as_deref(),
+            Some("pakchunk0-WindowsNoEditor.pak")
+        );
+
+        let _ = fs::remove_dir_all(&test_root);
     }
 
     #[test]

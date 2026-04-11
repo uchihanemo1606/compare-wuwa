@@ -1,4 +1,5 @@
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
@@ -8,10 +9,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     compare::{
-        CandidateMappingChange, RiskLevel, SnapshotAssetChange, SnapshotChangeType,
-        SnapshotCompareReason, SnapshotCompareReport, load_snapshot_compare_report,
+        CandidateMappingChange, RemapCompatibility, RiskLevel, SnapshotAssetChange,
+        SnapshotChangeType, SnapshotCompareReason, SnapshotCompareReport,
+        load_snapshot_compare_report,
     },
     error::{AppError, AppResult},
+    report::{
+        VersionContinuityIndex, VersionContinuityObservation, VersionContinuityRelation,
+        VersionContinuityThread, VersionContinuityThreadSummary,
+    },
     wwmi::{WwmiKnowledgeBase, WwmiPatternKind, load_wwmi_knowledge},
 };
 
@@ -93,17 +99,76 @@ pub struct InferredMappingHint {
     pub old_asset_path: String,
     pub new_asset_path: String,
     pub confidence: f32,
+    #[serde(default)]
+    pub compatibility: RemapCompatibility,
     pub needs_review: bool,
     #[serde(default)]
     pub ambiguous: bool,
     #[serde(default)]
     pub confidence_gap: Option<f32>,
+    #[serde(default)]
+    pub continuity: Option<InferredMappingContinuityContext>,
     pub reasons: Vec<String>,
     pub evidence: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct InferredMappingContinuityContext {
+    pub thread_id: Option<String>,
+    pub first_seen_version: Option<String>,
+    pub latest_observed_version: Option<String>,
+    pub latest_live_version: Option<String>,
+    pub stable_before_current_change: bool,
+    pub total_rename_steps: usize,
+    pub total_container_movement_steps: usize,
+    pub total_layout_drift_steps: usize,
+    pub review_required_history: bool,
+    pub terminal_relation: Option<VersionContinuityRelation>,
+    pub terminal_version: Option<String>,
+    pub terminal_after_current: bool,
+    pub instability_detected: bool,
+}
+
+impl InferredMappingContinuityContext {
+    pub fn has_review_caution(&self) -> bool {
+        self.instability_detected
+            || self.total_layout_drift_steps >= 2
+            || self.review_required_history
+            || self.terminal_relation.is_some()
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct FixInferenceEngine;
+
+#[derive(Debug, Clone, Default)]
+struct InferenceContinuityContext {
+    change_signals: BTreeMap<(String, Option<String>), ContinuitySignal>,
+    mapping_signals: BTreeMap<(String, String), ContinuitySignal>,
+}
+
+#[derive(Debug, Clone)]
+struct ContinuitySignal {
+    thread_id: String,
+    current_from_path: String,
+    current_to_path: Option<String>,
+    first_seen_version: String,
+    latest_observed_version: String,
+    latest_live_version: Option<String>,
+    current_relation: VersionContinuityRelation,
+    prior_persisted_steps: usize,
+    prior_rename_steps: usize,
+    prior_container_movement_steps: usize,
+    prior_layout_drift_steps: usize,
+    prior_material_steps: usize,
+    later_rename_steps: usize,
+    later_container_movement_steps: usize,
+    later_layout_drift_steps: usize,
+    terminal_relation: Option<VersionContinuityRelation>,
+    terminal_version: Option<String>,
+    review_required: bool,
+}
 
 impl FixInferenceEngine {
     pub fn infer_files(
@@ -121,8 +186,19 @@ impl FixInferenceEngine {
         compare_report: &SnapshotCompareReport,
         wwmi_knowledge: &WwmiKnowledgeBase,
     ) -> InferenceReport {
+        self.infer_with_continuity(compare_report, wwmi_knowledge, None)
+    }
+
+    pub fn infer_with_continuity(
+        &self,
+        compare_report: &SnapshotCompareReport,
+        wwmi_knowledge: &WwmiKnowledgeBase,
+        continuity: Option<&VersionContinuityIndex>,
+    ) -> InferenceReport {
         let scope = build_inference_scope_context(compare_report);
         let confidence_scale = if scope.low_signal_compare { 0.85 } else { 1.0 };
+        let continuity_context =
+            continuity.map(|index| build_inference_continuity_context(compare_report, index));
 
         let mapping_support = pattern_support(wwmi_knowledge, WwmiPatternKind::MappingOrHashUpdate);
         let buffer_support =
@@ -191,7 +267,7 @@ impl FixInferenceEngine {
                     WwmiPatternKind::RuntimeConfigChange,
                 ],
                 actions: vec![
-                    "Compare vertex_count/index_count/material_slots/section_count against the previous version.".to_string(),
+                    "Compare vertex_count/index_count/material_slots/section_count and any internal section/binding signals against the previous version.".to_string(),
                     "Check whether the mod needs a new mapping or a larger buffer/layout-aware path similar to WWMI buffer-capacity fixes.".to_string(),
                     "Avoid auto-applying mappings for these assets until the new layout is validated.".to_string(),
                 ],
@@ -214,7 +290,19 @@ impl FixInferenceEngine {
             .iter()
             .filter(|change| change.change_type == SnapshotChangeType::Removed)
             .collect::<Vec<_>>();
-        if !removed_assets.is_empty() && !compare_report.candidate_mapping_changes.is_empty() {
+        let plausible_repair_candidates = compare_report
+            .candidate_mapping_changes
+            .iter()
+            .filter(|candidate| {
+                matches!(
+                    candidate.compatibility,
+                    RemapCompatibility::LikelyCompatible
+                        | RemapCompatibility::CompatibleWithCaution
+                        | RemapCompatibility::StructurallyRisky
+                )
+            })
+            .collect::<Vec<_>>();
+        if !removed_assets.is_empty() && !plausible_repair_candidates.is_empty() {
             let confidence = (0.55 + 0.25 * mapping_support + 0.10 * shader_support + 0.05)
                 .clamp(0.0, 1.0)
                 * confidence_scale;
@@ -223,8 +311,7 @@ impl FixInferenceEngine {
                 summary: "Assets disappeared from their old paths but plausible replacements exist in the new snapshot; the mod likely needs remapping.".to_string(),
                 confidence,
                 risk: RiskLevel::High,
-                affected_assets: compare_report
-                    .candidate_mapping_changes
+                affected_assets: plausible_repair_candidates
                     .iter()
                     .map(|candidate| format!("{} -> {}", candidate.old_asset.path, candidate.new_asset.path))
                     .collect(),
@@ -235,7 +322,7 @@ impl FixInferenceEngine {
                 reasons: vec![
                     format!(
                         "{} removed assets have candidate replacements",
-                        compare_report.candidate_mapping_changes.len()
+                        plausible_repair_candidates.len()
                     ),
                     "compare heuristics found plausible old->new asset remap candidates".to_string(),
                 ],
@@ -289,6 +376,244 @@ impl FixInferenceEngine {
             });
         }
 
+        let structurally_drifted_remaps = compare_report
+            .candidate_mapping_changes
+            .iter()
+            .filter(|candidate| candidate.compatibility == RemapCompatibility::StructurallyRisky)
+            .collect::<Vec<_>>();
+        if !structurally_drifted_remaps.is_empty() {
+            let confidence = (0.52 + 0.22 * buffer_support + 0.18 * mapping_support)
+                .clamp(0.0, 1.0)
+                * confidence_scale;
+            probable_crash_causes.push(ProbableCrashCause {
+                code: "candidate_remap_structural_drift".to_string(),
+                summary: "Some remap candidates look logically related, but their structural metadata drifted; a path remap alone may still break the mod.".to_string(),
+                confidence,
+                risk: RiskLevel::High,
+                affected_assets: structurally_drifted_remaps
+                    .iter()
+                    .flat_map(|candidate| {
+                        [
+                            candidate.old_asset.path.clone(),
+                            candidate.new_asset.path.clone(),
+                        ]
+                    })
+                    .collect(),
+                related_patterns: vec![
+                    WwmiPatternKind::BufferLayoutOrCapacityFix,
+                    WwmiPatternKind::MappingOrHashUpdate,
+                ],
+                reasons: vec![
+                    "compare found candidate remaps that still carry structural drift".to_string(),
+                    "same logical asset does not automatically mean layout-compatible replacement".to_string(),
+                ],
+                evidence: structurally_drifted_remaps
+                    .iter()
+                    .flat_map(|candidate| {
+                        candidate
+                            .reasons
+                .iter()
+                .filter(|reason| {
+                    matches!(
+                        reason.code.as_str(),
+                        "same_asset_but_structural_drift"
+                            | "buffer_layout_validation_needed"
+                            | "vertex_count_mismatch"
+                            | "index_count_mismatch"
+                            | "material_slots_mismatch"
+                            | "section_count_mismatch"
+                            | "vertex_stride_mismatch"
+                            | "vertex_buffer_count_mismatch"
+                            | "index_format_mismatch"
+                            | "primitive_topology_mismatch"
+                            | "layout_markers_mismatch"
+                    )
+                })
+                .map(reason_to_string)
+            })
+                    .chain(pattern_evidence(
+                        wwmi_knowledge,
+                        &[
+                            WwmiPatternKind::BufferLayoutOrCapacityFix,
+                            WwmiPatternKind::MappingOrHashUpdate,
+                        ],
+                    ))
+                    .collect(),
+            });
+            suggested_fixes.push(SuggestedFix {
+                code: "validate_candidate_remaps_against_layout".to_string(),
+                summary: "Validate remap candidates against the new mesh/buffer layout before applying path updates.".to_string(),
+                confidence,
+                priority: RiskLevel::High,
+                related_patterns: vec![
+                    WwmiPatternKind::BufferLayoutOrCapacityFix,
+                    WwmiPatternKind::MappingOrHashUpdate,
+                ],
+                actions: vec![
+                    "Review candidate remaps that report structural drift and compare their vertex/index/material/section metadata.".to_string(),
+                    "Keep these mappings in review state until the replacement asset is proven layout-compatible.".to_string(),
+                ],
+                reasons: vec![
+                    "compare surfaced remap candidates with structural drift".to_string(),
+                ],
+                evidence: pattern_evidence(
+                    wwmi_knowledge,
+                    &[
+                        WwmiPatternKind::BufferLayoutOrCapacityFix,
+                        WwmiPatternKind::MappingOrHashUpdate,
+                    ],
+                ),
+            });
+        }
+
+        let incompatible_candidates = compare_report
+            .candidate_mapping_changes
+            .iter()
+            .filter(|candidate| candidate.compatibility == RemapCompatibility::IncompatibleBlocked)
+            .collect::<Vec<_>>();
+        if !incompatible_candidates.is_empty() {
+            let confidence = (0.48 + 0.24 * mapping_support + 0.12 * shader_support)
+                .clamp(0.0, 1.0)
+                * confidence_scale;
+            probable_crash_causes.push(ProbableCrashCause {
+                code: "candidate_remap_identity_conflict".to_string(),
+                summary: "Some high-similarity remap candidates are blocked by identity conflicts; the next step is manual inspection, not auto-remap.".to_string(),
+                confidence,
+                risk: RiskLevel::High,
+                affected_assets: incompatible_candidates
+                    .iter()
+                    .flat_map(|candidate| {
+                        [
+                            candidate.old_asset.path.clone(),
+                            candidate.new_asset.path.clone(),
+                        ]
+                    })
+                    .collect(),
+                related_patterns: vec![
+                    WwmiPatternKind::MappingOrHashUpdate,
+                    WwmiPatternKind::ShaderLogicChange,
+                ],
+                reasons: vec![
+                    "candidate remaps contain explicit identity conflicts".to_string(),
+                ],
+                evidence: incompatible_candidates
+                    .iter()
+                    .flat_map(|candidate| {
+                        candidate
+                            .reasons
+                            .iter()
+                            .filter(|reason| {
+                                matches!(
+                                    reason.code.as_str(),
+                                    "identity_conflict_detected"
+                                        | "kind_mismatch"
+                                        | "signature_mismatch"
+                                )
+                            })
+                            .map(reason_to_string)
+                    })
+                    .chain(pattern_evidence(
+                        wwmi_knowledge,
+                        &[
+                            WwmiPatternKind::MappingOrHashUpdate,
+                            WwmiPatternKind::ShaderLogicChange,
+                        ],
+                    ))
+                    .collect(),
+            });
+            suggested_fixes.push(SuggestedFix {
+                code: "inspect_identity_conflicts_before_remap".to_string(),
+                summary: "Inspect candidates with blocked identity signals before attempting any remap update.".to_string(),
+                confidence,
+                priority: RiskLevel::High,
+                related_patterns: vec![
+                    WwmiPatternKind::MappingOrHashUpdate,
+                    WwmiPatternKind::ShaderLogicChange,
+                ],
+                actions: vec![
+                    "Review conflicting kind/signature/hash signals on blocked candidates.".to_string(),
+                    "Do not auto-apply these remaps until a human confirms the replacement asset.".to_string(),
+                ],
+                reasons: vec![
+                    "candidate compatibility is blocked by conflicting identity evidence".to_string(),
+                ],
+                evidence: pattern_evidence(
+                    wwmi_knowledge,
+                    &[
+                        WwmiPatternKind::MappingOrHashUpdate,
+                        WwmiPatternKind::ShaderLogicChange,
+                    ],
+                ),
+            });
+        }
+
+        let insufficient_candidates = compare_report
+            .candidate_mapping_changes
+            .iter()
+            .filter(|candidate| candidate.compatibility == RemapCompatibility::InsufficientEvidence)
+            .collect::<Vec<_>>();
+        if !insufficient_candidates.is_empty() {
+            let confidence = (0.32 + 0.18 * mapping_support).clamp(0.0, 1.0) * confidence_scale;
+            probable_crash_causes.push(ProbableCrashCause {
+                code: "candidate_remap_insufficient_evidence".to_string(),
+                summary: "Some remap candidates lack enough asset-level evidence to recommend a safe repair path yet.".to_string(),
+                confidence,
+                risk: RiskLevel::Medium,
+                affected_assets: insufficient_candidates
+                    .iter()
+                    .flat_map(|candidate| {
+                        [
+                            candidate.old_asset.path.clone(),
+                            candidate.new_asset.path.clone(),
+                        ]
+                    })
+                    .collect(),
+                related_patterns: vec![WwmiPatternKind::MappingOrHashUpdate],
+                reasons: vec![
+                    "candidate compatibility remained in insufficient-evidence state".to_string(),
+                ],
+                evidence: insufficient_candidates
+                    .iter()
+                    .flat_map(|candidate| {
+                        candidate
+                            .reasons
+                            .iter()
+                            .filter(|reason| {
+                                matches!(
+                                    reason.code.as_str(),
+                                    "weak_identity_evidence"
+                                        | "ambiguous_runner_up"
+                                        | "compatibility_insufficient_evidence"
+                                )
+                            })
+                            .map(reason_to_string)
+                    })
+                    .chain(pattern_evidence(
+                        wwmi_knowledge,
+                        &[WwmiPatternKind::MappingOrHashUpdate],
+                    ))
+                    .collect(),
+            });
+            suggested_fixes.push(SuggestedFix {
+                code: "gather_stronger_asset_evidence".to_string(),
+                summary: "Gather stronger asset-level evidence before treating low-evidence remap candidates as repair-safe.".to_string(),
+                confidence,
+                priority: RiskLevel::Medium,
+                related_patterns: vec![WwmiPatternKind::MappingOrHashUpdate],
+                actions: vec![
+                    "Prefer prepared asset-level snapshots with richer identity or structural metadata.".to_string(),
+                    "Keep low-evidence remap candidates in manual review until stronger evidence appears.".to_string(),
+                ],
+                reasons: vec![
+                    "snapshot evidence is insufficient to classify some remaps as repair-safe".to_string(),
+                ],
+                evidence: pattern_evidence(
+                    wwmi_knowledge,
+                    &[WwmiPatternKind::MappingOrHashUpdate],
+                ),
+            });
+        }
+
         let name_or_hash_changes = compare_report
             .changed_assets
             .iter()
@@ -296,7 +621,12 @@ impl FixInferenceEngine {
                 change.changed_fields.iter().any(|field| {
                     matches!(
                         field.as_str(),
-                        "normalized_name" | "logical_name" | "asset_hash" | "shader_hash" | "kind"
+                        "normalized_name"
+                            | "logical_name"
+                            | "asset_hash"
+                            | "shader_hash"
+                            | "signature"
+                            | "kind"
                     )
                 })
             })
@@ -376,8 +706,34 @@ impl FixInferenceEngine {
         let mut candidate_mapping_hints = compare_report
             .candidate_mapping_changes
             .iter()
-            .map(|candidate| infer_mapping_hint(candidate, mapping_support, &scope))
+            .map(|candidate| {
+                let continuity_signal = continuity_context.as_ref().and_then(|context| {
+                    context.mapping_signals.get(&(
+                        candidate.old_asset.path.clone(),
+                        candidate.new_asset.path.clone(),
+                    ))
+                });
+                infer_mapping_hint(
+                    candidate,
+                    mapping_support,
+                    &scope,
+                    continuity_signal,
+                    &compare_report.new_snapshot.version_id,
+                )
+            })
             .collect::<Vec<_>>();
+
+        if let Some(continuity_context) = continuity_context.as_ref() {
+            apply_continuity_inference_adjustments(
+                &mut probable_crash_causes,
+                &mut suggested_fixes,
+                compare_report,
+                continuity_context,
+                mapping_support,
+                buffer_support,
+                confidence_scale,
+            );
+        }
 
         if scope.low_signal_compare {
             apply_low_signal_inference_guardrails(
@@ -459,8 +815,20 @@ fn is_structural_change(change: &SnapshotAssetChange) -> bool {
                 | "index_count"
                 | "material_slots"
                 | "section_count"
+                | "internal_structure.section_labels"
+                | "internal_structure.buffer_roles"
+                | "internal_structure.binding_targets"
+                | "internal_structure.subresource_roles"
+                | "internal_structure.has_skeleton"
+                | "internal_structure.has_shapekey_data"
+                | "vertex_stride"
+                | "vertex_buffer_count"
+                | "index_format"
+                | "primitive_topology"
+                | "layout_markers"
                 | "asset_hash"
                 | "shader_hash"
+                | "signature"
         )
     })
 }
@@ -469,6 +837,8 @@ fn infer_mapping_hint(
     candidate: &CandidateMappingChange,
     mapping_support: f32,
     scope: &InferenceScopeContext,
+    continuity_signal: Option<&ContinuitySignal>,
+    current_new_version: &str,
 ) -> InferredMappingHint {
     let mut confidence = (candidate.confidence * 0.70 + mapping_support * 0.30).clamp(0.0, 1.0);
     if candidate.ambiguous {
@@ -477,12 +847,27 @@ fn infer_mapping_hint(
     if scope.low_signal_compare {
         confidence = (confidence - 0.03).clamp(0.0, 1.0);
     }
+    let mut compatibility = adjust_hint_compatibility(candidate, scope);
 
     let mut reasons = candidate
         .reasons
         .iter()
         .map(reason_to_string)
         .collect::<Vec<_>>();
+    reasons.push(format!(
+        "compatibility: {}",
+        compatibility_label(&compatibility)
+    ));
+    if candidate_has_reason_code(candidate, "likely_same_asset_repathed") {
+        reasons.push(
+            "compare suggests this is a likely same-asset rename/repath candidate".to_string(),
+        );
+    }
+    if candidate_has_reason_code(candidate, "same_asset_but_structural_drift") {
+        reasons.push(
+            "compare also detected structural drift on this candidate, so remap-only fixes may be unsafe".to_string(),
+        );
+    }
     if candidate.ambiguous {
         reasons.push(
             "compare detected a near-tie runner-up candidate; confidence was penalized to keep this mapping under review".to_string(),
@@ -514,6 +899,21 @@ fn infer_mapping_hint(
             "mapping hint confidence penalized by 0.120 because the runner-up candidate was too close".to_string(),
         );
     }
+    evidence.extend(
+        candidate
+            .reasons
+            .iter()
+            .filter(|reason| {
+                matches!(
+                    reason.code.as_str(),
+                    "likely_same_asset_repathed"
+                        | "same_asset_but_structural_drift"
+                        | "identity_conflict_detected"
+                        | "weak_identity_evidence"
+                )
+            })
+            .map(reason_to_string),
+    );
     if scope.low_signal_compare {
         evidence.extend(
             scope
@@ -524,13 +924,33 @@ fn infer_mapping_hint(
         );
     }
 
+    if let Some(signal) = continuity_signal {
+        apply_continuity_to_mapping_hint(
+            &mut confidence,
+            &mut compatibility,
+            &mut reasons,
+            &mut evidence,
+            signal,
+            current_new_version,
+        );
+    }
+
+    reasons.push(format!(
+        "continuity-aware compatibility: {}",
+        compatibility_label(&compatibility)
+    ));
+    let continuity = continuity_signal
+        .map(|signal| build_mapping_hint_continuity_context(signal, current_new_version));
+
     InferredMappingHint {
         old_asset_path: candidate.old_asset.path.clone(),
         new_asset_path: candidate.new_asset.path.clone(),
         confidence,
+        compatibility,
         needs_review: true,
         ambiguous: candidate.ambiguous,
         confidence_gap: candidate.confidence_gap,
+        continuity,
         reasons,
         evidence,
     }
@@ -557,6 +977,812 @@ fn build_inference_scope_context(compare_report: &SnapshotCompareReport) -> Infe
             .low_signal_for_character_analysis,
         notes,
     }
+}
+
+fn build_inference_continuity_context(
+    compare_report: &SnapshotCompareReport,
+    continuity: &VersionContinuityIndex,
+) -> InferenceContinuityContext {
+    let mut context = InferenceContinuityContext::default();
+    let old_version = compare_report.old_snapshot.version_id.as_str();
+    let new_version = compare_report.new_snapshot.version_id.as_str();
+
+    for change in compare_report
+        .changed_assets
+        .iter()
+        .chain(compare_report.removed_assets.iter())
+    {
+        let Some((old_path, new_path)) = asset_change_transition_key(change) else {
+            continue;
+        };
+        let Some(signal) = find_continuity_signal(
+            continuity,
+            old_version,
+            new_version,
+            &old_path,
+            new_path.as_deref(),
+        ) else {
+            continue;
+        };
+        context.change_signals.insert((old_path, new_path), signal);
+    }
+
+    for candidate in &compare_report.candidate_mapping_changes {
+        let Some(signal) = find_continuity_signal(
+            continuity,
+            old_version,
+            new_version,
+            &candidate.old_asset.path,
+            Some(candidate.new_asset.path.as_str()),
+        ) else {
+            continue;
+        };
+        context.mapping_signals.insert(
+            (
+                candidate.old_asset.path.clone(),
+                candidate.new_asset.path.clone(),
+            ),
+            signal,
+        );
+    }
+
+    context
+}
+
+fn asset_change_transition_key(change: &SnapshotAssetChange) -> Option<(String, Option<String>)> {
+    let old_path = change.old_asset.as_ref()?.path.clone();
+    let new_path = change.new_asset.as_ref().map(|asset| asset.path.clone());
+    Some((old_path, new_path))
+}
+
+fn continuity_signal_for_change(
+    context: &InferenceContinuityContext,
+    change: &SnapshotAssetChange,
+) -> Option<ContinuitySignal> {
+    let key = asset_change_transition_key(change)?;
+    context.change_signals.get(&key).cloned()
+}
+
+fn continuity_signal_for_candidate(
+    context: &InferenceContinuityContext,
+    candidate: &CandidateMappingChange,
+) -> Option<ContinuitySignal> {
+    context
+        .mapping_signals
+        .get(&(
+            candidate.old_asset.path.clone(),
+            candidate.new_asset.path.clone(),
+        ))
+        .cloned()
+}
+
+fn find_continuity_signal(
+    continuity: &VersionContinuityIndex,
+    old_version: &str,
+    new_version: &str,
+    old_path: &str,
+    new_path: Option<&str>,
+) -> Option<ContinuitySignal> {
+    continuity.threads.iter().find_map(|thread| {
+        let (index, observation) =
+            thread
+                .observations
+                .iter()
+                .enumerate()
+                .find(|(_, observation)| {
+                    observation.from_version_id == old_version
+                        && observation.to_version_id == new_version
+                        && observation.from_path == old_path
+                        && observation.to_path.as_deref() == new_path
+                })?;
+        let summary = continuity
+            .thread_summaries
+            .iter()
+            .find(|summary| summary.thread_id == thread.thread_id)
+            .cloned()
+            .unwrap_or_else(|| summarize_continuity_thread_for_inference(thread));
+        let previous = &thread.observations[..index];
+        let later = &thread.observations[index + 1..];
+
+        Some(ContinuitySignal {
+            thread_id: thread.thread_id.clone(),
+            current_from_path: observation.from_path.clone(),
+            current_to_path: observation.to_path.clone(),
+            first_seen_version: summary.first_seen_version,
+            latest_observed_version: summary.latest_observed_version,
+            latest_live_version: summary.latest_live_version,
+            current_relation: observation.relation.clone(),
+            prior_persisted_steps: count_continuity_relation(
+                previous,
+                VersionContinuityRelation::Persisted,
+            ),
+            prior_rename_steps: count_continuity_relation(
+                previous,
+                VersionContinuityRelation::RenameOrRepath,
+            ),
+            prior_container_movement_steps: count_continuity_relation(
+                previous,
+                VersionContinuityRelation::ContainerMovement,
+            ),
+            prior_layout_drift_steps: count_continuity_relation(
+                previous,
+                VersionContinuityRelation::LayoutDrift,
+            ),
+            prior_material_steps: previous
+                .iter()
+                .filter(|observation| observation.relation != VersionContinuityRelation::Persisted)
+                .count(),
+            later_rename_steps: count_continuity_relation(
+                later,
+                VersionContinuityRelation::RenameOrRepath,
+            ),
+            later_container_movement_steps: count_continuity_relation(
+                later,
+                VersionContinuityRelation::ContainerMovement,
+            ),
+            later_layout_drift_steps: count_continuity_relation(
+                later,
+                VersionContinuityRelation::LayoutDrift,
+            ),
+            terminal_relation: summary.terminal_relation,
+            terminal_version: summary.terminal_version,
+            review_required: summary.review_required,
+        })
+    })
+}
+
+fn summarize_continuity_thread_for_inference(
+    thread: &VersionContinuityThread,
+) -> VersionContinuityThreadSummary {
+    let latest_observed_version = thread
+        .observations
+        .last()
+        .map(|observation| observation.to_version_id.clone())
+        .unwrap_or_else(|| thread.anchor_version_id.clone());
+    let latest_relation = thread
+        .observations
+        .last()
+        .map(|observation| &observation.relation);
+    let latest_live_version =
+        if latest_relation.is_none_or(|relation| continuity_relation_continues_thread(relation)) {
+            Some(latest_observed_version.clone())
+        } else {
+            None
+        };
+    let terminal_relation = latest_relation
+        .filter(|relation| !continuity_relation_continues_thread(relation))
+        .cloned();
+    let terminal_version = terminal_relation
+        .as_ref()
+        .map(|_| latest_observed_version.clone());
+
+    VersionContinuityThreadSummary {
+        thread_id: thread.thread_id.clone(),
+        anchor_version_id: thread.anchor_version_id.clone(),
+        anchor: thread.anchor.clone(),
+        first_seen_version: thread.anchor_version_id.clone(),
+        latest_observed_version,
+        latest_live_version,
+        terminal_relation,
+        terminal_version,
+        review_required: thread.review_required,
+        ..VersionContinuityThreadSummary::default()
+    }
+}
+
+fn continuity_relation_continues_thread(relation: &VersionContinuityRelation) -> bool {
+    matches!(
+        relation,
+        VersionContinuityRelation::Persisted
+            | VersionContinuityRelation::RenameOrRepath
+            | VersionContinuityRelation::ContainerMovement
+            | VersionContinuityRelation::LayoutDrift
+    )
+}
+
+fn count_continuity_relation(
+    observations: &[VersionContinuityObservation],
+    relation: VersionContinuityRelation,
+) -> usize {
+    observations
+        .iter()
+        .filter(|observation| observation.relation == relation)
+        .count()
+}
+
+impl ContinuitySignal {
+    fn stable_before_current_change(&self) -> bool {
+        self.prior_persisted_steps > 0
+            && self.prior_material_steps == 0
+            && self.current_relation != VersionContinuityRelation::Persisted
+    }
+
+    fn total_rename_steps(&self) -> usize {
+        self.prior_rename_steps
+            + usize::from(self.current_relation == VersionContinuityRelation::RenameOrRepath)
+            + self.later_rename_steps
+    }
+
+    fn total_container_movement_steps(&self) -> usize {
+        self.prior_container_movement_steps
+            + usize::from(self.current_relation == VersionContinuityRelation::ContainerMovement)
+            + self.later_container_movement_steps
+    }
+
+    fn total_layout_drift_steps(&self) -> usize {
+        self.prior_layout_drift_steps
+            + usize::from(self.current_relation == VersionContinuityRelation::LayoutDrift)
+            + self.later_layout_drift_steps
+    }
+
+    fn has_terminal_or_review_history(&self) -> bool {
+        self.review_required || self.terminal_relation.is_some()
+    }
+
+    fn terminal_after_current(&self, current_new_version: &str) -> bool {
+        self.terminal_version
+            .as_deref()
+            .is_some_and(|version| version != current_new_version)
+    }
+}
+
+fn build_mapping_hint_continuity_context(
+    signal: &ContinuitySignal,
+    current_new_version: &str,
+) -> InferredMappingContinuityContext {
+    InferredMappingContinuityContext {
+        thread_id: Some(signal.thread_id.clone()),
+        first_seen_version: Some(signal.first_seen_version.clone()),
+        latest_observed_version: Some(signal.latest_observed_version.clone()),
+        latest_live_version: signal.latest_live_version.clone(),
+        stable_before_current_change: signal.stable_before_current_change(),
+        total_rename_steps: signal.total_rename_steps(),
+        total_container_movement_steps: signal.total_container_movement_steps(),
+        total_layout_drift_steps: signal.total_layout_drift_steps(),
+        review_required_history: signal.review_required,
+        terminal_relation: signal.terminal_relation.clone(),
+        terminal_version: signal.terminal_version.clone(),
+        terminal_after_current: signal.terminal_after_current(current_new_version),
+        instability_detected: signal.total_layout_drift_steps() >= 2
+            || signal.review_required
+            || signal.terminal_relation.is_some(),
+    }
+}
+
+fn apply_continuity_to_mapping_hint(
+    confidence: &mut f32,
+    compatibility: &mut RemapCompatibility,
+    reasons: &mut Vec<String>,
+    evidence: &mut Vec<String>,
+    signal: &ContinuitySignal,
+    current_new_version: &str,
+) {
+    if signal.stable_before_current_change() {
+        *confidence = (*confidence + 0.03).clamp(0.0, 1.0);
+        reasons.push(format!(
+            "continuity kept this thread stable for {} earlier step(s) before the current {}",
+            signal.prior_persisted_steps,
+            continuity_relation_label(&signal.current_relation)
+        ));
+    }
+
+    if signal.total_rename_steps() >= 2 {
+        reasons.push(format!(
+            "continuity shows {} rename/repath steps on this thread; path movement recurs across versions, so keep the remap review-first",
+            signal.total_rename_steps()
+        ));
+    }
+
+    if signal.total_container_movement_steps() >= 2 {
+        reasons.push(format!(
+            "continuity shows {} container/package movement steps on this thread; verify package context as well as path equivalence",
+            signal.total_container_movement_steps()
+        ));
+    }
+
+    if signal.total_layout_drift_steps() >= 2 {
+        *confidence = (*confidence - 0.08).clamp(0.0, 1.0);
+        *compatibility = downgrade_compatibility_for_layout_history(compatibility.clone());
+        reasons.push(
+            "continuity records repeated layout drift on this thread; remap-only repair is risky"
+                .to_string(),
+        );
+    }
+
+    if signal.review_required {
+        *confidence = (*confidence - 0.05).clamp(0.0, 1.0);
+        reasons.push(
+            "continuity already marked this thread review-required elsewhere in the broader chain"
+                .to_string(),
+        );
+    }
+
+    if let Some(relation) = signal.terminal_relation.as_ref() {
+        let penalty = match relation {
+            VersionContinuityRelation::Ambiguous
+            | VersionContinuityRelation::InsufficientEvidence => 0.12,
+            VersionContinuityRelation::Replacement | VersionContinuityRelation::Removed => 0.10,
+            _ => 0.0,
+        };
+        *confidence = (*confidence - penalty).clamp(0.0, 1.0);
+        *compatibility =
+            downgrade_compatibility_for_terminal_history(compatibility.clone(), relation);
+        let timing = if signal.terminal_after_current(current_new_version) {
+            "later marks"
+        } else {
+            "marks"
+        };
+        reasons.push(format!(
+            "continuity {timing} this thread as {} in {}",
+            continuity_relation_label(relation),
+            signal
+                .terminal_version
+                .as_deref()
+                .unwrap_or(signal.latest_observed_version.as_str())
+        ));
+    }
+
+    evidence.push(continuity_signal_evidence(signal, current_new_version));
+}
+
+fn downgrade_compatibility_for_layout_history(
+    compatibility: RemapCompatibility,
+) -> RemapCompatibility {
+    match compatibility {
+        RemapCompatibility::LikelyCompatible => RemapCompatibility::CompatibleWithCaution,
+        RemapCompatibility::CompatibleWithCaution => RemapCompatibility::StructurallyRisky,
+        other => other,
+    }
+}
+
+fn downgrade_compatibility_for_terminal_history(
+    compatibility: RemapCompatibility,
+    relation: &VersionContinuityRelation,
+) -> RemapCompatibility {
+    match relation {
+        VersionContinuityRelation::Ambiguous | VersionContinuityRelation::InsufficientEvidence => {
+            RemapCompatibility::InsufficientEvidence
+        }
+        VersionContinuityRelation::Replacement => match compatibility {
+            RemapCompatibility::LikelyCompatible => RemapCompatibility::CompatibleWithCaution,
+            RemapCompatibility::CompatibleWithCaution => RemapCompatibility::StructurallyRisky,
+            other => other,
+        },
+        VersionContinuityRelation::Removed => match compatibility {
+            RemapCompatibility::LikelyCompatible => RemapCompatibility::CompatibleWithCaution,
+            other => other,
+        },
+        _ => compatibility,
+    }
+}
+
+fn continuity_relation_label(relation: &VersionContinuityRelation) -> &'static str {
+    match relation {
+        VersionContinuityRelation::Persisted => "persisted",
+        VersionContinuityRelation::RenameOrRepath => "rename/repath",
+        VersionContinuityRelation::ContainerMovement => "container movement",
+        VersionContinuityRelation::LayoutDrift => "layout drift",
+        VersionContinuityRelation::Replacement => "replacement",
+        VersionContinuityRelation::Ambiguous => "ambiguous",
+        VersionContinuityRelation::InsufficientEvidence => "insufficient evidence",
+        VersionContinuityRelation::Removed => "removed",
+    }
+}
+
+fn continuity_signal_evidence(signal: &ContinuitySignal, current_new_version: &str) -> String {
+    let focus = signal
+        .current_to_path
+        .as_deref()
+        .unwrap_or(signal.current_from_path.as_str());
+    let mut details = vec![format!(
+        "continuity thread {focus} spans {} -> {}",
+        signal.first_seen_version, signal.latest_observed_version
+    )];
+    if signal.stable_before_current_change() {
+        details.push(format!(
+            "{} prior persisted step(s) before current {}",
+            signal.prior_persisted_steps,
+            continuity_relation_label(&signal.current_relation)
+        ));
+    }
+    if signal.total_rename_steps() >= 2 {
+        details.push(format!(
+            "{} rename/repath step(s)",
+            signal.total_rename_steps()
+        ));
+    }
+    if signal.total_container_movement_steps() >= 2 {
+        details.push(format!(
+            "{} container movement step(s)",
+            signal.total_container_movement_steps()
+        ));
+    }
+    if signal.total_layout_drift_steps() >= 2 {
+        details.push(format!(
+            "{} layout-drift step(s)",
+            signal.total_layout_drift_steps()
+        ));
+    }
+    if signal.review_required {
+        details.push("thread marked review-required".to_string());
+    }
+    if let Some(relation) = signal.terminal_relation.as_ref() {
+        let timing = if signal.terminal_after_current(current_new_version) {
+            "later terminates"
+        } else {
+            "terminates"
+        };
+        details.push(format!(
+            "{timing} as {} in {}",
+            continuity_relation_label(relation),
+            signal
+                .terminal_version
+                .as_deref()
+                .unwrap_or(signal.latest_observed_version.as_str())
+        ));
+    } else if let Some(latest_live_version) = signal.latest_live_version.as_deref() {
+        details.push(format!("latest live version {latest_live_version}"));
+    }
+
+    details.join("; ")
+}
+
+fn apply_continuity_inference_adjustments(
+    probable_crash_causes: &mut Vec<ProbableCrashCause>,
+    suggested_fixes: &mut Vec<SuggestedFix>,
+    compare_report: &SnapshotCompareReport,
+    continuity_context: &InferenceContinuityContext,
+    mapping_support: f32,
+    buffer_support: f32,
+    confidence_scale: f32,
+) {
+    let current_new_version = compare_report.new_snapshot.version_id.as_str();
+    let structural_signals = dedup_continuity_signals(
+        compare_report
+            .changed_assets
+            .iter()
+            .filter(|change| is_structural_change(change))
+            .filter_map(|change| continuity_signal_for_change(continuity_context, change))
+            .collect(),
+    );
+    let removed_signals = dedup_continuity_signals(
+        compare_report
+            .removed_assets
+            .iter()
+            .filter(|change| change.change_type == SnapshotChangeType::Removed)
+            .filter_map(|change| continuity_signal_for_change(continuity_context, change))
+            .collect(),
+    );
+    let candidate_signals = dedup_continuity_signals(
+        compare_report
+            .candidate_mapping_changes
+            .iter()
+            .filter_map(|candidate| continuity_signal_for_candidate(continuity_context, candidate))
+            .collect(),
+    );
+    let structurally_drifted_signals = dedup_continuity_signals(
+        compare_report
+            .candidate_mapping_changes
+            .iter()
+            .filter(|candidate| candidate.compatibility == RemapCompatibility::StructurallyRisky)
+            .filter_map(|candidate| continuity_signal_for_candidate(continuity_context, candidate))
+            .collect(),
+    );
+
+    if let Some(cause) = probable_crash_causes
+        .iter_mut()
+        .find(|cause| cause.code == "buffer_layout_changed")
+    {
+        append_continuity_signal_context(
+            &mut cause.reasons,
+            &mut cause.evidence,
+            &structural_signals,
+            current_new_version,
+            "structurally changed",
+        );
+        if structural_signals.iter().any(|signal| {
+            signal.total_layout_drift_steps() >= 2 || signal.has_terminal_or_review_history()
+        }) {
+            cause.confidence = (cause.confidence + 0.05).clamp(0.0, 1.0);
+        }
+    }
+
+    if let Some(fix) = suggested_fixes
+        .iter_mut()
+        .find(|fix| fix.code == "review_buffer_layout_and_runtime_guards")
+        && !structural_signals.is_empty()
+    {
+        append_continuity_signal_context(
+            &mut fix.reasons,
+            &mut fix.evidence,
+            &structural_signals,
+            current_new_version,
+            "layout-sensitive",
+        );
+        fix.actions.push(
+            "Inspect continuity milestones for repeated layout drift or later terminal states before promoting any repair path."
+                .to_string(),
+        );
+        if structural_signals
+            .iter()
+            .any(|signal| signal.total_layout_drift_steps() >= 2)
+        {
+            fix.confidence = (fix.confidence + 0.04).clamp(0.0, 1.0);
+        }
+    }
+
+    if let Some(cause) = probable_crash_causes
+        .iter_mut()
+        .find(|cause| cause.code == "asset_paths_or_mapping_shifted")
+        && !candidate_signals.is_empty()
+    {
+        append_continuity_signal_context(
+            &mut cause.reasons,
+            &mut cause.evidence,
+            &candidate_signals,
+            current_new_version,
+            "mapping-candidate",
+        );
+        let stable_support = candidate_signals
+            .iter()
+            .filter(|signal| signal.stable_before_current_change())
+            .count() as f32;
+        let instability = candidate_signals
+            .iter()
+            .filter(|signal| {
+                signal.total_layout_drift_steps() >= 2 || signal.has_terminal_or_review_history()
+            })
+            .count() as f32;
+        cause.confidence =
+            (cause.confidence + 0.02 * stable_support - 0.06 * instability).clamp(0.0, 1.0);
+    }
+
+    if let Some(fix) = suggested_fixes
+        .iter_mut()
+        .find(|fix| fix.code == "review_candidate_asset_remaps")
+        && !candidate_signals.is_empty()
+    {
+        append_continuity_signal_context(
+            &mut fix.reasons,
+            &mut fix.evidence,
+            &candidate_signals,
+            current_new_version,
+            "remap-candidate",
+        );
+        fix.actions.push(
+            "Cross-check continuity history for recent stability, recurring renames, and any later terminal state before approving a mapping."
+                .to_string(),
+        );
+    }
+
+    if let Some(cause) = probable_crash_causes
+        .iter_mut()
+        .find(|cause| cause.code == "candidate_remap_structural_drift")
+        && !structurally_drifted_signals.is_empty()
+    {
+        append_continuity_signal_context(
+            &mut cause.reasons,
+            &mut cause.evidence,
+            &structurally_drifted_signals,
+            current_new_version,
+            "structurally drifted remap",
+        );
+        if structurally_drifted_signals.iter().any(|signal| {
+            signal.total_layout_drift_steps() >= 2 || signal.has_terminal_or_review_history()
+        }) {
+            cause.confidence = (cause.confidence + 0.06).clamp(0.0, 1.0);
+        }
+    }
+
+    if let Some(fix) = suggested_fixes
+        .iter_mut()
+        .find(|fix| fix.code == "validate_candidate_remaps_against_layout")
+        && !structurally_drifted_signals.is_empty()
+    {
+        append_continuity_signal_context(
+            &mut fix.reasons,
+            &mut fix.evidence,
+            &structurally_drifted_signals,
+            current_new_version,
+            "layout-risk remap",
+        );
+        fix.actions.push(
+            "Escalate to manual validation if continuity shows repeated layout drift or a later ambiguous/replacement/removed state."
+                .to_string(),
+        );
+    }
+
+    if let Some(cause) = probable_crash_causes
+        .iter_mut()
+        .find(|cause| cause.code == "asset_removed_without_clear_replacement")
+        && !removed_signals.is_empty()
+    {
+        append_continuity_signal_context(
+            &mut cause.reasons,
+            &mut cause.evidence,
+            &removed_signals,
+            current_new_version,
+            "removed",
+        );
+        if removed_signals
+            .iter()
+            .any(|signal| signal.has_terminal_or_review_history())
+        {
+            cause.confidence = (cause.confidence + 0.04).clamp(0.0, 1.0);
+        }
+    }
+
+    let instability_signals = dedup_continuity_signals(
+        structural_signals
+            .iter()
+            .chain(candidate_signals.iter())
+            .chain(removed_signals.iter())
+            .filter(|signal| {
+                signal.total_layout_drift_steps() >= 2 || signal.has_terminal_or_review_history()
+            })
+            .cloned()
+            .collect(),
+    );
+    if instability_signals.is_empty() {
+        return;
+    }
+
+    let instability_count = instability_signals.len().min(3) as f32;
+    let confidence =
+        (0.42 + 0.08 * instability_count + 0.10 * buffer_support + 0.08 * mapping_support)
+            .clamp(0.0, 1.0)
+            * confidence_scale;
+    let risk = if instability_signals
+        .iter()
+        .any(|signal| signal.total_layout_drift_steps() >= 2)
+    {
+        RiskLevel::High
+    } else {
+        RiskLevel::Medium
+    };
+    let mut reasons = vec![
+        format!(
+            "continuity surfaces {} relevant thread(s) with repeated drift or terminal/review history",
+            instability_signals.len()
+        ),
+        "broader version history suggests one-shot remap assumptions may not hold for every affected asset thread"
+            .to_string(),
+    ];
+    let mut evidence = instability_signals
+        .iter()
+        .take(4)
+        .map(|signal| continuity_signal_evidence(signal, current_new_version))
+        .collect::<Vec<_>>();
+    evidence.push(format!(
+        "continuity-informed confidence blended instability count with WWMI buffer {:.3} and mapping {:.3} support",
+        buffer_support, mapping_support
+    ));
+
+    probable_crash_causes.push(ProbableCrashCause {
+        code: "continuity_thread_instability".to_string(),
+        summary: "Broader continuity history shows some affected asset threads drift repeatedly or terminate ambiguously, so remap-only repair may not stay safe across versions.".to_string(),
+        confidence,
+        risk: risk.clone(),
+        affected_assets: collect_continuity_affected_assets(&instability_signals),
+        related_patterns: vec![
+            WwmiPatternKind::BufferLayoutOrCapacityFix,
+            WwmiPatternKind::MappingOrHashUpdate,
+        ],
+        reasons: reasons.clone(),
+        evidence: evidence.clone(),
+    });
+
+    reasons.push(
+        "continuity should be treated as supporting evidence; keep fixes review-oriented when the thread later degrades or terminates"
+            .to_string(),
+    );
+    evidence.push(
+        "use continuity milestones to decide whether repair should stay manual rather than auto-promoted"
+            .to_string(),
+    );
+    suggested_fixes.push(SuggestedFix {
+        code: "review_continuity_thread_history_before_repair".to_string(),
+        summary: "Review continuity milestones for unstable asset threads before trusting remap-only repair decisions.".to_string(),
+        confidence,
+        priority: risk,
+        related_patterns: vec![
+            WwmiPatternKind::BufferLayoutOrCapacityFix,
+            WwmiPatternKind::MappingOrHashUpdate,
+        ],
+        actions: vec![
+            "Inspect the full continuity thread for each flagged asset and note any repeated layout drift, recurring rename/repath, or terminal state.".to_string(),
+            "Downgrade repair confidence when the broader chain later becomes ambiguous, replacement-like, or removed.".to_string(),
+            "Keep continuity-unstable mappings in review until a human validates both the current pair and the broader version history.".to_string(),
+        ],
+        reasons,
+        evidence,
+    });
+}
+
+fn append_continuity_signal_context(
+    reasons: &mut Vec<String>,
+    evidence: &mut Vec<String>,
+    signals: &[ContinuitySignal],
+    current_new_version: &str,
+    subject: &str,
+) {
+    if signals.is_empty() {
+        return;
+    }
+
+    let stable_count = signals
+        .iter()
+        .filter(|signal| signal.stable_before_current_change())
+        .count();
+    let recurring_rename_count = signals
+        .iter()
+        .filter(|signal| signal.total_rename_steps() >= 2)
+        .count();
+    let recurring_layout_count = signals
+        .iter()
+        .filter(|signal| signal.total_layout_drift_steps() >= 2)
+        .count();
+    let terminal_or_review_count = signals
+        .iter()
+        .filter(|signal| signal.has_terminal_or_review_history())
+        .count();
+
+    if stable_count > 0 {
+        reasons.push(format!(
+            "continuity shows {stable_count} {subject} thread(s) stayed stable across earlier versions before the current pair drifted"
+        ));
+    }
+    if recurring_rename_count > 0 {
+        reasons.push(format!(
+            "continuity shows recurring rename/repath history on {recurring_rename_count} {subject} thread(s)"
+        ));
+    }
+    if recurring_layout_count > 0 {
+        reasons.push(format!(
+            "continuity records repeated layout drift on {recurring_layout_count} {subject} thread(s)"
+        ));
+    }
+    if terminal_or_review_count > 0 {
+        reasons.push(format!(
+            "continuity marks {terminal_or_review_count} {subject} thread(s) as terminal or review-required somewhere in the broader chain"
+        ));
+    }
+
+    evidence.extend(
+        signals
+            .iter()
+            .take(4)
+            .map(|signal| continuity_signal_evidence(signal, current_new_version)),
+    );
+}
+
+fn collect_continuity_affected_assets(signals: &[ContinuitySignal]) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut affected_assets = Vec::new();
+
+    for signal in signals {
+        for path in [
+            Some(signal.current_from_path.as_str()),
+            signal.current_to_path.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if seen.insert(path.to_string()) {
+                affected_assets.push(path.to_string());
+            }
+        }
+    }
+
+    affected_assets
+}
+
+fn dedup_continuity_signals(signals: Vec<ContinuitySignal>) -> Vec<ContinuitySignal> {
+    let mut seen = BTreeSet::new();
+    signals
+        .into_iter()
+        .filter(|signal| seen.insert(signal.thread_id.clone()))
+        .collect()
 }
 
 fn apply_low_signal_inference_guardrails(
@@ -605,6 +1831,65 @@ fn reason_to_string(reason: &SnapshotCompareReason) -> String {
     format!("{}: {}", reason.code, reason.message)
 }
 
+fn candidate_has_reason_code(candidate: &CandidateMappingChange, code: &str) -> bool {
+    candidate.reasons.iter().any(|reason| reason.code == code)
+}
+
+fn adjust_hint_compatibility(
+    candidate: &CandidateMappingChange,
+    scope: &InferenceScopeContext,
+) -> RemapCompatibility {
+    if !scope.low_signal_compare {
+        return candidate.compatibility.clone();
+    }
+
+    match candidate.compatibility {
+        RemapCompatibility::LikelyCompatible => {
+            if candidate_has_reason_code(candidate, "signature_exact")
+                || candidate_has_reason_code(candidate, "asset_hash_exact")
+            {
+                RemapCompatibility::CompatibleWithCaution
+            } else if has_low_signal_structural_remap_anchor(candidate) {
+                RemapCompatibility::LikelyCompatible
+            } else {
+                RemapCompatibility::InsufficientEvidence
+            }
+        }
+        RemapCompatibility::CompatibleWithCaution => RemapCompatibility::InsufficientEvidence,
+        _ => candidate.compatibility.clone(),
+    }
+}
+
+fn has_low_signal_structural_remap_anchor(candidate: &CandidateMappingChange) -> bool {
+    let has_path_and_name_anchor = candidate_has_reason_code(candidate, "normalized_name_exact")
+        && candidate_has_reason_code(candidate, "same_parent_directory");
+    let has_structural_compatibility =
+        candidate_has_reason_code(candidate, "structural_layout_compatible")
+            || candidate_has_reason_code(candidate, "buffer_layout_compatible");
+    let has_conflict = candidate_has_reason_code(candidate, "identity_conflict_detected")
+        || candidate_has_reason_code(candidate, "same_asset_but_structural_drift")
+        || candidate_has_reason_code(candidate, "buffer_layout_validation_needed")
+        || candidate_has_reason_code(candidate, "weak_identity_evidence")
+        || candidate_has_reason_code(candidate, "signature_mismatch")
+        || candidate_has_reason_code(candidate, "kind_mismatch");
+
+    has_path_and_name_anchor
+        && has_structural_compatibility
+        && !has_conflict
+        && candidate.confidence >= 0.90
+        && candidate.confidence_gap.is_none_or(|gap| gap >= 0.12)
+}
+
+fn compatibility_label(compatibility: &RemapCompatibility) -> &'static str {
+    match compatibility {
+        RemapCompatibility::LikelyCompatible => "likely compatible",
+        RemapCompatibility::CompatibleWithCaution => "compatible with caution",
+        RemapCompatibility::StructurallyRisky => "structurally risky",
+        RemapCompatibility::IncompatibleBlocked => "incompatible/blocked",
+        RemapCompatibility::InsufficientEvidence => "insufficient evidence",
+    }
+}
+
 fn pattern_support(knowledge: &WwmiKnowledgeBase, kind: WwmiPatternKind) -> f32 {
     knowledge
         .patterns
@@ -645,10 +1930,15 @@ fn current_unix_ms() -> AppResult<u128> {
 mod tests {
     use crate::{
         compare::{
-            CandidateMappingChange, RiskLevel, SnapshotAssetChange, SnapshotAssetSummary,
-            SnapshotChangeType, SnapshotCompareReason, SnapshotCompareReport,
+            CandidateMappingChange, RemapCompatibility, RiskLevel, SnapshotAssetChange,
+            SnapshotAssetSummary, SnapshotChangeType, SnapshotCompareReason, SnapshotCompareReport,
             SnapshotCompareScopeContext, SnapshotCompareScopeInfo, SnapshotCompareSummary,
             SnapshotVersionInfo,
+        },
+        report::{
+            DiffStatus, TechnicalMetadata, VersionContinuityIndex, VersionContinuityObservation,
+            VersionContinuityRelation, VersionContinuitySource, VersionContinuityThread,
+            VersionedItem,
         },
         wwmi::{
             WwmiEvidenceCommit, WwmiFixPattern, WwmiKeywordStat, WwmiKnowledgeBase,
@@ -682,6 +1972,21 @@ mod tests {
                 removed_assets: 1,
                 changed_assets: 1,
                 candidate_mapping_changes: 1,
+                identity_changed_assets: 0,
+                layout_changed_assets: 0,
+                structural_changed_assets: 1,
+                naming_only_changed_assets: 0,
+                cosmetic_only_changed_assets: 0,
+                provenance_changed_assets: 0,
+                container_moved_assets: 0,
+                lineage_rename_or_repath_assets: 0,
+                lineage_container_movement_assets: 0,
+                lineage_layout_drift_assets: 0,
+                lineage_replacement_assets: 0,
+                lineage_ambiguous_assets: 0,
+                lineage_insufficient_evidence_assets: 0,
+                ambiguous_candidate_mapping_changes: 0,
+                high_confidence_candidate_mapping_changes: 0,
             },
             added_assets: Vec::new(),
             removed_assets: vec![SnapshotAssetChange {
@@ -692,6 +1997,7 @@ mod tests {
                 probable_impact: RiskLevel::Medium,
                 crash_risk: RiskLevel::Medium,
                 suspected_mapping_change: true,
+                lineage: crate::compare::AssetLineageKind::InsufficientEvidence,
                 reasons: vec![SnapshotCompareReason {
                     code: "asset_removed".to_string(),
                     message: "old path removed".to_string(),
@@ -705,6 +2011,7 @@ mod tests {
                 probable_impact: RiskLevel::High,
                 crash_risk: RiskLevel::High,
                 suspected_mapping_change: true,
+                lineage: crate::compare::AssetLineageKind::LayoutDrift,
                 reasons: vec![SnapshotCompareReason {
                     code: "vertex_count_changed".to_string(),
                     message: "vertex count changed".to_string(),
@@ -714,6 +2021,8 @@ mod tests {
                 old_asset: asset_summary("Content/Weapon/Sword.weapon"),
                 new_asset: asset_summary("Content/Weapon/Sword_v2.weapon"),
                 confidence: 0.82,
+                compatibility: RemapCompatibility::CompatibleWithCaution,
+                lineage: crate::compare::AssetLineageKind::RenameOrRepath,
                 reasons: vec![SnapshotCompareReason {
                     code: "normalized_name_exact".to_string(),
                     message: "normalized name matched".to_string(),
@@ -799,6 +2108,10 @@ mod tests {
         );
         assert_eq!(report.candidate_mapping_hints.len(), 1);
         assert!(!report.candidate_mapping_hints[0].ambiguous);
+        assert_eq!(
+            report.candidate_mapping_hints[0].compatibility,
+            RemapCompatibility::CompatibleWithCaution
+        );
         assert!(report.summary.highest_confidence >= 0.75);
         assert!(!report.scope.low_signal_compare);
     }
@@ -852,6 +2165,21 @@ mod tests {
                 removed_assets: 1,
                 changed_assets: 0,
                 candidate_mapping_changes: 1,
+                identity_changed_assets: 0,
+                layout_changed_assets: 0,
+                structural_changed_assets: 0,
+                naming_only_changed_assets: 0,
+                cosmetic_only_changed_assets: 0,
+                provenance_changed_assets: 0,
+                container_moved_assets: 0,
+                lineage_rename_or_repath_assets: 0,
+                lineage_container_movement_assets: 0,
+                lineage_layout_drift_assets: 0,
+                lineage_replacement_assets: 0,
+                lineage_ambiguous_assets: 0,
+                lineage_insufficient_evidence_assets: 0,
+                ambiguous_candidate_mapping_changes: 0,
+                high_confidence_candidate_mapping_changes: 1,
             },
             added_assets: Vec::new(),
             removed_assets: vec![SnapshotAssetChange {
@@ -864,6 +2192,7 @@ mod tests {
                 probable_impact: RiskLevel::Medium,
                 crash_risk: RiskLevel::Medium,
                 suspected_mapping_change: true,
+                lineage: crate::compare::AssetLineageKind::InsufficientEvidence,
                 reasons: vec![SnapshotCompareReason {
                     code: "asset_removed".to_string(),
                     message: "old path removed".to_string(),
@@ -874,6 +2203,8 @@ mod tests {
                 old_asset: asset_summary("Client/Content/Paks/pakchunk0-WindowsNoEditor.pak"),
                 new_asset: asset_summary("Client/Content/Paks/pakchunk1-WindowsNoEditor.pak"),
                 confidence: 0.90,
+                compatibility: RemapCompatibility::InsufficientEvidence,
+                lineage: crate::compare::AssetLineageKind::ContainerMovement,
                 reasons: vec![SnapshotCompareReason {
                     code: "same_parent_directory".to_string(),
                     message: "same folder".to_string(),
@@ -938,6 +2269,10 @@ mod tests {
         );
         assert!(!report.candidate_mapping_hints.is_empty());
         assert!(report.candidate_mapping_hints[0].needs_review);
+        assert_eq!(
+            report.candidate_mapping_hints[0].compatibility,
+            RemapCompatibility::InsufficientEvidence
+        );
         assert!(
             report.candidate_mapping_hints[0]
                 .reasons
@@ -946,18 +2281,838 @@ mod tests {
         );
     }
 
+    #[test]
+    fn inference_keeps_strong_structural_remaps_visible_in_low_signal_scope() {
+        let engine = FixInferenceEngine;
+        let compare_report = SnapshotCompareReport {
+            schema_version: "whashreonator.snapshot-compare.v1".to_string(),
+            old_snapshot: SnapshotVersionInfo {
+                version_id: "2.4.0".to_string(),
+                source_root: "old".to_string(),
+                asset_count: 1,
+            },
+            new_snapshot: SnapshotVersionInfo {
+                version_id: "2.5.0".to_string(),
+                source_root: "new".to_string(),
+                asset_count: 1,
+            },
+            scope: SnapshotCompareScopeContext {
+                old_snapshot: SnapshotCompareScopeInfo {
+                    capture_mode: Some("local_filesystem_inventory".to_string()),
+                    mostly_install_or_package_level: true,
+                    meaningful_content_coverage: false,
+                    meaningful_character_coverage: false,
+                    content_like_path_count: 2,
+                    character_path_count: 1,
+                    non_content_path_count: 2,
+                    low_signal_for_character_analysis: true,
+                    note: Some("legacy low-signal snapshot".to_string()),
+                },
+                new_snapshot: SnapshotCompareScopeInfo {
+                    capture_mode: Some("local_filesystem_inventory".to_string()),
+                    mostly_install_or_package_level: true,
+                    meaningful_content_coverage: false,
+                    meaningful_character_coverage: false,
+                    content_like_path_count: 2,
+                    character_path_count: 1,
+                    non_content_path_count: 2,
+                    low_signal_for_character_analysis: true,
+                    note: Some("legacy low-signal snapshot".to_string()),
+                },
+                low_signal_compare: true,
+                notes: vec!["low-signal compare scope".to_string()],
+            },
+            summary: SnapshotCompareSummary {
+                total_old_assets: 1,
+                total_new_assets: 1,
+                unchanged_assets: 0,
+                added_assets: 1,
+                removed_assets: 1,
+                changed_assets: 0,
+                candidate_mapping_changes: 1,
+                identity_changed_assets: 0,
+                layout_changed_assets: 0,
+                structural_changed_assets: 0,
+                naming_only_changed_assets: 0,
+                cosmetic_only_changed_assets: 0,
+                provenance_changed_assets: 0,
+                container_moved_assets: 0,
+                lineage_rename_or_repath_assets: 0,
+                lineage_container_movement_assets: 0,
+                lineage_layout_drift_assets: 0,
+                lineage_replacement_assets: 0,
+                lineage_ambiguous_assets: 0,
+                lineage_insufficient_evidence_assets: 0,
+                ambiguous_candidate_mapping_changes: 0,
+                high_confidence_candidate_mapping_changes: 1,
+            },
+            added_assets: Vec::new(),
+            removed_assets: Vec::new(),
+            changed_assets: Vec::new(),
+            candidate_mapping_changes: vec![CandidateMappingChange {
+                old_asset: asset_summary("Content/Character/Encore/Hair.mesh"),
+                new_asset: asset_summary("Content/Character/Encore/Hair_LOD0.mesh"),
+                confidence: 0.96,
+                compatibility: RemapCompatibility::LikelyCompatible,
+                lineage: crate::compare::AssetLineageKind::RenameOrRepath,
+                reasons: vec![
+                    SnapshotCompareReason {
+                        code: "normalized_name_exact".to_string(),
+                        message: "same logical asset".to_string(),
+                    },
+                    SnapshotCompareReason {
+                        code: "same_parent_directory".to_string(),
+                        message: "same folder".to_string(),
+                    },
+                    SnapshotCompareReason {
+                        code: "structural_layout_compatible".to_string(),
+                        message: "layout signals stayed aligned".to_string(),
+                    },
+                ],
+                runner_up_confidence: Some(0.70),
+                confidence_gap: Some(0.26),
+                ambiguous: false,
+            }],
+        };
+
+        let knowledge = WwmiKnowledgeBase {
+            schema_version: "whashreonator.wwmi-knowledge.v1".to_string(),
+            generated_at_unix_ms: 1,
+            repo: WwmiKnowledgeRepoInfo {
+                input: "repo".to_string(),
+                resolved_path: "repo".to_string(),
+                origin_url: None,
+            },
+            summary: WwmiKnowledgeSummary {
+                analyzed_commits: 1,
+                fix_like_commits: 1,
+                discovered_patterns: 1,
+            },
+            patterns: vec![WwmiFixPattern {
+                kind: WwmiPatternKind::MappingOrHashUpdate,
+                description: "mapping".to_string(),
+                frequency: 1,
+                average_fix_likelihood: 0.8,
+                example_commits: vec!["abc".to_string()],
+            }],
+            keyword_stats: vec![WwmiKeywordStat {
+                keyword: "mapping".to_string(),
+                count: 1,
+            }],
+            evidence_commits: vec![WwmiEvidenceCommit {
+                hash: "abc".to_string(),
+                subject: "fix mapping".to_string(),
+                unix_time: 1,
+                decorations: String::new(),
+                commit_url: None,
+                fix_likelihood: 0.8,
+                changed_files: vec!["WWMI/d3dx.ini".to_string()],
+                detected_patterns: vec![WwmiPatternKind::MappingOrHashUpdate],
+                detected_keywords: vec!["mapping".to_string()],
+                reasons: vec!["subject contains fix".to_string()],
+            }],
+        };
+
+        let report = engine.infer(&compare_report, &knowledge);
+
+        assert_eq!(
+            report.candidate_mapping_hints[0].compatibility,
+            RemapCompatibility::LikelyCompatible
+        );
+        assert!(report.candidate_mapping_hints[0].needs_review);
+    }
+
+    #[test]
+    fn inference_flags_structurally_drifted_remap_candidates() {
+        let engine = FixInferenceEngine;
+        let compare_report = SnapshotCompareReport {
+            schema_version: "whashreonator.snapshot-compare.v1".to_string(),
+            old_snapshot: SnapshotVersionInfo {
+                version_id: "6.0.0".to_string(),
+                source_root: "old".to_string(),
+                asset_count: 1,
+            },
+            new_snapshot: SnapshotVersionInfo {
+                version_id: "6.1.0".to_string(),
+                source_root: "new".to_string(),
+                asset_count: 1,
+            },
+            scope: SnapshotCompareScopeContext::default(),
+            summary: SnapshotCompareSummary {
+                total_old_assets: 1,
+                total_new_assets: 1,
+                unchanged_assets: 0,
+                added_assets: 1,
+                removed_assets: 1,
+                changed_assets: 0,
+                candidate_mapping_changes: 1,
+                identity_changed_assets: 0,
+                layout_changed_assets: 0,
+                structural_changed_assets: 0,
+                naming_only_changed_assets: 0,
+                cosmetic_only_changed_assets: 0,
+                provenance_changed_assets: 0,
+                container_moved_assets: 0,
+                lineage_rename_or_repath_assets: 0,
+                lineage_container_movement_assets: 0,
+                lineage_layout_drift_assets: 0,
+                lineage_replacement_assets: 0,
+                lineage_ambiguous_assets: 0,
+                lineage_insufficient_evidence_assets: 0,
+                ambiguous_candidate_mapping_changes: 0,
+                high_confidence_candidate_mapping_changes: 1,
+            },
+            added_assets: Vec::new(),
+            removed_assets: Vec::new(),
+            changed_assets: Vec::new(),
+            candidate_mapping_changes: vec![CandidateMappingChange {
+                old_asset: asset_summary("Content/Character/Encore/Body.mesh"),
+                new_asset: asset_summary("Content/Character/Encore/Body_v2.mesh"),
+                confidence: 0.91,
+                compatibility: RemapCompatibility::StructurallyRisky,
+                lineage: crate::compare::AssetLineageKind::LayoutDrift,
+                reasons: vec![
+                    SnapshotCompareReason {
+                        code: "signature_exact".to_string(),
+                        message: "asset signature matched".to_string(),
+                    },
+                    SnapshotCompareReason {
+                        code: "same_asset_but_structural_drift".to_string(),
+                        message: "structural fields drifted".to_string(),
+                    },
+                    SnapshotCompareReason {
+                        code: "vertex_count_mismatch".to_string(),
+                        message: "vertex count changed".to_string(),
+                    },
+                ],
+                runner_up_confidence: None,
+                confidence_gap: Some(0.22),
+                ambiguous: false,
+            }],
+        };
+        let knowledge = WwmiKnowledgeBase {
+            schema_version: "whashreonator.wwmi-knowledge.v1".to_string(),
+            generated_at_unix_ms: 1,
+            repo: WwmiKnowledgeRepoInfo {
+                input: "repo".to_string(),
+                resolved_path: "repo".to_string(),
+                origin_url: None,
+            },
+            summary: WwmiKnowledgeSummary {
+                analyzed_commits: 3,
+                fix_like_commits: 2,
+                discovered_patterns: 2,
+            },
+            patterns: vec![
+                WwmiFixPattern {
+                    kind: WwmiPatternKind::BufferLayoutOrCapacityFix,
+                    description: "buffer".to_string(),
+                    frequency: 2,
+                    average_fix_likelihood: 0.85,
+                    example_commits: vec!["abc".to_string()],
+                },
+                WwmiFixPattern {
+                    kind: WwmiPatternKind::MappingOrHashUpdate,
+                    description: "mapping".to_string(),
+                    frequency: 2,
+                    average_fix_likelihood: 0.80,
+                    example_commits: vec!["def".to_string()],
+                },
+            ],
+            keyword_stats: Vec::new(),
+            evidence_commits: Vec::new(),
+        };
+
+        let report = engine.infer(&compare_report, &knowledge);
+
+        assert!(
+            report
+                .probable_crash_causes
+                .iter()
+                .any(|cause| cause.code == "candidate_remap_structural_drift")
+        );
+        assert!(
+            report
+                .suggested_fixes
+                .iter()
+                .any(|fix| fix.code == "validate_candidate_remaps_against_layout")
+        );
+        assert_eq!(
+            report.candidate_mapping_hints[0].compatibility,
+            RemapCompatibility::StructurallyRisky
+        );
+        assert!(
+            report.candidate_mapping_hints[0]
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("structural drift"))
+        );
+    }
+
+    #[test]
+    fn inference_surfaces_blocked_identity_conflicts() {
+        let engine = FixInferenceEngine;
+        let compare_report = SnapshotCompareReport {
+            schema_version: "whashreonator.snapshot-compare.v1".to_string(),
+            old_snapshot: SnapshotVersionInfo {
+                version_id: "6.0.0".to_string(),
+                source_root: "old".to_string(),
+                asset_count: 1,
+            },
+            new_snapshot: SnapshotVersionInfo {
+                version_id: "6.1.0".to_string(),
+                source_root: "new".to_string(),
+                asset_count: 1,
+            },
+            scope: SnapshotCompareScopeContext::default(),
+            summary: SnapshotCompareSummary {
+                total_old_assets: 1,
+                total_new_assets: 1,
+                unchanged_assets: 0,
+                added_assets: 1,
+                removed_assets: 1,
+                changed_assets: 0,
+                candidate_mapping_changes: 1,
+                identity_changed_assets: 0,
+                layout_changed_assets: 0,
+                structural_changed_assets: 0,
+                naming_only_changed_assets: 0,
+                cosmetic_only_changed_assets: 0,
+                provenance_changed_assets: 0,
+                container_moved_assets: 0,
+                lineage_rename_or_repath_assets: 0,
+                lineage_container_movement_assets: 0,
+                lineage_layout_drift_assets: 0,
+                lineage_replacement_assets: 0,
+                lineage_ambiguous_assets: 0,
+                lineage_insufficient_evidence_assets: 0,
+                ambiguous_candidate_mapping_changes: 0,
+                high_confidence_candidate_mapping_changes: 1,
+            },
+            added_assets: Vec::new(),
+            removed_assets: Vec::new(),
+            changed_assets: Vec::new(),
+            candidate_mapping_changes: vec![CandidateMappingChange {
+                old_asset: asset_summary("Content/Character/Encore/Face.mesh"),
+                new_asset: asset_summary("Content/Character/Encore/Face_LOD0.mesh"),
+                confidence: 0.87,
+                compatibility: RemapCompatibility::IncompatibleBlocked,
+                lineage: crate::compare::AssetLineageKind::Replacement,
+                reasons: vec![
+                    SnapshotCompareReason {
+                        code: "signature_mismatch".to_string(),
+                        message: "signature changed".to_string(),
+                    },
+                    SnapshotCompareReason {
+                        code: "identity_conflict_detected".to_string(),
+                        message: "identity conflict".to_string(),
+                    },
+                ],
+                runner_up_confidence: None,
+                confidence_gap: Some(0.18),
+                ambiguous: false,
+            }],
+        };
+        let knowledge = WwmiKnowledgeBase {
+            schema_version: "whashreonator.wwmi-knowledge.v1".to_string(),
+            generated_at_unix_ms: 1,
+            repo: WwmiKnowledgeRepoInfo {
+                input: "repo".to_string(),
+                resolved_path: "repo".to_string(),
+                origin_url: None,
+            },
+            summary: WwmiKnowledgeSummary {
+                analyzed_commits: 2,
+                fix_like_commits: 2,
+                discovered_patterns: 2,
+            },
+            patterns: vec![
+                WwmiFixPattern {
+                    kind: WwmiPatternKind::MappingOrHashUpdate,
+                    description: "mapping".to_string(),
+                    frequency: 2,
+                    average_fix_likelihood: 0.80,
+                    example_commits: vec!["abc".to_string()],
+                },
+                WwmiFixPattern {
+                    kind: WwmiPatternKind::ShaderLogicChange,
+                    description: "shader".to_string(),
+                    frequency: 1,
+                    average_fix_likelihood: 0.70,
+                    example_commits: vec!["def".to_string()],
+                },
+            ],
+            keyword_stats: Vec::new(),
+            evidence_commits: Vec::new(),
+        };
+
+        let report = engine.infer(&compare_report, &knowledge);
+
+        assert_eq!(
+            report.candidate_mapping_hints[0].compatibility,
+            RemapCompatibility::IncompatibleBlocked
+        );
+        assert!(
+            report
+                .probable_crash_causes
+                .iter()
+                .any(|cause| cause.code == "candidate_remap_identity_conflict")
+        );
+        assert!(
+            report
+                .suggested_fixes
+                .iter()
+                .any(|fix| fix.code == "inspect_identity_conflicts_before_remap")
+        );
+    }
+
+    #[test]
+    fn infer_with_none_continuity_keeps_pairwise_behavior() {
+        let engine = FixInferenceEngine;
+        let compare_report = continuity_mapping_compare_report();
+        let knowledge = continuity_test_knowledge();
+
+        let mut pairwise = engine.infer(&compare_report, &knowledge);
+        let mut with_none = engine.infer_with_continuity(&compare_report, &knowledge, None);
+
+        pairwise.generated_at_unix_ms = 0;
+        with_none.generated_at_unix_ms = 0;
+
+        assert_eq!(pairwise, with_none);
+    }
+
+    #[test]
+    fn inference_uses_continuity_history_for_mapping_review_and_new_fix() {
+        let engine = FixInferenceEngine;
+        let compare_report = continuity_mapping_compare_report();
+        let knowledge = continuity_test_knowledge();
+        let continuity = VersionContinuityIndex {
+            summary: Default::default(),
+            threads: vec![VersionContinuityThread {
+                thread_id: "1.0.0:Content/Character/Encore/Body.mesh".to_string(),
+                anchor_version_id: "1.0.0".to_string(),
+                anchor: continuity_item("Content/Character/Encore/Body.mesh"),
+                observations: vec![
+                    continuity_observation(
+                        "1.0.0",
+                        "1.1.0",
+                        "Content/Character/Encore/Body.mesh",
+                        Some("Content/Character/Encore/Body.mesh"),
+                        VersionContinuityRelation::Persisted,
+                    ),
+                    continuity_observation(
+                        "1.1.0",
+                        "1.2.0",
+                        "Content/Character/Encore/Body.mesh",
+                        Some("Content/Character/Encore/Body.mesh"),
+                        VersionContinuityRelation::Persisted,
+                    ),
+                    continuity_observation(
+                        "1.2.0",
+                        "1.3.0",
+                        "Content/Character/Encore/Body.mesh",
+                        Some("Content/Character/Encore/Body_LOD0.mesh"),
+                        VersionContinuityRelation::RenameOrRepath,
+                    ),
+                    continuity_observation(
+                        "1.3.0",
+                        "1.4.0",
+                        "Content/Character/Encore/Body_LOD0.mesh",
+                        None,
+                        VersionContinuityRelation::Removed,
+                    ),
+                ],
+                review_required: false,
+            }],
+            thread_summaries: Vec::new(),
+        };
+
+        let base_report = engine.infer(&compare_report, &knowledge);
+        let continuity_report =
+            engine.infer_with_continuity(&compare_report, &knowledge, Some(&continuity));
+        let base_hint = continuity_mapping_hint(&base_report);
+        let continuity_hint = continuity_mapping_hint(&continuity_report);
+
+        assert!(
+            continuity_report
+                .probable_crash_causes
+                .iter()
+                .any(|cause| cause.code == "continuity_thread_instability")
+        );
+        assert!(
+            continuity_report
+                .suggested_fixes
+                .iter()
+                .any(|fix| fix.code == "review_continuity_thread_history_before_repair")
+        );
+        assert!(
+            base_report
+                .probable_crash_causes
+                .iter()
+                .all(|cause| cause.code != "continuity_thread_instability")
+        );
+        assert!(
+            base_report
+                .suggested_fixes
+                .iter()
+                .all(|fix| fix.code != "review_continuity_thread_history_before_repair")
+        );
+        assert!(continuity_hint.confidence < base_hint.confidence);
+        assert_eq!(
+            continuity_hint.compatibility,
+            RemapCompatibility::CompatibleWithCaution
+        );
+        assert!(
+            continuity_hint
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("continuity kept this thread stable"))
+        );
+        assert!(
+            continuity_hint
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("removed in 1.4.0"))
+        );
+        assert!(
+            continuity_hint
+                .evidence
+                .iter()
+                .any(|evidence| evidence.contains("spans 1.0.0 -> 1.4.0"))
+        );
+    }
+
+    #[test]
+    fn inference_downgrades_mapping_hints_when_continuity_shows_repeated_layout_drift() {
+        let engine = FixInferenceEngine;
+        let compare_report = continuity_layout_compare_report();
+        let knowledge = continuity_test_knowledge();
+        let continuity = VersionContinuityIndex {
+            summary: Default::default(),
+            threads: vec![VersionContinuityThread {
+                thread_id: "2.0.0:Content/Character/Encore/Cloak.mesh".to_string(),
+                anchor_version_id: "2.0.0".to_string(),
+                anchor: continuity_item("Content/Character/Encore/Cloak.mesh"),
+                observations: vec![
+                    continuity_observation(
+                        "2.0.0",
+                        "2.1.0",
+                        "Content/Character/Encore/Cloak.mesh",
+                        Some("Content/Character/Encore/Cloak.mesh"),
+                        VersionContinuityRelation::LayoutDrift,
+                    ),
+                    continuity_observation(
+                        "2.1.0",
+                        "2.2.0",
+                        "Content/Character/Encore/Cloak.mesh",
+                        Some("Content/Character/Encore/Cloak_v2.mesh"),
+                        VersionContinuityRelation::RenameOrRepath,
+                    ),
+                    continuity_observation(
+                        "2.2.0",
+                        "2.3.0",
+                        "Content/Character/Encore/Cloak_v2.mesh",
+                        Some("Content/Character/Encore/Cloak_v3.mesh"),
+                        VersionContinuityRelation::LayoutDrift,
+                    ),
+                ],
+                review_required: true,
+            }],
+            thread_summaries: Vec::new(),
+        };
+
+        let base_report = engine.infer(&compare_report, &knowledge);
+        let continuity_report =
+            engine.infer_with_continuity(&compare_report, &knowledge, Some(&continuity));
+        let base_hint = continuity_mapping_hint(&base_report);
+        let continuity_hint = continuity_mapping_hint(&continuity_report);
+
+        assert_eq!(
+            base_hint.compatibility,
+            RemapCompatibility::CompatibleWithCaution
+        );
+        assert_eq!(
+            continuity_hint.compatibility,
+            RemapCompatibility::StructurallyRisky
+        );
+        assert!(continuity_hint.confidence < base_hint.confidence);
+        assert!(
+            continuity_hint
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("repeated layout drift"))
+        );
+        assert!(
+            continuity_report
+                .probable_crash_causes
+                .iter()
+                .any(|cause| cause.code == "continuity_thread_instability")
+        );
+        assert!(
+            continuity_report
+                .suggested_fixes
+                .iter()
+                .any(|fix| fix.code == "review_continuity_thread_history_before_repair")
+        );
+    }
+
     fn asset_summary(path: &str) -> SnapshotAssetSummary {
         SnapshotAssetSummary {
             id: path.to_string(),
             path: path.to_string(),
             kind: Some("mesh".to_string()),
+            logical_name: Some("Asset".to_string()),
             normalized_name: Some("asset".to_string()),
             vertex_count: Some(1000),
             index_count: Some(2000),
             material_slots: Some(1),
             section_count: Some(1),
+            vertex_stride: None,
+            vertex_buffer_count: None,
+            index_format: None,
+            primitive_topology: None,
+            layout_markers: Vec::new(),
+            internal_structure: crate::domain::AssetInternalStructure::default(),
             asset_hash: None,
             shader_hash: None,
+            signature: None,
+            tags: vec!["character".to_string()],
+            source: crate::domain::AssetSourceContext::default(),
+        }
+    }
+
+    fn continuity_mapping_compare_report() -> SnapshotCompareReport {
+        SnapshotCompareReport {
+            schema_version: "whashreonator.snapshot-compare.v1".to_string(),
+            old_snapshot: SnapshotVersionInfo {
+                version_id: "1.2.0".to_string(),
+                source_root: "old".to_string(),
+                asset_count: 1,
+            },
+            new_snapshot: SnapshotVersionInfo {
+                version_id: "1.3.0".to_string(),
+                source_root: "new".to_string(),
+                asset_count: 1,
+            },
+            scope: SnapshotCompareScopeContext::default(),
+            summary: SnapshotCompareSummary {
+                total_old_assets: 1,
+                total_new_assets: 1,
+                unchanged_assets: 0,
+                added_assets: 1,
+                removed_assets: 1,
+                changed_assets: 0,
+                candidate_mapping_changes: 1,
+                identity_changed_assets: 0,
+                layout_changed_assets: 0,
+                structural_changed_assets: 0,
+                naming_only_changed_assets: 0,
+                cosmetic_only_changed_assets: 0,
+                provenance_changed_assets: 0,
+                container_moved_assets: 0,
+                lineage_rename_or_repath_assets: 0,
+                lineage_container_movement_assets: 0,
+                lineage_layout_drift_assets: 0,
+                lineage_replacement_assets: 0,
+                lineage_ambiguous_assets: 0,
+                lineage_insufficient_evidence_assets: 0,
+                ambiguous_candidate_mapping_changes: 0,
+                high_confidence_candidate_mapping_changes: 1,
+            },
+            added_assets: Vec::new(),
+            removed_assets: vec![SnapshotAssetChange {
+                change_type: SnapshotChangeType::Removed,
+                old_asset: Some(asset_summary("Content/Character/Encore/Body.mesh")),
+                new_asset: None,
+                changed_fields: vec!["path_presence".to_string()],
+                probable_impact: RiskLevel::Medium,
+                crash_risk: RiskLevel::Medium,
+                suspected_mapping_change: true,
+                lineage: crate::compare::AssetLineageKind::RenameOrRepath,
+                reasons: vec![SnapshotCompareReason {
+                    code: "asset_removed".to_string(),
+                    message: "old path removed".to_string(),
+                }],
+            }],
+            changed_assets: Vec::new(),
+            candidate_mapping_changes: vec![CandidateMappingChange {
+                old_asset: asset_summary("Content/Character/Encore/Body.mesh"),
+                new_asset: asset_summary("Content/Character/Encore/Body_LOD0.mesh"),
+                confidence: 0.95,
+                compatibility: RemapCompatibility::LikelyCompatible,
+                lineage: crate::compare::AssetLineageKind::RenameOrRepath,
+                reasons: vec![
+                    SnapshotCompareReason {
+                        code: "normalized_name_exact".to_string(),
+                        message: "same logical asset".to_string(),
+                    },
+                    SnapshotCompareReason {
+                        code: "same_parent_directory".to_string(),
+                        message: "same folder".to_string(),
+                    },
+                    SnapshotCompareReason {
+                        code: "structural_layout_compatible".to_string(),
+                        message: "layout stayed aligned".to_string(),
+                    },
+                ],
+                runner_up_confidence: None,
+                confidence_gap: Some(0.22),
+                ambiguous: false,
+            }],
+        }
+    }
+
+    fn continuity_layout_compare_report() -> SnapshotCompareReport {
+        SnapshotCompareReport {
+            schema_version: "whashreonator.snapshot-compare.v1".to_string(),
+            old_snapshot: SnapshotVersionInfo {
+                version_id: "2.1.0".to_string(),
+                source_root: "old".to_string(),
+                asset_count: 1,
+            },
+            new_snapshot: SnapshotVersionInfo {
+                version_id: "2.2.0".to_string(),
+                source_root: "new".to_string(),
+                asset_count: 1,
+            },
+            scope: SnapshotCompareScopeContext::default(),
+            summary: SnapshotCompareSummary {
+                total_old_assets: 1,
+                total_new_assets: 1,
+                unchanged_assets: 0,
+                added_assets: 1,
+                removed_assets: 1,
+                changed_assets: 0,
+                candidate_mapping_changes: 1,
+                identity_changed_assets: 0,
+                layout_changed_assets: 0,
+                structural_changed_assets: 0,
+                naming_only_changed_assets: 0,
+                cosmetic_only_changed_assets: 0,
+                provenance_changed_assets: 0,
+                container_moved_assets: 0,
+                lineage_rename_or_repath_assets: 0,
+                lineage_container_movement_assets: 0,
+                lineage_layout_drift_assets: 0,
+                lineage_replacement_assets: 0,
+                lineage_ambiguous_assets: 0,
+                lineage_insufficient_evidence_assets: 0,
+                ambiguous_candidate_mapping_changes: 0,
+                high_confidence_candidate_mapping_changes: 1,
+            },
+            added_assets: Vec::new(),
+            removed_assets: vec![SnapshotAssetChange {
+                change_type: SnapshotChangeType::Removed,
+                old_asset: Some(asset_summary("Content/Character/Encore/Cloak.mesh")),
+                new_asset: None,
+                changed_fields: vec!["path_presence".to_string()],
+                probable_impact: RiskLevel::Medium,
+                crash_risk: RiskLevel::Medium,
+                suspected_mapping_change: true,
+                lineage: crate::compare::AssetLineageKind::LayoutDrift,
+                reasons: vec![SnapshotCompareReason {
+                    code: "asset_removed".to_string(),
+                    message: "old path removed".to_string(),
+                }],
+            }],
+            changed_assets: Vec::new(),
+            candidate_mapping_changes: vec![CandidateMappingChange {
+                old_asset: asset_summary("Content/Character/Encore/Cloak.mesh"),
+                new_asset: asset_summary("Content/Character/Encore/Cloak_v2.mesh"),
+                confidence: 0.93,
+                compatibility: RemapCompatibility::CompatibleWithCaution,
+                lineage: crate::compare::AssetLineageKind::RenameOrRepath,
+                reasons: vec![
+                    SnapshotCompareReason {
+                        code: "normalized_name_exact".to_string(),
+                        message: "same logical asset".to_string(),
+                    },
+                    SnapshotCompareReason {
+                        code: "same_parent_directory".to_string(),
+                        message: "same folder".to_string(),
+                    },
+                ],
+                runner_up_confidence: None,
+                confidence_gap: Some(0.18),
+                ambiguous: false,
+            }],
+        }
+    }
+
+    fn continuity_mapping_hint<'a>(
+        report: &'a crate::inference::InferenceReport,
+    ) -> &'a crate::inference::InferredMappingHint {
+        report
+            .candidate_mapping_hints
+            .iter()
+            .find(|hint| {
+                hint.old_asset_path.contains("Body") || hint.old_asset_path.contains("Cloak")
+            })
+            .expect("mapping hint")
+    }
+
+    fn continuity_observation(
+        from_version_id: &str,
+        to_version_id: &str,
+        from_path: &str,
+        to_path: Option<&str>,
+        relation: VersionContinuityRelation,
+    ) -> VersionContinuityObservation {
+        VersionContinuityObservation {
+            from_version_id: from_version_id.to_string(),
+            to_version_id: to_version_id.to_string(),
+            from_path: from_path.to_string(),
+            to_path: to_path.map(ToOwned::to_owned),
+            relation,
+            status: DiffStatus::Changed,
+            confidence: Some(0.90),
+            compatibility: None,
+            source: VersionContinuitySource::CandidateMapping,
+            reason_codes: Vec::new(),
+        }
+    }
+
+    fn continuity_item(path: &str) -> VersionedItem {
+        VersionedItem {
+            key: path.to_string(),
+            label: path.to_string(),
+            path: Some(path.to_string()),
+            metadata: TechnicalMetadata::default(),
+        }
+    }
+
+    fn continuity_test_knowledge() -> WwmiKnowledgeBase {
+        WwmiKnowledgeBase {
+            schema_version: "whashreonator.wwmi-knowledge.v1".to_string(),
+            generated_at_unix_ms: 1,
+            repo: WwmiKnowledgeRepoInfo {
+                input: "repo".to_string(),
+                resolved_path: "repo".to_string(),
+                origin_url: None,
+            },
+            summary: WwmiKnowledgeSummary {
+                analyzed_commits: 2,
+                fix_like_commits: 2,
+                discovered_patterns: 2,
+            },
+            patterns: vec![
+                WwmiFixPattern {
+                    kind: WwmiPatternKind::MappingOrHashUpdate,
+                    description: "mapping".to_string(),
+                    frequency: 2,
+                    average_fix_likelihood: 0.80,
+                    example_commits: vec!["abc".to_string()],
+                },
+                WwmiFixPattern {
+                    kind: WwmiPatternKind::BufferLayoutOrCapacityFix,
+                    description: "buffer".to_string(),
+                    frequency: 2,
+                    average_fix_likelihood: 0.85,
+                    example_commits: vec!["def".to_string()],
+                },
+            ],
+            keyword_stats: Vec::new(),
+            evidence_commits: Vec::new(),
         }
     }
 }

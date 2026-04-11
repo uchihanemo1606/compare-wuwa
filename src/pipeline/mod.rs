@@ -7,7 +7,7 @@ use crate::{
         CompareSnapshotsArgs, ExtractWwmiKnowledgeArgs, GenerateProposalsArgs, InferFixesArgs,
         MapArgs, MapLocalArgs, SnapshotArgs, SnapshotCaptureScopeArg, SnapshotReportArgs,
     },
-    compare::{SnapshotCompareReport, SnapshotComparer},
+    compare::{SnapshotCompareReport, SnapshotComparer, load_snapshot_compare_report},
     config::AppConfig,
     domain::{MatchDecision, MatchStatus, PipelineReport, PipelineSummary},
     error::{AppError, AppResult},
@@ -26,11 +26,17 @@ use crate::{
     },
     matcher::{HeuristicMatcher, Matcher},
     proposal::{ProposalArtifacts, ProposalEngine},
-    report::{VersionDiffReportBuilder, VersionDiffReportV2},
-    snapshot::{GameSnapshot, create_local_snapshot_with_capture_scope},
+    report::{
+        VersionContinuityIndex, VersionDiffReportBuilder, VersionDiffReportV2,
+        load_version_continuity_artifact,
+    },
+    report_storage::ReportStorage,
+    snapshot::{
+        GameSnapshot, create_local_snapshot_with_capture_scope, create_prepared_snapshot_from_file,
+    },
     snapshot_report::{SnapshotInventoryReport, SnapshotReportRenderer, load_snapshots},
     validator::{ThresholdValidator, Validator},
-    wwmi::{WwmiKnowledgeBase, WwmiKnowledgeExtractor, WwmiRepoInput},
+    wwmi::{WwmiKnowledgeBase, WwmiKnowledgeExtractor, WwmiRepoInput, load_wwmi_knowledge},
 };
 
 pub struct MatchPipeline<I, F, M, V, E> {
@@ -67,6 +73,13 @@ impl ProposalOutputs {
 pub struct ProposalResult {
     pub artifacts: ProposalArtifacts,
     pub outputs: ProposalOutputs,
+}
+
+#[derive(Debug, Clone)]
+pub struct SnapshotCommandResult {
+    pub snapshot: GameSnapshot,
+    pub stored_snapshot_path: Option<PathBuf>,
+    pub stored_prepared_inventory_path: Option<PathBuf>,
 }
 
 impl SourceMapOutputs {
@@ -166,13 +179,56 @@ pub fn run_map_command(args: &MapArgs) -> AppResult<()> {
     Ok(())
 }
 
-pub fn run_snapshot_command(args: &SnapshotArgs) -> AppResult<GameSnapshot> {
-    let snapshot = create_local_snapshot_with_capture_scope(
-        &args.version_id,
-        args.source_root.as_path(),
-        to_local_capture_scope(args.capture_scope),
-    )?;
+pub fn run_snapshot_command(args: &SnapshotArgs) -> AppResult<SnapshotCommandResult> {
+    let snapshot = match args.capture_scope {
+        SnapshotCaptureScopeArg::Full
+        | SnapshotCaptureScopeArg::Content
+        | SnapshotCaptureScopeArg::Character => {
+            if let Some(prepared_inventory) = args.prepared_inventory.as_deref() {
+                return Err(AppError::InvalidInput(format!(
+                    "--prepared-inventory {} requires --capture-scope prepared",
+                    prepared_inventory.display()
+                )));
+            }
+
+            create_local_snapshot_with_capture_scope(
+                &args.version_id,
+                args.source_root.as_path(),
+                to_local_capture_scope(args.capture_scope)?,
+            )?
+        }
+        SnapshotCaptureScopeArg::Prepared => {
+            let prepared_inventory = args.prepared_inventory.as_deref().ok_or_else(|| {
+                AppError::InvalidInput(
+                    "snapshot --capture-scope prepared requires --prepared-inventory".to_string(),
+                )
+            })?;
+            create_prepared_snapshot_from_file(
+                &args.version_id,
+                args.source_root.as_path(),
+                prepared_inventory,
+            )?
+        }
+    };
     export_snapshot_output(&snapshot, args.output.as_path())?;
+
+    let mut stored_snapshot_path = None;
+    let mut stored_prepared_inventory_path = None;
+    if args.store_in_report {
+        let storage = match args.report_root.as_ref() {
+            Some(root) => ReportStorage::new(root.clone()),
+            None => ReportStorage::default(),
+        };
+        stored_snapshot_path = Some(storage.save_snapshot_for_version(&snapshot)?);
+        if let Some(prepared_inventory) = args.prepared_inventory.as_deref() {
+            stored_prepared_inventory_path =
+                Some(storage.save_prepared_inventory_input_for_version(
+                    &snapshot.version_id,
+                    prepared_inventory,
+                )?);
+        }
+    }
+
     info!(
         output = %args.output.display(),
         version_id = %snapshot.version_id,
@@ -180,14 +236,21 @@ pub fn run_snapshot_command(args: &SnapshotArgs) -> AppResult<GameSnapshot> {
         "snapshot output exported"
     );
 
-    Ok(snapshot)
+    Ok(SnapshotCommandResult {
+        snapshot,
+        stored_snapshot_path,
+        stored_prepared_inventory_path,
+    })
 }
 
-fn to_local_capture_scope(value: SnapshotCaptureScopeArg) -> LocalSnapshotCaptureScope {
+fn to_local_capture_scope(value: SnapshotCaptureScopeArg) -> AppResult<LocalSnapshotCaptureScope> {
     match value {
-        SnapshotCaptureScopeArg::Full => LocalSnapshotCaptureScope::FullInventory,
-        SnapshotCaptureScopeArg::Content => LocalSnapshotCaptureScope::ContentFocused,
-        SnapshotCaptureScopeArg::Character => LocalSnapshotCaptureScope::CharacterFocused,
+        SnapshotCaptureScopeArg::Full => Ok(LocalSnapshotCaptureScope::FullInventory),
+        SnapshotCaptureScopeArg::Content => Ok(LocalSnapshotCaptureScope::ContentFocused),
+        SnapshotCaptureScopeArg::Character => Ok(LocalSnapshotCaptureScope::CharacterFocused),
+        SnapshotCaptureScopeArg::Prepared => Err(AppError::InvalidInput(
+            "prepared capture does not map to local filesystem capture scope".to_string(),
+        )),
     }
 }
 
@@ -261,8 +324,11 @@ pub fn run_extract_wwmi_knowledge_command(
 }
 
 pub fn run_infer_fixes_command(args: &InferFixesArgs) -> AppResult<InferenceReport> {
-    let report = FixInferenceEngine
-        .infer_files(args.compare_report.as_path(), args.wwmi_knowledge.as_path())?;
+    let compare_report = load_snapshot_compare_report(args.compare_report.as_path())?;
+    let knowledge = load_wwmi_knowledge(args.wwmi_knowledge.as_path())?;
+    let continuity = resolve_inference_continuity(args, &compare_report)?;
+    let report =
+        FixInferenceEngine.infer_with_continuity(&compare_report, &knowledge, continuity.as_ref());
     export_inference_output(&report, args.output.as_path())?;
     info!(
         output = %args.output.display(),
@@ -274,6 +340,26 @@ pub fn run_infer_fixes_command(args: &InferFixesArgs) -> AppResult<InferenceRepo
     );
 
     Ok(report)
+}
+
+fn resolve_inference_continuity(
+    args: &InferFixesArgs,
+    compare_report: &SnapshotCompareReport,
+) -> AppResult<Option<VersionContinuityIndex>> {
+    if let Some(path) = args.continuity_artifact.as_deref() {
+        let artifact = load_version_continuity_artifact(path)?;
+        return Ok(Some(artifact.continuity));
+    }
+
+    let Some(report_root) = args.report_root.as_ref() else {
+        return Ok(None);
+    };
+
+    let storage = ReportStorage::new(report_root.clone());
+    storage.load_version_continuity_index_for_pair(
+        &compare_report.old_snapshot.version_id,
+        &compare_report.new_snapshot.version_id,
+    )
 }
 
 pub fn run_generate_proposals_command(args: &GenerateProposalsArgs) -> AppResult<ProposalResult> {
