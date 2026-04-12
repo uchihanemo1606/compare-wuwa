@@ -8,12 +8,15 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    domain::{AssetInternalStructure, AssetMetadata, AssetRecord, AssetSourceContext},
+    domain::{
+        AssetInternalStructure, AssetMetadata, AssetRecord, AssetSourceContext,
+        ExtractedAssetRecord,
+    },
     error::{AppError, AppResult},
     fingerprint::{AssetFingerprint, DefaultFingerprinter, Fingerprinter},
     ingest::{
         FilteredLocalSnapshotAssetExtractor, LocalSnapshotCaptureScope, LocalSnapshotIngestSource,
-        PreparedSnapshotAssetExtractor, SnapshotAssetExtractor,
+        PreparedSnapshotAssetExtractor, SnapshotAssetExtractor, SnapshotExtractionScopeHint,
     },
 };
 
@@ -80,6 +83,8 @@ pub struct SnapshotContext {
     pub launcher: Option<SnapshotLauncherContext>,
     pub resource_manifest: Option<SnapshotResourceManifestContext>,
     #[serde(default)]
+    pub extractor: Option<SnapshotExtractorContext>,
+    #[serde(default)]
     pub scope: SnapshotScopeContext,
     pub notes: Vec<String>,
 }
@@ -87,12 +92,29 @@ pub struct SnapshotContext {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(default)]
 pub struct SnapshotScopeContext {
+    pub acquisition_kind: Option<String>,
     pub capture_mode: Option<String>,
     pub mostly_install_or_package_level: Option<bool>,
     pub meaningful_content_coverage: Option<bool>,
     pub meaningful_character_coverage: Option<bool>,
+    pub meaningful_asset_record_enrichment: Option<bool>,
     pub coverage: SnapshotCoverageSignals,
     pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct SnapshotExtractorContext {
+    pub inventory_path: Option<String>,
+    pub extraction_tool: Option<String>,
+    pub extraction_kind: Option<String>,
+    pub inventory_source_root: Option<String>,
+    pub tags: Vec<String>,
+    pub note: Option<String>,
+    pub record_count: usize,
+    pub records_with_hashes: usize,
+    pub records_with_source_context: usize,
+    pub records_with_rich_metadata: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -105,10 +127,12 @@ pub struct SnapshotCoverageSignals {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotScopeAssessment {
+    pub acquisition_kind: Option<String>,
     pub capture_mode: Option<String>,
     pub mostly_install_or_package_level: bool,
     pub meaningful_content_coverage: bool,
     pub meaningful_character_coverage: bool,
+    pub meaningful_asset_record_enrichment: bool,
     pub coverage: SnapshotCoverageSignals,
     pub note: Option<String>,
     pub observed_fallback_used: bool,
@@ -116,8 +140,20 @@ pub struct SnapshotScopeAssessment {
 
 impl SnapshotScopeAssessment {
     pub fn is_low_signal_for_character_analysis(&self) -> bool {
-        self.mostly_install_or_package_level
-            && !(self.meaningful_content_coverage && self.meaningful_character_coverage)
+        match self.acquisition_kind.as_deref() {
+            Some("shallow_filesystem_inventory") => true,
+            Some("extractor_backed_asset_records") => {
+                !self.meaningful_content_coverage
+                    || !self.meaningful_character_coverage
+                    || !self.meaningful_asset_record_enrichment
+            }
+            _ => {
+                self.mostly_install_or_package_level
+                    || !self.meaningful_content_coverage
+                    || !self.meaningful_character_coverage
+                    || !self.meaningful_asset_record_enrichment
+            }
+        }
     }
 }
 
@@ -165,8 +201,13 @@ where
         }
 
         let extraction_mode = self.asset_source.extraction_mode();
-        let scope_note = self.asset_source.scope_note();
+        let scope_hint = self.asset_source.scope_hint();
         let assets = self.asset_source.extract_snapshot_assets(source_root)?;
+        let extractor_context = matches!(
+            extraction_mode,
+            crate::ingest::SnapshotExtractionMode::ExtractorBackedAssetRecords
+        )
+        .then(|| build_extractor_context(&scope_hint, &assets));
         let snapshot_assets = assets
             .iter()
             .map(|asset| {
@@ -189,7 +230,9 @@ where
             context: SnapshotContext {
                 launcher: None,
                 resource_manifest: None,
+                extractor: extractor_context,
                 scope: SnapshotScopeContext {
+                    acquisition_kind: Some(extraction_mode.acquisition_kind().to_string()),
                     capture_mode: Some(extraction_mode.capture_mode().to_string()),
                     ..SnapshotScopeContext::default()
                 },
@@ -197,7 +240,7 @@ where
             },
         };
 
-        annotate_snapshot_scope_from_extractor(&mut snapshot, extraction_mode, scope_note);
+        annotate_snapshot_scope_from_extractor(&mut snapshot, extraction_mode, scope_hint);
         Ok(snapshot)
     }
 }
@@ -252,10 +295,28 @@ pub fn create_prepared_snapshot(
     source_root: &Path,
     extractor: PreparedSnapshotAssetExtractor,
 ) -> AppResult<GameSnapshot> {
-    create_snapshot_with_extractor(version_id, source_root, extractor)
+    create_extractor_backed_snapshot(version_id, source_root, extractor)
+}
+
+pub fn create_extractor_backed_snapshot(
+    version_id: &str,
+    source_root: &Path,
+    extractor: PreparedSnapshotAssetExtractor,
+) -> AppResult<GameSnapshot> {
+    let mut snapshot = create_snapshot_with_extractor(version_id, source_root, extractor)?;
+    enrich_snapshot_from_game_root(&mut snapshot, source_root)?;
+    Ok(snapshot)
 }
 
 pub fn create_prepared_snapshot_from_inventory(
+    version_id: &str,
+    source_root: &Path,
+    inventory: crate::domain::PreparedAssetInventory,
+) -> AppResult<GameSnapshot> {
+    create_extractor_backed_snapshot_from_inventory(version_id, source_root, inventory)
+}
+
+pub fn create_extractor_backed_snapshot_from_inventory(
     version_id: &str,
     source_root: &Path,
     inventory: crate::domain::PreparedAssetInventory,
@@ -268,6 +329,14 @@ pub fn create_prepared_snapshot_from_inventory(
 }
 
 pub fn create_prepared_snapshot_from_file(
+    version_id: &str,
+    source_root: &Path,
+    inventory_path: &Path,
+) -> AppResult<GameSnapshot> {
+    create_extractor_backed_snapshot_from_file(version_id, source_root, inventory_path)
+}
+
+pub fn create_extractor_backed_snapshot_from_file(
     version_id: &str,
     source_root: &Path,
     inventory_path: &Path,
@@ -356,36 +425,191 @@ impl SnapshotAsset {
     }
 }
 
+fn build_extractor_context(
+    scope_hint: &SnapshotExtractionScopeHint,
+    assets: &[ExtractedAssetRecord],
+) -> SnapshotExtractorContext {
+    SnapshotExtractorContext {
+        inventory_path: scope_hint.inventory_path.clone(),
+        extraction_tool: scope_hint.extraction_tool.clone(),
+        extraction_kind: scope_hint.extraction_kind.clone(),
+        inventory_source_root: scope_hint.inventory_source_root.clone(),
+        tags: scope_hint.tags.clone(),
+        note: scope_hint.note.clone(),
+        record_count: assets.len(),
+        records_with_hashes: assets
+            .iter()
+            .filter(|asset| has_hash_fields(&asset.hash_fields))
+            .count(),
+        records_with_source_context: assets
+            .iter()
+            .filter(|asset| has_source_context(&asset.source))
+            .count(),
+        records_with_rich_metadata: assets
+            .iter()
+            .filter(|asset| has_rich_asset_metadata(&asset.asset.metadata))
+            .count(),
+    }
+}
+
+fn has_hash_fields(hash_fields: &crate::domain::AssetHashFields) -> bool {
+    hash_fields.asset_hash.is_some()
+        || hash_fields.shader_hash.is_some()
+        || hash_fields.signature.is_some()
+}
+
+fn has_source_context(source: &AssetSourceContext) -> bool {
+    source.extraction_tool.is_some()
+        || source.source_root.is_some()
+        || source.source_path.is_some()
+        || source.container_path.is_some()
+        || source.source_kind.is_some()
+}
+
+fn has_rich_asset_metadata(metadata: &AssetMetadata) -> bool {
+    metadata.vertex_count.is_some()
+        || metadata.index_count.is_some()
+        || metadata.material_slots.is_some()
+        || metadata.section_count.is_some()
+        || metadata.vertex_stride.is_some()
+        || metadata.vertex_buffer_count.is_some()
+        || metadata.index_format.is_some()
+        || metadata.primitive_topology.is_some()
+        || !metadata.layout_markers.is_empty()
+        || metadata.internal_structure != AssetInternalStructure::default()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AssetRecordEnrichmentSummary {
+    record_count: usize,
+    enriched_record_count: usize,
+    meaningful_enriched_record_threshold: usize,
+}
+
+fn has_snapshot_hash_fields(hash_fields: &SnapshotHashFields) -> bool {
+    hash_fields.asset_hash.is_some()
+        || hash_fields.shader_hash.is_some()
+        || hash_fields.signature.is_some()
+}
+
+fn is_meaningfully_enriched_snapshot_asset(asset: &SnapshotAsset) -> bool {
+    has_snapshot_hash_fields(&asset.hash_fields)
+        || has_source_context(&asset.source)
+        || has_rich_asset_metadata(&asset.metadata)
+}
+
+fn min_meaningful_enriched_record_count(record_count: usize) -> usize {
+    match record_count {
+        0 => return 0,
+        1 | 2 => return MIN_FULLY_ENRICHED_SMALL_SNAPSHOT_RECORD_COUNT,
+        3 | 4 => return record_count,
+        _ => {}
+    }
+
+    let numerator = record_count.saturating_mul(MIN_MEANINGFUL_ENRICHED_RECORD_RATIO_NUMERATOR);
+    let ratio_threshold = numerator / MIN_MEANINGFUL_ENRICHED_RECORD_RATIO_DENOMINATOR
+        + usize::from(numerator % MIN_MEANINGFUL_ENRICHED_RECORD_RATIO_DENOMINATOR != 0);
+
+    MIN_MEANINGFUL_ENRICHED_RECORD_COUNT.max(ratio_threshold)
+}
+
+fn summarize_asset_record_enrichment(
+    snapshot: &GameSnapshot,
+) -> Option<AssetRecordEnrichmentSummary> {
+    let extractor = snapshot.context.extractor.as_ref()?;
+    let record_count = extractor.record_count.max(snapshot.asset_count);
+    let enriched_record_count = snapshot
+        .assets
+        .iter()
+        .filter(|asset| is_meaningfully_enriched_snapshot_asset(asset))
+        .count();
+
+    Some(AssetRecordEnrichmentSummary {
+        record_count,
+        enriched_record_count,
+        meaningful_enriched_record_threshold: min_meaningful_enriched_record_count(record_count),
+    })
+}
+
+fn has_meaningful_asset_record_enrichment(snapshot: &GameSnapshot) -> bool {
+    summarize_asset_record_enrichment(snapshot).is_some_and(|summary| {
+        summary.record_count > 0
+            && summary.enriched_record_count >= summary.meaningful_enriched_record_threshold
+    })
+}
+
 fn annotate_snapshot_scope_from_extractor(
     snapshot: &mut GameSnapshot,
     extraction_mode: crate::ingest::SnapshotExtractionMode,
-    scope_note: Option<String>,
+    scope_hint: SnapshotExtractionScopeHint,
 ) {
     if !matches!(
         extraction_mode,
-        crate::ingest::SnapshotExtractionMode::PreparedAssetList
+        crate::ingest::SnapshotExtractionMode::ExtractorBackedAssetRecords
     ) {
         return;
     }
 
     let coverage = compute_scope_coverage(snapshot);
-    let prepared_note = scope_note.unwrap_or_else(|| {
-        "prepared asset-level records were ingested through the extractor seam".to_string()
+    let meaningful_content_coverage = scope_hint
+        .meaningful_content_coverage
+        .unwrap_or(coverage.content_like_path_count >= MIN_MEANINGFUL_CONTENT_PATH_COUNT);
+    let meaningful_character_coverage = scope_hint
+        .meaningful_character_coverage
+        .unwrap_or(coverage.character_path_count >= MIN_MEANINGFUL_CHARACTER_PATH_COUNT);
+    let meaningful_asset_record_enrichment = has_meaningful_asset_record_enrichment(snapshot);
+    let mut extractor_note = scope_hint.note.unwrap_or_else(|| {
+        "extractor-backed asset records were bridged into runtime snapshot acquisition".to_string()
     });
+    extractor_note.push_str(
+        "; snapshot uses richer extractor-backed asset records instead of shallow install/package inventory",
+    );
+    if let Some(extractor_context) = snapshot.context.extractor.as_ref() {
+        extractor_note.push_str(&format!(
+            "; records={} hashes={} source_context={} rich_metadata={}",
+            extractor_context.record_count,
+            extractor_context.records_with_hashes,
+            extractor_context.records_with_source_context,
+            extractor_context.records_with_rich_metadata
+        ));
+        if let Some(inventory_path) = extractor_context.inventory_path.as_deref() {
+            extractor_note.push_str(&format!("; inventory_path={inventory_path}"));
+        }
+    }
+    if let Some(summary) = summarize_asset_record_enrichment(snapshot) {
+        extractor_note.push_str(&format!(
+            "; enriched_records={}/{} threshold={}",
+            summary.enriched_record_count,
+            summary.record_count,
+            summary.meaningful_enriched_record_threshold
+        ));
+    }
+    if !(meaningful_content_coverage && meaningful_character_coverage) {
+        extractor_note.push_str(
+            ", but extracted coverage is still partial for deep character-level analysis",
+        );
+    }
+    if !meaningful_asset_record_enrichment {
+        extractor_note.push_str(
+            ", and current extractor records still preserve little asset-level enrichment beyond path identity across the full snapshot",
+        );
+    }
 
     snapshot.context.scope = SnapshotScopeContext {
+        acquisition_kind: Some(extraction_mode.acquisition_kind().to_string()),
         capture_mode: Some(extraction_mode.capture_mode().to_string()),
         mostly_install_or_package_level: Some(false),
-        meaningful_content_coverage: Some(coverage.content_like_path_count > 0),
-        meaningful_character_coverage: Some(coverage.character_path_count > 0),
+        meaningful_content_coverage: Some(meaningful_content_coverage),
+        meaningful_character_coverage: Some(meaningful_character_coverage),
+        meaningful_asset_record_enrichment: Some(meaningful_asset_record_enrichment),
         coverage,
-        note: Some(format!(
-            "{prepared_note}; snapshot is asset-level prepared input, not raw install/package inventory"
-        )),
+        note: Some(extractor_note.clone()),
     };
-    snapshot.context.notes.push(
-        "prepared asset-level snapshot created from externally extracted records".to_string(),
-    );
+    snapshot
+        .context
+        .notes
+        .push("extractor-backed runtime snapshot created from richer asset records".to_string());
+    snapshot.context.notes.push(extractor_note);
 }
 
 fn enrich_snapshot_from_game_root(
@@ -413,10 +637,20 @@ fn enrich_snapshot_from_game_root(
     match load_resource_manifest(source_root)? {
         Some((manifest_context, manifest_entries)) => {
             let mut matched_assets = 0usize;
+            let mut preserved_existing_hashes = 0usize;
+            let mut conflicting_existing_hashes = 0usize;
             for asset in &mut snapshot.assets {
                 if let Some(entry) = manifest_entries.get(&asset.path) {
-                    asset.hash_fields.asset_hash = Some(entry.md5.clone());
                     matched_assets += 1;
+                    match asset.hash_fields.asset_hash.as_deref() {
+                        None => asset.hash_fields.asset_hash = Some(entry.md5.clone()),
+                        Some(existing) if existing == entry.md5 => {
+                            preserved_existing_hashes += 1;
+                        }
+                        Some(_) => {
+                            conflicting_existing_hashes += 1;
+                        }
+                    }
                 }
             }
 
@@ -425,22 +659,38 @@ fn enrich_snapshot_from_game_root(
                 unmatched_snapshot_assets: snapshot.assets.len().saturating_sub(matched_assets),
                 ..manifest_context
             });
+            if preserved_existing_hashes > 0 || conflicting_existing_hashes > 0 {
+                notes.push(format!(
+                    "resource manifest matched {matched_assets} asset paths; preserved existing extractor asset_hash values for {} assets (conflicts: {})",
+                    preserved_existing_hashes + conflicting_existing_hashes,
+                    conflicting_existing_hashes
+                ));
+            }
         }
         None => notes.push("LocalGameResources.json not found; asset hashes were not enriched from launcher manifest".to_string()),
     }
 
-    snapshot.context.notes = notes;
+    snapshot.context.notes.extend(notes);
     Ok(())
 }
 
 const MIN_MEANINGFUL_CONTENT_PATH_COUNT: usize = 10;
 const MIN_MEANINGFUL_CHARACTER_PATH_COUNT: usize = 5;
+const MIN_FULLY_ENRICHED_SMALL_SNAPSHOT_RECORD_COUNT: usize = 3;
+const MIN_MEANINGFUL_ENRICHED_RECORD_COUNT: usize = 5;
+const MIN_MEANINGFUL_ENRICHED_RECORD_RATIO_NUMERATOR: usize = 2;
+const MIN_MEANINGFUL_ENRICHED_RECORD_RATIO_DENOMINATOR: usize = 5;
 
 pub fn assess_snapshot_scope(snapshot: &GameSnapshot) -> SnapshotScopeAssessment {
     let scope = &snapshot.context.scope;
+    let acquisition_kind = scope
+        .acquisition_kind
+        .clone()
+        .or_else(|| infer_acquisition_kind_from_capture_mode(scope.capture_mode.as_deref()));
     let has_explicit_scope_flags = scope.mostly_install_or_package_level.is_some()
         || scope.meaningful_content_coverage.is_some()
-        || scope.meaningful_character_coverage.is_some();
+        || scope.meaningful_character_coverage.is_some()
+        || scope.meaningful_asset_record_enrichment.is_some();
     let mut coverage = scope.coverage.clone();
     let mut observed_fallback_used = false;
 
@@ -460,15 +710,25 @@ pub fn assess_snapshot_scope(snapshot: &GameSnapshot) -> SnapshotScopeAssessment
     let meaningful_character_coverage = scope
         .meaningful_character_coverage
         .unwrap_or(coverage.character_path_count >= MIN_MEANINGFUL_CHARACTER_PATH_COUNT);
-    let mostly_install_or_package_level = scope
-        .mostly_install_or_package_level
-        .unwrap_or(!(meaningful_content_coverage && meaningful_character_coverage));
+    let meaningful_asset_record_enrichment = scope
+        .meaningful_asset_record_enrichment
+        .unwrap_or_else(|| has_meaningful_asset_record_enrichment(snapshot));
+    let mostly_install_or_package_level =
+        scope.mostly_install_or_package_level.unwrap_or_else(|| {
+            if acquisition_kind.as_deref() == Some("extractor_backed_asset_records") {
+                false
+            } else {
+                !(meaningful_content_coverage && meaningful_character_coverage)
+            }
+        });
 
     SnapshotScopeAssessment {
+        acquisition_kind,
         capture_mode: scope.capture_mode.clone(),
         mostly_install_or_package_level,
         meaningful_content_coverage,
         meaningful_character_coverage,
+        meaningful_asset_record_enrichment,
         coverage,
         note: scope.note.clone(),
         observed_fallback_used,
@@ -511,12 +771,17 @@ fn annotate_local_snapshot_scope(snapshot: &mut GameSnapshot) {
             capture_mode
         ));
     }
+    note.push_str(
+        "; this remains shallow filesystem inventory fallback and should be treated conservatively",
+    );
 
     snapshot.context.scope = SnapshotScopeContext {
+        acquisition_kind: Some("shallow_filesystem_inventory".to_string()),
         capture_mode: Some(capture_mode),
         mostly_install_or_package_level: Some(mostly_install_or_package_level),
         meaningful_content_coverage: Some(meaningful_content_coverage),
         meaningful_character_coverage: Some(meaningful_character_coverage),
+        meaningful_asset_record_enrichment: Some(false),
         coverage,
         note: Some(note.clone()),
     };
@@ -539,6 +804,18 @@ fn compute_scope_coverage(snapshot: &GameSnapshot) -> SnapshotCoverageSignals {
         content_like_path_count,
         character_path_count,
         non_content_path_count: snapshot.asset_count.saturating_sub(content_like_path_count),
+    }
+}
+
+fn infer_acquisition_kind_from_capture_mode(capture_mode: Option<&str>) -> Option<String> {
+    match capture_mode {
+        Some("extractor_backed_asset_records") | Some("prepared_asset_list_inventory") => {
+            Some("extractor_backed_asset_records".to_string())
+        }
+        Some(mode) if mode.starts_with("local_filesystem_inventory") => {
+            Some("shallow_filesystem_inventory".to_string())
+        }
+        _ => None,
     }
 }
 
@@ -815,11 +1092,19 @@ mod tests {
         assert_eq!(snapshot.version_id, "2.4.0");
         assert_eq!(snapshot.asset_count, 1);
         assert_eq!(
+            snapshot.context.scope.acquisition_kind.as_deref(),
+            Some("extractor_backed_asset_records")
+        );
+        assert_eq!(
             snapshot.context.scope.capture_mode.as_deref(),
-            Some("prepared_asset_list_inventory")
+            Some("extractor_backed_asset_records")
         );
         assert_eq!(
             snapshot.context.scope.mostly_install_or_package_level,
+            Some(false)
+        );
+        assert_eq!(
+            snapshot.context.scope.meaningful_asset_record_enrichment,
             Some(false)
         );
         assert!(
@@ -828,14 +1113,14 @@ mod tests {
                 .scope
                 .note
                 .as_deref()
-                .is_some_and(|note| note.contains("asset-level"))
+                .is_some_and(|note| note.contains("extractor-backed"))
         );
 
         let _ = fs::remove_dir_all(&test_root);
     }
 
     #[test]
-    fn prepared_asset_inventory_creates_richer_asset_level_snapshot() {
+    fn prepared_asset_inventory_preserves_asset_level_fields_even_when_sample_is_small() {
         let test_root = unique_test_dir();
         fs::create_dir_all(&test_root).expect("create test root");
         let inventory_path = test_root.join("prepared-assets.json");
@@ -846,7 +1131,9 @@ mod tests {
                 "context":{
                     "extraction_tool":"fixture-extractor",
                     "extraction_kind":"asset_records",
-                    "source_root":"D:/prepared"
+                    "source_root":"D:/prepared",
+                    "meaningful_content_coverage":true,
+                    "meaningful_character_coverage":true
                 },
                 "assets":[
                     {
@@ -884,8 +1171,12 @@ mod tests {
 
         assert_eq!(snapshot.asset_count, 1);
         assert_eq!(
+            snapshot.context.scope.acquisition_kind.as_deref(),
+            Some("extractor_backed_asset_records")
+        );
+        assert_eq!(
             snapshot.context.scope.capture_mode.as_deref(),
-            Some("prepared_asset_list_inventory")
+            Some("extractor_backed_asset_records")
         );
         assert_eq!(
             snapshot.context.scope.mostly_install_or_package_level,
@@ -899,14 +1190,14 @@ mod tests {
             snapshot.context.scope.meaningful_character_coverage,
             Some(true)
         );
-        assert!(
-            snapshot
-                .context
-                .scope
-                .note
-                .as_deref()
-                .is_some_and(|note| note.contains("fixture-extractor"))
+        assert_eq!(
+            snapshot.context.scope.meaningful_asset_record_enrichment,
+            Some(false)
         );
+        assert!(assess_snapshot_scope(&snapshot).is_low_signal_for_character_analysis());
+        assert!(snapshot.context.scope.note.as_deref().is_some_and(|note| {
+            note.contains("fixture-extractor") && note.contains("enriched_records=1/1")
+        }));
         assert_eq!(snapshot.assets[0].metadata.vertex_count, Some(120));
         assert_eq!(snapshot.assets[0].fingerprint.vertex_count, Some(120));
         assert_eq!(snapshot.assets[0].fingerprint.index_count, Some(240));
@@ -943,6 +1234,144 @@ mod tests {
         assert_eq!(
             snapshot.assets[0].source.container_path.as_deref(),
             Some("pakchunk0-WindowsNoEditor.pak")
+        );
+        assert_eq!(
+            snapshot
+                .context
+                .extractor
+                .as_ref()
+                .and_then(|context| context.inventory_path.clone()),
+            Some(inventory_path.to_string_lossy().replace('\\', "/"))
+        );
+        assert_eq!(
+            snapshot
+                .context
+                .extractor
+                .as_ref()
+                .map(|context| context.records_with_hashes),
+            Some(1)
+        );
+        assert_eq!(
+            snapshot
+                .context
+                .extractor
+                .as_ref()
+                .map(|context| context.records_with_source_context),
+            Some(1)
+        );
+        assert_eq!(
+            snapshot
+                .context
+                .extractor
+                .as_ref()
+                .map(|context| context.records_with_rich_metadata),
+            Some(1)
+        );
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[test]
+    fn partial_extractor_backed_snapshot_stays_low_signal_without_explicit_coverage_hints() {
+        let test_root = unique_test_dir();
+        fs::create_dir_all(&test_root).expect("create test root");
+        let inventory_path = test_root.join("prepared-assets.json");
+        fs::write(
+            &inventory_path,
+            r#"{
+                "schema_version":"whashreonator.prepared-assets.v1",
+                "context":{
+                    "extraction_tool":"fixture-extractor",
+                    "extraction_kind":"asset_records",
+                    "source_root":"D:/prepared"
+                },
+                "assets":[
+                    {
+                        "id":"mesh:encore:body",
+                        "path":"Content/Character/Encore/Body.mesh",
+                        "kind":"mesh",
+                        "metadata":{
+                            "logical_name":"Encore Body",
+                            "tags":["character","prepared"]
+                        },
+                        "hash_fields":{
+                            "asset_hash":"asset-md5"
+                        },
+                        "source":{
+                            "extraction_tool":"fixture-extractor",
+                            "source_root":"D:/prepared",
+                            "source_path":"Content/Character/Encore/Body.mesh",
+                            "source_kind":"mesh_record",
+                            "container_path":"pakchunk0-WindowsNoEditor.pak"
+                        }
+                    }
+                ]
+            }"#,
+        )
+        .expect("write prepared inventory");
+
+        let snapshot = create_prepared_snapshot_from_file("6.0.0", &test_root, &inventory_path)
+            .expect("snapshot");
+        let scope = assess_snapshot_scope(&snapshot);
+
+        assert_eq!(
+            scope.acquisition_kind.as_deref(),
+            Some("extractor_backed_asset_records")
+        );
+        assert!(!scope.mostly_install_or_package_level);
+        assert!(!scope.meaningful_content_coverage);
+        assert!(!scope.meaningful_character_coverage);
+        assert!(!scope.meaningful_asset_record_enrichment);
+        assert!(scope.is_low_signal_for_character_analysis());
+        assert!(
+            snapshot
+                .context
+                .scope
+                .note
+                .as_deref()
+                .is_some_and(|note| note.contains("enriched_records=1/1"))
+        );
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[test]
+    fn extractor_backed_path_only_records_stay_low_signal_even_with_broad_character_coverage() {
+        let test_root = unique_test_dir();
+        fs::create_dir_all(&test_root).expect("create test root");
+        let extractor = PreparedSnapshotAssetExtractor::new(
+            (0..12)
+                .map(|index| crate::domain::AssetRecord {
+                    id: format!("asset-{index}"),
+                    path: format!("Content/Character/Encore/Variant{index}.mesh"),
+                    kind: Some("mesh".to_string()),
+                    metadata: crate::domain::AssetMetadata::default(),
+                })
+                .map(Into::into)
+                .collect(),
+        )
+        .expect("build extractor");
+
+        let snapshot =
+            create_snapshot_with_extractor("6.2.0", &test_root, extractor).expect("snapshot");
+        let scope = assess_snapshot_scope(&snapshot);
+
+        assert_eq!(
+            scope.acquisition_kind.as_deref(),
+            Some("extractor_backed_asset_records")
+        );
+        assert!(!scope.mostly_install_or_package_level);
+        assert!(scope.meaningful_content_coverage);
+        assert!(scope.meaningful_character_coverage);
+        assert!(!scope.meaningful_asset_record_enrichment);
+        assert!(scope.is_low_signal_for_character_analysis());
+        assert!(
+            snapshot
+                .context
+                .scope
+                .note
+                .as_deref()
+                .is_some_and(|note| note.contains("preserve little asset-level enrichment"))
         );
 
         let _ = fs::remove_dir_all(&test_root);
@@ -1102,6 +1531,7 @@ mod tests {
         assert_eq!(scope.coverage.content_like_path_count, 1);
         assert_eq!(scope.coverage.character_path_count, 1);
         assert_eq!(scope.coverage.non_content_path_count, 1);
+        assert!(!scope.meaningful_asset_record_enrichment);
         assert!(scope.is_low_signal_for_character_analysis());
     }
 

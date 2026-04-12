@@ -101,6 +101,9 @@ pub struct PreparedAssetInventoryContext {
     pub extraction_kind: Option<String>,
     pub source_root: Option<String>,
     pub tags: Vec<String>,
+    pub meaningful_content_coverage: Option<bool>,
+    pub meaningful_character_coverage: Option<bool>,
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

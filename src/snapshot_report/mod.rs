@@ -114,14 +114,15 @@ fn render_markdown(
 
     lines.push("## Scope & Coverage".to_string());
     lines.push(
-        "| Version | Capture Mode | Scope | Content-like Paths | Character-like Paths | Non-content Paths | Note |"
+        "| Version | Acquisition | Capture Mode | Scope | Content-like Paths | Character-like Paths | Non-content Paths | Note |"
             .to_string(),
     );
-    lines.push("| --- | --- | --- | ---: | ---: | ---: | --- |".to_string());
+    lines.push("| --- | --- | --- | --- | ---: | ---: | ---: | --- |".to_string());
     for (snapshot, scope) in snapshots.iter().zip(scope_assessments.iter()) {
         lines.push(format!(
-            "| {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} |",
             md_cell(&snapshot.version_id),
+            md_cell(scope.acquisition_kind.as_deref().unwrap_or("-")),
             md_cell(scope.capture_mode.as_deref().unwrap_or("-")),
             scope_label(scope),
             scope.coverage.content_like_path_count,
@@ -137,7 +138,7 @@ fn render_markdown(
     for (snapshot, scope) in snapshots.iter().zip(scope_assessments.iter()) {
         if scope.is_low_signal_for_character_analysis() {
             low_signal_lines.push(format!(
-                "- {}: install/package-level or low-coverage snapshot; resonator-level and mapping-level interpretation can be incomplete.",
+                "- {}: shallow filesystem inventory or low-coverage/low-enrichment extractor snapshot; resonator-level and mapping-level interpretation can be incomplete.",
                 snapshot.version_id
             ));
         }
@@ -238,7 +239,7 @@ fn render_markdown(
             || new_scope.is_low_signal_for_character_analysis()
         {
             lines.push(
-                "Scope note: this pair includes install/package-level or low-coverage snapshots, so resonator-level and candidate-remap signals are limited."
+                "Scope note: this pair includes shallow filesystem inventory or low-coverage/low-enrichment extractor snapshots, so resonator-level and candidate-remap signals are limited."
                     .to_string(),
             );
         }
@@ -341,7 +342,10 @@ fn render_markdown(
 fn scope_label(scope: &SnapshotScopeAssessment) -> &'static str {
     if scope.mostly_install_or_package_level {
         "mostly install/package-level"
-    } else if scope.meaningful_content_coverage && scope.meaningful_character_coverage {
+    } else if scope.meaningful_content_coverage
+        && scope.meaningful_character_coverage
+        && scope.meaningful_asset_record_enrichment
+    {
         "content/character-oriented inventory"
     } else {
         "mixed or partial coverage"
@@ -563,7 +567,7 @@ mod tests {
         assert!(report.markdown.contains("## Version Summary"));
         assert!(report.markdown.contains("## Analysis Limitations"));
         assert!(report.markdown.contains(
-            "install/package-level or low-coverage snapshot; resonator-level and mapping-level interpretation can be incomplete."
+            "shallow filesystem inventory or low-coverage/low-enrichment extractor snapshot; resonator-level and mapping-level interpretation can be incomplete."
         ));
         assert!(report.markdown.contains(
             "Resonator matrix is still shown, but low-signal snapshots should be treated as inventory-level hints."
@@ -579,7 +583,7 @@ mod tests {
                 asset("Content/Character/Encore/Body.mesh", "encore body"),
                 asset("Content/Character/Encore/Hair.mesh", "encore hair"),
             ],
-            meaningful_scope("local asset-level inventory", 12, 6, 1),
+            meaningful_scope("extractor-backed asset records", 12, 6, 1),
         );
         let new_snapshot = sample_snapshot_with_scope(
             "4.1.0",
@@ -588,7 +592,7 @@ mod tests {
                 asset("Content/Character/Encore/Body.mesh", "encore body"),
                 asset("Content/Character/Camellya/Body.mesh", "camellya body"),
             ],
-            meaningful_scope("local asset-level inventory", 14, 7, 1),
+            meaningful_scope("extractor-backed asset records", 14, 7, 1),
         );
 
         let report = SnapshotReportRenderer
@@ -652,6 +656,7 @@ mod tests {
                     app_id: Some("50004".to_string()),
                 }),
                 resource_manifest: None,
+                extractor: None,
                 scope,
                 notes: Vec::new(),
             },
@@ -665,10 +670,12 @@ mod tests {
         non_content_path_count: usize,
     ) -> SnapshotScopeContext {
         SnapshotScopeContext {
+            acquisition_kind: Some("shallow_filesystem_inventory".to_string()),
             capture_mode: Some("local_filesystem_inventory".to_string()),
             mostly_install_or_package_level: Some(true),
             meaningful_content_coverage: Some(false),
             meaningful_character_coverage: Some(false),
+            meaningful_asset_record_enrichment: Some(false),
             coverage: SnapshotCoverageSignals {
                 content_like_path_count,
                 character_path_count,
@@ -685,10 +692,12 @@ mod tests {
         non_content_path_count: usize,
     ) -> SnapshotScopeContext {
         SnapshotScopeContext {
-            capture_mode: Some("local_filesystem_inventory".to_string()),
+            acquisition_kind: Some("extractor_backed_asset_records".to_string()),
+            capture_mode: Some("extractor_backed_asset_records".to_string()),
             mostly_install_or_package_level: Some(false),
             meaningful_content_coverage: Some(true),
             meaningful_character_coverage: Some(true),
+            meaningful_asset_record_enrichment: Some(true),
             coverage: SnapshotCoverageSignals {
                 content_like_path_count,
                 character_path_count,

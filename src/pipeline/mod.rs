@@ -2,6 +2,9 @@ use std::path::{Path, PathBuf};
 
 use tracing::info;
 
+use crate::wwmi::dependency::{
+    WwmiModDependencyProfile, load_mod_dependency_profile, scan_mod_dependency_profile,
+};
 use crate::{
     cli::{
         CompareSnapshotsArgs, ExtractWwmiKnowledgeArgs, GenerateProposalsArgs, InferFixesArgs,
@@ -32,7 +35,8 @@ use crate::{
     },
     report_storage::ReportStorage,
     snapshot::{
-        GameSnapshot, create_local_snapshot_with_capture_scope, create_prepared_snapshot_from_file,
+        GameSnapshot, create_extractor_backed_snapshot_from_file,
+        create_local_snapshot_with_capture_scope,
     },
     snapshot_report::{SnapshotInventoryReport, SnapshotReportRenderer, load_snapshots},
     validator::{ThresholdValidator, Validator},
@@ -79,7 +83,7 @@ pub struct ProposalResult {
 pub struct SnapshotCommandResult {
     pub snapshot: GameSnapshot,
     pub stored_snapshot_path: Option<PathBuf>,
-    pub stored_prepared_inventory_path: Option<PathBuf>,
+    pub stored_extractor_inventory_path: Option<PathBuf>,
 }
 
 impl SourceMapOutputs {
@@ -184,10 +188,10 @@ pub fn run_snapshot_command(args: &SnapshotArgs) -> AppResult<SnapshotCommandRes
         SnapshotCaptureScopeArg::Full
         | SnapshotCaptureScopeArg::Content
         | SnapshotCaptureScopeArg::Character => {
-            if let Some(prepared_inventory) = args.prepared_inventory.as_deref() {
+            if let Some(extractor_inventory) = args.extractor_inventory.as_deref() {
                 return Err(AppError::InvalidInput(format!(
-                    "--prepared-inventory {} requires --capture-scope prepared",
-                    prepared_inventory.display()
+                    "--extractor-inventory/--prepared-inventory {} requires --capture-scope extractor",
+                    extractor_inventory.display()
                 )));
             }
 
@@ -197,34 +201,35 @@ pub fn run_snapshot_command(args: &SnapshotArgs) -> AppResult<SnapshotCommandRes
                 to_local_capture_scope(args.capture_scope)?,
             )?
         }
-        SnapshotCaptureScopeArg::Prepared => {
-            let prepared_inventory = args.prepared_inventory.as_deref().ok_or_else(|| {
+        SnapshotCaptureScopeArg::Extractor => {
+            let extractor_inventory = args.extractor_inventory.as_deref().ok_or_else(|| {
                 AppError::InvalidInput(
-                    "snapshot --capture-scope prepared requires --prepared-inventory".to_string(),
+                    "snapshot --capture-scope extractor requires --extractor-inventory/--prepared-inventory"
+                        .to_string(),
                 )
             })?;
-            create_prepared_snapshot_from_file(
+            create_extractor_backed_snapshot_from_file(
                 &args.version_id,
                 args.source_root.as_path(),
-                prepared_inventory,
+                extractor_inventory,
             )?
         }
     };
     export_snapshot_output(&snapshot, args.output.as_path())?;
 
     let mut stored_snapshot_path = None;
-    let mut stored_prepared_inventory_path = None;
+    let mut stored_extractor_inventory_path = None;
     if args.store_in_report {
         let storage = match args.report_root.as_ref() {
             Some(root) => ReportStorage::new(root.clone()),
             None => ReportStorage::default(),
         };
         stored_snapshot_path = Some(storage.save_snapshot_for_version(&snapshot)?);
-        if let Some(prepared_inventory) = args.prepared_inventory.as_deref() {
-            stored_prepared_inventory_path =
-                Some(storage.save_prepared_inventory_input_for_version(
+        if let Some(extractor_inventory) = args.extractor_inventory.as_deref() {
+            stored_extractor_inventory_path =
+                Some(storage.save_extractor_inventory_input_for_version(
                     &snapshot.version_id,
-                    prepared_inventory,
+                    extractor_inventory,
                 )?);
         }
     }
@@ -239,7 +244,7 @@ pub fn run_snapshot_command(args: &SnapshotArgs) -> AppResult<SnapshotCommandRes
     Ok(SnapshotCommandResult {
         snapshot,
         stored_snapshot_path,
-        stored_prepared_inventory_path,
+        stored_extractor_inventory_path,
     })
 }
 
@@ -248,8 +253,8 @@ fn to_local_capture_scope(value: SnapshotCaptureScopeArg) -> AppResult<LocalSnap
         SnapshotCaptureScopeArg::Full => Ok(LocalSnapshotCaptureScope::FullInventory),
         SnapshotCaptureScopeArg::Content => Ok(LocalSnapshotCaptureScope::ContentFocused),
         SnapshotCaptureScopeArg::Character => Ok(LocalSnapshotCaptureScope::CharacterFocused),
-        SnapshotCaptureScopeArg::Prepared => Err(AppError::InvalidInput(
-            "prepared capture does not map to local filesystem capture scope".to_string(),
+        SnapshotCaptureScopeArg::Extractor => Err(AppError::InvalidInput(
+            "extractor-backed capture does not map to local filesystem capture scope".to_string(),
         )),
     }
 }
@@ -327,8 +332,13 @@ pub fn run_infer_fixes_command(args: &InferFixesArgs) -> AppResult<InferenceRepo
     let compare_report = load_snapshot_compare_report(args.compare_report.as_path())?;
     let knowledge = load_wwmi_knowledge(args.wwmi_knowledge.as_path())?;
     let continuity = resolve_inference_continuity(args, &compare_report)?;
-    let report =
-        FixInferenceEngine.infer_with_continuity(&compare_report, &knowledge, continuity.as_ref());
+    let mod_dependency_profile = resolve_inference_mod_dependency_profile(args)?;
+    let report = FixInferenceEngine.infer_with_continuity_and_mod_profile(
+        &compare_report,
+        &knowledge,
+        continuity.as_ref(),
+        mod_dependency_profile.as_ref(),
+    );
     export_inference_output(&report, args.output.as_path())?;
     info!(
         output = %args.output.display(),
@@ -360,6 +370,27 @@ fn resolve_inference_continuity(
         &compare_report.old_snapshot.version_id,
         &compare_report.new_snapshot.version_id,
     )
+}
+
+fn resolve_inference_mod_dependency_profile(
+    args: &InferFixesArgs,
+) -> AppResult<Option<WwmiModDependencyProfile>> {
+    if args.mod_root.is_some() && args.mod_dependency_profile.is_some() {
+        return Err(AppError::InvalidInput(
+            "infer-fixes accepts either --mod-root or --mod-dependency-profile, not both"
+                .to_string(),
+        ));
+    }
+
+    if let Some(path) = args.mod_dependency_profile.as_deref() {
+        return Ok(Some(load_mod_dependency_profile(path)?));
+    }
+
+    if let Some(path) = args.mod_root.as_deref() {
+        return Ok(Some(scan_mod_dependency_profile(path)?));
+    }
+
+    Ok(None)
 }
 
 pub fn run_generate_proposals_command(args: &GenerateProposalsArgs) -> AppResult<ProposalResult> {

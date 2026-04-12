@@ -18,7 +18,11 @@ use crate::{
         VersionContinuityIndex, VersionContinuityObservation, VersionContinuityRelation,
         VersionContinuityThread, VersionContinuityThreadSummary,
     },
-    wwmi::{WwmiKnowledgeBase, WwmiPatternKind, load_wwmi_knowledge},
+    wwmi::{
+        WwmiKnowledgeBase, WwmiPatternKind,
+        dependency::{WwmiModDependencyKind, WwmiModDependencyProfile},
+        load_wwmi_knowledge,
+    },
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -27,6 +31,8 @@ pub struct InferenceReport {
     pub generated_at_unix_ms: u128,
     pub compare_input: InferenceCompareInput,
     pub knowledge_input: InferenceKnowledgeInput,
+    #[serde(default)]
+    pub mod_dependency_input: Option<InferenceModDependencyInput>,
     #[serde(default)]
     pub scope: InferenceScopeContext,
     pub summary: InferenceSummary,
@@ -60,6 +66,16 @@ pub struct InferenceKnowledgeInput {
     pub analyzed_commits: usize,
     pub fix_like_commits: usize,
     pub discovered_patterns: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct InferenceModDependencyInput {
+    pub mod_name: Option<String>,
+    pub mod_root: String,
+    pub ini_file_count: usize,
+    pub signal_count: usize,
+    pub dependency_kinds: Vec<WwmiModDependencyKind>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -170,6 +186,24 @@ struct ContinuitySignal {
     review_required: bool,
 }
 
+#[derive(Debug, Clone)]
+struct ModDependencyInsights {
+    input: InferenceModDependencyInput,
+    mapping_hash: Option<ModDependencySurfaceSummary>,
+    buffer_layout: Option<ModDependencySurfaceSummary>,
+    resource_or_skeleton: Option<ModDependencySurfaceSummary>,
+    hook_targeting: Option<ModDependencySurfaceSummary>,
+}
+
+#[derive(Debug, Clone)]
+struct ModDependencySurfaceSummary {
+    dependency_kinds: Vec<WwmiModDependencyKind>,
+    signal_count: usize,
+    source_files: Vec<String>,
+    sections: Vec<String>,
+    label: &'static str,
+}
+
 impl FixInferenceEngine {
     pub fn infer_files(
         &self,
@@ -186,7 +220,7 @@ impl FixInferenceEngine {
         compare_report: &SnapshotCompareReport,
         wwmi_knowledge: &WwmiKnowledgeBase,
     ) -> InferenceReport {
-        self.infer_with_continuity(compare_report, wwmi_knowledge, None)
+        self.infer_with_continuity_and_mod_profile(compare_report, wwmi_knowledge, None, None)
     }
 
     pub fn infer_with_continuity(
@@ -195,7 +229,18 @@ impl FixInferenceEngine {
         wwmi_knowledge: &WwmiKnowledgeBase,
         continuity: Option<&VersionContinuityIndex>,
     ) -> InferenceReport {
-        let scope = build_inference_scope_context(compare_report);
+        self.infer_with_continuity_and_mod_profile(compare_report, wwmi_knowledge, continuity, None)
+    }
+
+    pub fn infer_with_continuity_and_mod_profile(
+        &self,
+        compare_report: &SnapshotCompareReport,
+        wwmi_knowledge: &WwmiKnowledgeBase,
+        continuity: Option<&VersionContinuityIndex>,
+        mod_dependency_profile: Option<&WwmiModDependencyProfile>,
+    ) -> InferenceReport {
+        let mod_dependency = mod_dependency_profile.map(build_mod_dependency_insights);
+        let scope = build_inference_scope_context(compare_report, mod_dependency.as_ref());
         let confidence_scale = if scope.low_signal_compare { 0.85 } else { 1.0 };
         let continuity_context =
             continuity.map(|index| build_inference_continuity_context(compare_report, index));
@@ -744,6 +789,20 @@ impl FixInferenceEngine {
             );
         }
 
+        if let Some(mod_dependency) = mod_dependency.as_ref() {
+            apply_mod_dependency_inference_adjustments(
+                &mut probable_crash_causes,
+                &mut suggested_fixes,
+                &mut candidate_mapping_hints,
+                compare_report,
+                mod_dependency,
+                mapping_support,
+                buffer_support,
+                runtime_support,
+                confidence_scale,
+            );
+        }
+
         candidate_mapping_hints.sort_by(|left, right| {
             right
                 .confidence
@@ -788,6 +847,7 @@ impl FixInferenceEngine {
                 fix_like_commits: wwmi_knowledge.summary.fix_like_commits,
                 discovered_patterns: wwmi_knowledge.summary.discovered_patterns,
             },
+            mod_dependency_input: mod_dependency.as_ref().map(|value| value.input.clone()),
             scope,
             summary: InferenceSummary {
                 probable_crash_causes: probable_crash_causes.len(),
@@ -805,6 +865,94 @@ impl FixInferenceEngine {
 pub fn load_inference_report(path: &Path) -> AppResult<InferenceReport> {
     let content = fs::read_to_string(path)?;
     Ok(serde_json::from_str(&content)?)
+}
+
+fn build_mod_dependency_insights(profile: &WwmiModDependencyProfile) -> ModDependencyInsights {
+    ModDependencyInsights {
+        input: InferenceModDependencyInput {
+            mod_name: profile.mod_name.clone(),
+            mod_root: profile.mod_root.clone(),
+            ini_file_count: profile.ini_file_count,
+            signal_count: profile.signals.len(),
+            dependency_kinds: profile.kinds().into_iter().collect(),
+        },
+        mapping_hash: build_mod_dependency_surface_summary(
+            profile,
+            &[
+                WwmiModDependencyKind::TextureOverrideHash,
+                WwmiModDependencyKind::ResourceFileReference,
+            ],
+            "mapping/hash-sensitive",
+        ),
+        buffer_layout: build_mod_dependency_surface_summary(
+            profile,
+            &[
+                WwmiModDependencyKind::BufferLayoutHint,
+                WwmiModDependencyKind::MeshVertexCount,
+                WwmiModDependencyKind::ShapeKeyVertexCount,
+            ],
+            "buffer/layout-sensitive",
+        ),
+        resource_or_skeleton: build_mod_dependency_surface_summary(
+            profile,
+            &[
+                WwmiModDependencyKind::ResourceFileReference,
+                WwmiModDependencyKind::SkeletonMergeDependency,
+            ],
+            "resource/skeleton-sensitive",
+        ),
+        hook_targeting: build_mod_dependency_surface_summary(
+            profile,
+            &[
+                WwmiModDependencyKind::ObjectGuid,
+                WwmiModDependencyKind::DrawCallTarget,
+                WwmiModDependencyKind::FilterIndex,
+            ],
+            "hook-targeting-sensitive",
+        ),
+    }
+}
+
+fn build_mod_dependency_surface_summary(
+    profile: &WwmiModDependencyProfile,
+    kinds: &[WwmiModDependencyKind],
+    label: &'static str,
+) -> Option<ModDependencySurfaceSummary> {
+    let matched = profile
+        .signals
+        .iter()
+        .filter(|signal| kinds.contains(&signal.kind))
+        .collect::<Vec<_>>();
+    if matched.is_empty() {
+        return None;
+    }
+
+    let dependency_kinds = matched
+        .iter()
+        .map(|signal| signal.kind.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let source_files = matched
+        .iter()
+        .map(|signal| signal.source_file.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let sections = matched
+        .iter()
+        .filter_map(|signal| signal.section.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+
+    Some(ModDependencySurfaceSummary {
+        dependency_kinds,
+        signal_count: matched.len(),
+        source_files,
+        sections,
+        label,
+    })
 }
 
 fn is_structural_change(change: &SnapshotAssetChange) -> bool {
@@ -956,13 +1104,29 @@ fn infer_mapping_hint(
     }
 }
 
-fn build_inference_scope_context(compare_report: &SnapshotCompareReport) -> InferenceScopeContext {
+fn build_inference_scope_context(
+    compare_report: &SnapshotCompareReport,
+    mod_dependency: Option<&ModDependencyInsights>,
+) -> InferenceScopeContext {
     let mut notes = compare_report.scope.notes.clone();
     if compare_report.scope.low_signal_compare {
         notes.push(
             "inference confidence is conservative because compare scope is low-signal for deep character-level analysis"
                 .to_string(),
         );
+    }
+    if let Some(mod_dependency) = mod_dependency {
+        notes.push(format!(
+            "mod dependency profile {} scanned {} ini file(s), {} signal(s), dependency kinds={}",
+            mod_dependency
+                .input
+                .mod_name
+                .as_deref()
+                .unwrap_or(mod_dependency.input.mod_root.as_str()),
+            mod_dependency.input.ini_file_count,
+            mod_dependency.input.signal_count,
+            join_dependency_kind_labels(&mod_dependency.input.dependency_kinds)
+        ));
     }
 
     InferenceScopeContext {
@@ -976,6 +1140,482 @@ fn build_inference_scope_context(compare_report: &SnapshotCompareReport) -> Infe
             .new_snapshot
             .low_signal_for_character_analysis,
         notes,
+    }
+}
+
+fn apply_mod_dependency_inference_adjustments(
+    probable_crash_causes: &mut Vec<ProbableCrashCause>,
+    suggested_fixes: &mut Vec<SuggestedFix>,
+    candidate_mapping_hints: &mut Vec<InferredMappingHint>,
+    compare_report: &SnapshotCompareReport,
+    mod_dependency: &ModDependencyInsights,
+    mapping_support: f32,
+    buffer_support: f32,
+    runtime_support: f32,
+    confidence_scale: f32,
+) {
+    if let Some(surface) = mod_dependency.mapping_hash.as_ref() {
+        for code in [
+            "asset_paths_or_mapping_shifted",
+            "asset_removed_without_clear_replacement",
+            "asset_signature_or_hash_changed",
+            "candidate_remap_identity_conflict",
+            "candidate_remap_insufficient_evidence",
+        ] {
+            if let Some(cause) = probable_crash_causes
+                .iter_mut()
+                .find(|cause| cause.code == code)
+            {
+                cause.confidence = (cause.confidence + 0.05).clamp(0.0, 1.0);
+                push_unique(
+                    &mut cause.reasons,
+                    format!(
+                        "mod_dependency_surface: this mod uses {} surfaces, so mapping/hash change evidence is more repair-relevant here",
+                        surface.label
+                    ),
+                );
+                append_surface_evidence(
+                    &mut cause.evidence,
+                    surface,
+                    "mod-side ini files already depend on hash/resource-driven targeting",
+                );
+            }
+        }
+        for code in [
+            "review_candidate_asset_remaps",
+            "inspect_identity_conflicts_before_remap",
+            "gather_stronger_asset_evidence",
+        ] {
+            if let Some(fix) = suggested_fixes.iter_mut().find(|fix| fix.code == code) {
+                fix.confidence = (fix.confidence + 0.05).clamp(0.0, 1.0);
+                push_unique(
+                    &mut fix.reasons,
+                    format!(
+                        "mod_dependency_surface: this mod uses {} surfaces, so mapping/hash repair paths deserve stronger priority",
+                        surface.label
+                    ),
+                );
+                if code == "review_candidate_asset_remaps" {
+                    push_unique(
+                        &mut fix.actions,
+                        "Start with texture/resource override sections from the mod dependency profile before broad asset browsing."
+                            .to_string(),
+                    );
+                }
+                append_surface_evidence(
+                    &mut fix.evidence,
+                    surface,
+                    "mod-side dependency profile points at mapping/hash-sensitive repair touchpoints",
+                );
+            }
+        }
+    }
+
+    if let Some(surface) = mod_dependency.buffer_layout.as_ref() {
+        for code in [
+            "buffer_layout_changed",
+            "candidate_remap_structural_drift",
+            "asset_signature_or_hash_changed",
+        ] {
+            if let Some(cause) = probable_crash_causes
+                .iter_mut()
+                .find(|cause| cause.code == code)
+            {
+                cause.confidence = (cause.confidence + 0.06).clamp(0.0, 1.0);
+                push_unique(
+                    &mut cause.reasons,
+                    format!(
+                        "mod_dependency_surface: this mod uses {} surfaces, so structural drift is directly repair-relevant",
+                        surface.label
+                    ),
+                );
+                append_surface_evidence(
+                    &mut cause.evidence,
+                    surface,
+                    "mod-side ini files already encode buffer/layout assumptions",
+                );
+            }
+        }
+        for code in [
+            "review_buffer_layout_and_runtime_guards",
+            "validate_candidate_remaps_against_layout",
+        ] {
+            if let Some(fix) = suggested_fixes.iter_mut().find(|fix| fix.code == code) {
+                fix.confidence = (fix.confidence + 0.06).clamp(0.0, 1.0);
+                push_unique(
+                    &mut fix.reasons,
+                    format!(
+                        "mod_dependency_surface: this mod uses {} surfaces, so layout-sensitive fixes should be inspected first",
+                        surface.label
+                    ),
+                );
+                push_unique(
+                    &mut fix.actions,
+                    "Cross-check the mod's override stride/count/layout sections before approving any remap or runtime guard."
+                        .to_string(),
+                );
+                append_surface_evidence(
+                    &mut fix.evidence,
+                    surface,
+                    "mod-side dependency profile points at buffer/layout-sensitive hooks",
+                );
+            }
+        }
+    }
+
+    if let Some(surface) = mod_dependency.resource_or_skeleton.as_ref() {
+        let affected_assets = resource_or_skeleton_affected_assets(compare_report);
+        if !affected_assets.is_empty() {
+            probable_crash_causes.push(ProbableCrashCause {
+                code: "mod_resource_or_skeleton_surface_changed".to_string(),
+                summary: "The mod depends on skeleton/resource reference surfaces, and compare evidence suggests those surfaces moved or changed.".to_string(),
+                confidence: (0.46 + 0.18 * buffer_support + 0.14 * runtime_support)
+                    .clamp(0.0, 1.0)
+                    * confidence_scale,
+                risk: RiskLevel::High,
+                affected_assets: affected_assets.clone(),
+                related_patterns: vec![
+                    WwmiPatternKind::BufferLayoutOrCapacityFix,
+                    WwmiPatternKind::RuntimeConfigChange,
+                    WwmiPatternKind::MappingOrHashUpdate,
+                ],
+                reasons: vec![format!(
+                    "mod_dependency_surface: this mod uses {} surfaces and compare evidence shows related movement/drift",
+                    surface.label
+                )],
+                evidence: surface_evidence(
+                    surface,
+                    "resource/container/skeleton signals changed on game-side assets that this mod style commonly touches",
+                ),
+            });
+            suggested_fixes.push(SuggestedFix {
+                code: "review_resource_and_skeleton_bindings".to_string(),
+                summary: "Review resource references, skeleton merge bindings, and moved package/context surfaces before trusting remaps.".to_string(),
+                confidence: (0.45 + 0.15 * buffer_support + 0.10 * mapping_support)
+                    .clamp(0.0, 1.0)
+                    * confidence_scale,
+                priority: RiskLevel::High,
+                related_patterns: vec![
+                    WwmiPatternKind::BufferLayoutOrCapacityFix,
+                    WwmiPatternKind::RuntimeConfigChange,
+                    WwmiPatternKind::MappingOrHashUpdate,
+                ],
+                actions: vec![
+                    "Inspect resource filename references and merged-skeleton related ini sections first."
+                        .to_string(),
+                    "Verify container/source-kind movement and skeleton presence markers before promoting a remap."
+                        .to_string(),
+                ],
+                reasons: vec![format!(
+                    "mod_dependency_surface: this mod uses {} surfaces, so resource/skeleton drift is a first-pass review target",
+                    surface.label
+                )],
+                evidence: surface_evidence(
+                    surface,
+                    "mod-side dependency profile includes resource references or skeleton merge hooks",
+                ),
+            });
+        }
+    }
+
+    if let Some(surface) = mod_dependency.hook_targeting.as_ref()
+        && has_hook_targeting_review_surface(compare_report)
+    {
+        probable_crash_causes.push(ProbableCrashCause {
+            code: "mod_hook_targeting_surface_requires_manual_review".to_string(),
+            summary: "This mod uses draw-call/filter/object-guid targeting, so plausible remaps still need manual hook revalidation.".to_string(),
+            confidence: (0.42 + 0.18 * mapping_support).clamp(0.0, 1.0) * confidence_scale,
+            risk: RiskLevel::Medium,
+            affected_assets: hint_paths(candidate_mapping_hints),
+            related_patterns: vec![
+                WwmiPatternKind::MappingOrHashUpdate,
+                WwmiPatternKind::RuntimeConfigChange,
+            ],
+            reasons: vec![format!(
+                "mod_dependency_surface: this mod uses {} surfaces that stay review-first even when compare candidates look plausible",
+                surface.label
+            )],
+            evidence: surface_evidence(
+                surface,
+                "hook-targeting ini sections often need manual retargeting beyond asset remap confidence",
+            ),
+        });
+        suggested_fixes.push(SuggestedFix {
+            code: "review_draw_call_and_filter_hooks_before_remap".to_string(),
+            summary: "Review draw-call/filter/object-guid hook sections before promoting any mapping candidate.".to_string(),
+            confidence: (0.44 + 0.15 * mapping_support).clamp(0.0, 1.0) * confidence_scale,
+            priority: RiskLevel::High,
+            related_patterns: vec![
+                WwmiPatternKind::MappingOrHashUpdate,
+                WwmiPatternKind::RuntimeConfigChange,
+            ],
+            actions: vec![
+                "Start with match_first_index/match_index_count/filter_index/object_guid sections from the mod dependency profile."
+                    .to_string(),
+                "Keep remaps in manual review until hook targeting is revalidated on real runtime behavior."
+                    .to_string(),
+            ],
+            reasons: vec![format!(
+                "mod_dependency_surface: this mod uses {} surfaces, so remap promotion should stay review-first",
+                surface.label
+            )],
+            evidence: surface_evidence(
+                surface,
+                "draw-call/filter/object-guid targeting is present in the scanned mod ini files",
+            ),
+        });
+    }
+
+    for hint in candidate_mapping_hints {
+        if let Some(surface) = mod_dependency.mapping_hash.as_ref() {
+            if has_reason_code(&hint.reasons, "asset_hash_exact")
+                || has_reason_code(&hint.reasons, "signature_exact")
+            {
+                hint.confidence = (hint.confidence + 0.03).clamp(0.0, 1.0);
+                push_unique(
+                    &mut hint.reasons,
+                    format!(
+                        "mod_dependency_surface: this mod uses {} surfaces, so this hash/identity-aligned remap is more repair-relevant",
+                        surface.label
+                    ),
+                );
+                append_surface_evidence(
+                    &mut hint.evidence,
+                    surface,
+                    "texture/resource override sections provide a direct reviewer entry point for this remap",
+                );
+            }
+        }
+
+        if let Some(surface) = mod_dependency.buffer_layout.as_ref()
+            && (hint.compatibility == RemapCompatibility::StructurallyRisky
+                || has_reason_code(&hint.reasons, "same_asset_but_structural_drift")
+                || has_reason_code(&hint.reasons, "buffer_layout_validation_needed"))
+        {
+            hint.confidence = (hint.confidence - 0.06).clamp(0.0, 1.0);
+            push_unique(
+                &mut hint.reasons,
+                format!(
+                    "mod_dependency_review_first: this mod uses {} surfaces, so structurally drifted remaps stay review-first",
+                    surface.label
+                ),
+            );
+            append_surface_evidence(
+                &mut hint.evidence,
+                surface,
+                "buffer/layout-sensitive mod hooks raise the cost of a wrong remap",
+            );
+        }
+
+        if let Some(surface) = mod_dependency.resource_or_skeleton.as_ref()
+            && is_resource_or_skeleton_hint(hint)
+        {
+            hint.confidence = (hint.confidence - 0.03).clamp(0.0, 1.0);
+            push_unique(
+                &mut hint.reasons,
+                format!(
+                    "mod_dependency_review_first: this mod uses {} surfaces, so container/resource/skeleton movement stays review-first",
+                    surface.label
+                ),
+            );
+            append_surface_evidence(
+                &mut hint.evidence,
+                surface,
+                "resource references or skeleton merge hooks are present in the mod dependency profile",
+            );
+        }
+
+        if let Some(surface) = mod_dependency.hook_targeting.as_ref() {
+            hint.confidence = (hint.confidence - 0.07).clamp(0.0, 1.0);
+            hint.compatibility = downgrade_hook_targeting_compatibility(hint.compatibility.clone());
+            push_unique(
+                &mut hint.reasons,
+                format!(
+                    "mod_dependency_review_first: this mod uses {} surfaces, so even plausible remaps require manual hook revalidation",
+                    surface.label
+                ),
+            );
+            append_surface_evidence(
+                &mut hint.evidence,
+                surface,
+                "draw-call/filter/object-guid hooks can break independently of asset similarity",
+            );
+        }
+    }
+}
+
+fn resource_or_skeleton_affected_assets(compare_report: &SnapshotCompareReport) -> Vec<String> {
+    let changed_assets = compare_report
+        .changed_assets
+        .iter()
+        .filter(|change| {
+            change.changed_fields.iter().any(|field| {
+                matches!(
+                    field.as_str(),
+                    "container_path"
+                        | "source_kind"
+                        | "internal_structure.binding_targets"
+                        | "internal_structure.subresource_roles"
+                        | "internal_structure.has_skeleton"
+                        | "internal_structure.has_shapekey_data"
+                )
+            })
+        })
+        .filter_map(|change| change.new_asset.as_ref().or(change.old_asset.as_ref()))
+        .map(|asset| asset.path.clone());
+    let candidate_assets = compare_report
+        .candidate_mapping_changes
+        .iter()
+        .filter(|candidate| is_resource_or_skeleton_candidate(candidate))
+        .flat_map(|candidate| {
+            [
+                candidate.old_asset.path.clone(),
+                candidate.new_asset.path.clone(),
+            ]
+        });
+
+    changed_assets
+        .chain(candidate_assets)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn is_resource_or_skeleton_candidate(candidate: &CandidateMappingChange) -> bool {
+    [
+        "container_path_exact",
+        "container_path_mismatch",
+        "source_kind_exact",
+        "source_kind_mismatch",
+        "internal_binding_targets_exact",
+        "internal_binding_targets_overlap",
+        "internal_binding_targets_mismatch",
+        "internal_subresource_roles_exact",
+        "internal_subresource_roles_overlap",
+        "internal_subresource_roles_mismatch",
+        "internal_skeleton_presence_exact",
+        "internal_skeleton_presence_mismatch",
+    ]
+    .iter()
+    .any(|code| candidate_has_reason_code(candidate, code))
+}
+
+fn is_resource_or_skeleton_hint(hint: &InferredMappingHint) -> bool {
+    [
+        "container_path_exact",
+        "container_path_mismatch",
+        "source_kind_exact",
+        "source_kind_mismatch",
+        "internal_binding_targets_exact",
+        "internal_binding_targets_overlap",
+        "internal_binding_targets_mismatch",
+        "internal_subresource_roles_exact",
+        "internal_subresource_roles_overlap",
+        "internal_subresource_roles_mismatch",
+        "internal_skeleton_presence_exact",
+        "internal_skeleton_presence_mismatch",
+    ]
+    .iter()
+    .any(|code| has_reason_code(&hint.reasons, code))
+}
+
+fn has_hook_targeting_review_surface(compare_report: &SnapshotCompareReport) -> bool {
+    !compare_report.candidate_mapping_changes.is_empty()
+        || !compare_report.removed_assets.is_empty()
+        || compare_report.changed_assets.iter().any(|change| {
+            change.changed_fields.iter().any(|field| {
+                matches!(
+                    field.as_str(),
+                    "asset_hash" | "shader_hash" | "signature" | "container_path" | "source_kind"
+                )
+            })
+        })
+}
+
+fn hint_paths(hints: &[InferredMappingHint]) -> Vec<String> {
+    hints
+        .iter()
+        .flat_map(|hint| [hint.old_asset_path.clone(), hint.new_asset_path.clone()])
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn downgrade_hook_targeting_compatibility(compatibility: RemapCompatibility) -> RemapCompatibility {
+    match compatibility {
+        RemapCompatibility::LikelyCompatible => RemapCompatibility::CompatibleWithCaution,
+        other => other,
+    }
+}
+
+fn append_surface_evidence(
+    evidence: &mut Vec<String>,
+    surface: &ModDependencySurfaceSummary,
+    detail: &str,
+) {
+    for item in surface_evidence(surface, detail) {
+        push_unique(evidence, item);
+    }
+}
+
+fn surface_evidence(surface: &ModDependencySurfaceSummary, detail: &str) -> Vec<String> {
+    let mut evidence = vec![format!(
+        "{detail}; matched dependency kinds={} across {} signal(s)",
+        join_dependency_kind_labels(&surface.dependency_kinds),
+        surface.signal_count
+    )];
+    if !surface.source_files.is_empty() {
+        evidence.push(format!(
+            "mod dependency files: {}",
+            surface
+                .source_files
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if !surface.sections.is_empty() {
+        evidence.push(format!(
+            "mod dependency sections: {}",
+            surface
+                .sections
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    evidence
+}
+
+fn join_dependency_kind_labels(kinds: &[WwmiModDependencyKind]) -> String {
+    kinds
+        .iter()
+        .map(mod_dependency_kind_label)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn mod_dependency_kind_label(kind: &WwmiModDependencyKind) -> &'static str {
+    match kind {
+        WwmiModDependencyKind::ObjectGuid => "object_guid",
+        WwmiModDependencyKind::DrawCallTarget => "draw_call_target",
+        WwmiModDependencyKind::TextureOverrideHash => "texture_override_hash",
+        WwmiModDependencyKind::ResourceFileReference => "resource_file_reference",
+        WwmiModDependencyKind::MeshVertexCount => "mesh_vertex_count",
+        WwmiModDependencyKind::ShapeKeyVertexCount => "shapekey_vertex_count",
+        WwmiModDependencyKind::BufferLayoutHint => "buffer_layout_hint",
+        WwmiModDependencyKind::SkeletonMergeDependency => "skeleton_merge_dependency",
+        WwmiModDependencyKind::FilterIndex => "filter_index",
+    }
+}
+
+fn push_unique(target: &mut Vec<String>, value: String) {
+    if !target.contains(&value) {
+        target.push(value);
     }
 }
 
@@ -1831,6 +2471,13 @@ fn reason_to_string(reason: &SnapshotCompareReason) -> String {
     format!("{}: {}", reason.code, reason.message)
 }
 
+fn has_reason_code(reasons: &[String], code: &str) -> bool {
+    let prefix = format!("{code}:");
+    reasons
+        .iter()
+        .any(|reason| reason.trim() == code || reason.trim_start().starts_with(&prefix))
+}
+
 fn candidate_has_reason_code(candidate: &CandidateMappingChange, code: &str) -> bool {
     candidate.reasons.iter().any(|reason| reason.code == code)
 }
@@ -2133,10 +2780,12 @@ mod tests {
             },
             scope: SnapshotCompareScopeContext {
                 old_snapshot: SnapshotCompareScopeInfo {
+                    acquisition_kind: Some("shallow_filesystem_inventory".to_string()),
                     capture_mode: Some("local_filesystem_inventory".to_string()),
                     mostly_install_or_package_level: true,
                     meaningful_content_coverage: false,
                     meaningful_character_coverage: false,
+                    meaningful_asset_record_enrichment: false,
                     content_like_path_count: 1,
                     character_path_count: 0,
                     non_content_path_count: 2,
@@ -2144,10 +2793,12 @@ mod tests {
                     note: Some("install-level snapshot".to_string()),
                 },
                 new_snapshot: SnapshotCompareScopeInfo {
+                    acquisition_kind: Some("shallow_filesystem_inventory".to_string()),
                     capture_mode: Some("local_filesystem_inventory".to_string()),
                     mostly_install_or_package_level: true,
                     meaningful_content_coverage: false,
                     meaningful_character_coverage: false,
+                    meaningful_asset_record_enrichment: false,
                     content_like_path_count: 1,
                     character_path_count: 0,
                     non_content_path_count: 3,
@@ -2298,10 +2949,12 @@ mod tests {
             },
             scope: SnapshotCompareScopeContext {
                 old_snapshot: SnapshotCompareScopeInfo {
+                    acquisition_kind: Some("shallow_filesystem_inventory".to_string()),
                     capture_mode: Some("local_filesystem_inventory".to_string()),
                     mostly_install_or_package_level: true,
                     meaningful_content_coverage: false,
                     meaningful_character_coverage: false,
+                    meaningful_asset_record_enrichment: false,
                     content_like_path_count: 2,
                     character_path_count: 1,
                     non_content_path_count: 2,
@@ -2309,10 +2962,12 @@ mod tests {
                     note: Some("legacy low-signal snapshot".to_string()),
                 },
                 new_snapshot: SnapshotCompareScopeInfo {
+                    acquisition_kind: Some("shallow_filesystem_inventory".to_string()),
                     capture_mode: Some("local_filesystem_inventory".to_string()),
                     mostly_install_or_package_level: true,
                     meaningful_content_coverage: false,
                     meaningful_character_coverage: false,
+                    meaningful_asset_record_enrichment: false,
                     content_like_path_count: 2,
                     character_path_count: 1,
                     non_content_path_count: 2,

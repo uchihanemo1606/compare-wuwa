@@ -141,6 +141,14 @@ impl ProposalEngine {
                     | "validate_candidate_remaps_against_layout"
             )
         });
+        let resource_fix_available = report
+            .suggested_fixes
+            .iter()
+            .any(|fix| fix.code == "review_resource_and_skeleton_bindings");
+        let hook_fix_available = report
+            .suggested_fixes
+            .iter()
+            .any(|fix| fix.code == "review_draw_call_and_filter_hooks_before_remap");
 
         let mut mappings = report
             .candidate_mapping_hints
@@ -149,6 +157,7 @@ impl ProposalEngine {
                 let blocked = blocked_paths.contains(&hint.old_asset_path)
                     || blocked_paths.contains(&hint.new_asset_path);
                 let continuity_caution = continuity_proposal_caution(report, hint);
+                let mod_dependency_review_first = hint_has_mod_dependency_review_first(hint);
                 let strong_low_signal_justification =
                     has_strong_low_signal_justification(hint, min_confidence, blocked);
                 let compatibility_allows_proposal = hint.compatibility.supports_auto_proposal();
@@ -156,6 +165,7 @@ impl ProposalEngine {
                     && !blocked
                     && !hint.ambiguous
                     && !continuity_caution.blocks_auto_proposal()
+                    && !mod_dependency_review_first
                     && hint.confidence >= min_confidence
                     && (!low_signal_compare || strong_low_signal_justification)
                 {
@@ -176,6 +186,11 @@ impl ProposalEngine {
                     );
                 } else if continuity_caution.blocks_auto_proposal() {
                     reasons.extend(continuity_caution_reasons(&continuity_caution));
+                } else if mod_dependency_review_first {
+                    reasons.push(
+                        "mod dependency profile keeps this mapping review-first because hook/layout/resource targeting still needs manual revalidation"
+                            .to_string(),
+                    );
                 } else if hint.ambiguous {
                     reasons.push(
                         "multiple remap candidates remain too close after compare scoring; keep this mapping in review state".to_string(),
@@ -212,6 +227,9 @@ impl ProposalEngine {
                 if continuity_caution.blocks_auto_proposal() {
                     evidence.extend(continuity_caution_evidence(report, hint));
                 }
+                if mod_dependency_review_first {
+                    evidence.extend(mod_dependency_hint_evidence(hint));
+                }
                 if hint.ambiguous {
                     evidence.push(format!(
                         "mapping hint marked ambiguous with confidence gap {}",
@@ -242,6 +260,20 @@ impl ProposalEngine {
                 if blocked && layout_fix_available {
                     related_fix_codes.push("review_buffer_layout_and_runtime_guards".to_string());
                 }
+                if mod_dependency_has_surface(hint, "buffer/layout-sensitive") && layout_fix_available {
+                    related_fix_codes.push("review_buffer_layout_and_runtime_guards".to_string());
+                }
+                if mod_dependency_has_surface(hint, "resource/skeleton-sensitive")
+                    && resource_fix_available
+                {
+                    related_fix_codes.push("review_resource_and_skeleton_bindings".to_string());
+                }
+                if mod_dependency_has_surface(hint, "hook-targeting-sensitive") && hook_fix_available
+                {
+                    related_fix_codes.push("review_draw_call_and_filter_hooks_before_remap".to_string());
+                }
+                related_fix_codes.sort();
+                related_fix_codes.dedup();
 
                 MappingProposalEntry {
                     old_asset_path: hint.old_asset_path.clone(),
@@ -569,7 +601,7 @@ fn has_strong_low_signal_justification(
     min_confidence: f32,
     blocked: bool,
 ) -> bool {
-    if blocked || hint.ambiguous {
+    if blocked || hint.ambiguous || hint_has_mod_dependency_review_first(hint) {
         return false;
     }
 
@@ -626,6 +658,36 @@ fn has_reason_code(reasons: &[String], code: &str) -> bool {
         .any(|reason| reason.trim() == code || reason.trim_start().starts_with(&prefix))
 }
 
+fn hint_has_mod_dependency_review_first(hint: &crate::inference::InferredMappingHint) -> bool {
+    has_reason_code(&hint.reasons, "mod_dependency_review_first")
+}
+
+fn mod_dependency_has_surface(hint: &crate::inference::InferredMappingHint, surface: &str) -> bool {
+    hint.reasons
+        .iter()
+        .chain(hint.evidence.iter())
+        .any(|item| item.contains(surface))
+}
+
+fn mod_dependency_hint_evidence(hint: &crate::inference::InferredMappingHint) -> Vec<String> {
+    let mut evidence = BTreeSet::<String>::new();
+    for item in hint
+        .reasons
+        .iter()
+        .chain(hint.evidence.iter())
+        .filter(|item| {
+            item.contains("mod dependency")
+                || item.contains("mod-side")
+                || item.contains("hook-targeting-sensitive")
+                || item.contains("buffer/layout-sensitive")
+                || item.contains("resource/skeleton-sensitive")
+        })
+    {
+        evidence.insert(item.clone());
+    }
+    evidence.into_iter().collect()
+}
+
 fn current_unix_ms() -> AppResult<u128> {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -667,6 +729,7 @@ mod tests {
                 fix_like_commits: 5,
                 discovered_patterns: 3,
             },
+            mod_dependency_input: None,
             scope: InferenceScopeContext::default(),
             summary: InferenceSummary {
                 probable_crash_causes: 1,
@@ -781,6 +844,7 @@ mod tests {
                 fix_like_commits: 1,
                 discovered_patterns: 1,
             },
+            mod_dependency_input: None,
             scope: InferenceScopeContext {
                 low_signal_compare: true,
                 old_snapshot_low_signal: true,
@@ -883,6 +947,7 @@ mod tests {
                 fix_like_commits: 2,
                 discovered_patterns: 2,
             },
+            mod_dependency_input: None,
             scope: InferenceScopeContext::default(),
             summary: InferenceSummary {
                 probable_crash_causes: 1,
@@ -964,6 +1029,7 @@ mod tests {
                 fix_like_commits: 2,
                 discovered_patterns: 2,
             },
+            mod_dependency_input: None,
             scope: InferenceScopeContext::default(),
             summary: InferenceSummary {
                 probable_crash_causes: 0,
@@ -1053,6 +1119,7 @@ mod tests {
                 fix_like_commits: 2,
                 discovered_patterns: 2,
             },
+            mod_dependency_input: None,
             scope: InferenceScopeContext::default(),
             summary: InferenceSummary {
                 probable_crash_causes: 1,
@@ -1158,6 +1225,7 @@ mod tests {
                 fix_like_commits: 1,
                 discovered_patterns: 1,
             },
+            mod_dependency_input: None,
             scope: InferenceScopeContext::default(),
             summary: InferenceSummary {
                 probable_crash_causes: 0,

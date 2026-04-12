@@ -1321,6 +1321,7 @@ mod tests {
                 fix_like_commits: 2,
                 discovered_patterns: 2,
             },
+            mod_dependency_input: None,
             scope: InferenceScopeContext::default(),
             summary: InferenceSummary {
                 probable_crash_causes: 1,

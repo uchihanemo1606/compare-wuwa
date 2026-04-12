@@ -1736,23 +1736,27 @@ fn build_scope_notes(old_snapshot: &GameSnapshot, new_snapshot: &GameSnapshot) -
 
     let mut notes = vec![
         format!(
-            "old snapshot {} scope: mode={} install_or_package_level={} meaningful_content={} meaningful_character={} content_like_paths={} character_paths={} non_content_paths={}",
+            "old snapshot {} scope: acquisition={} mode={} install_or_package_level={} meaningful_content={} meaningful_character={} meaningful_asset_enrichment={} content_like_paths={} character_paths={} non_content_paths={}",
             old_snapshot.version_id,
+            old_scope.acquisition_kind.as_deref().unwrap_or("unknown"),
             old_scope.capture_mode.as_deref().unwrap_or("unknown"),
             old_scope.mostly_install_or_package_level,
             old_scope.meaningful_content_coverage,
             old_scope.meaningful_character_coverage,
+            old_scope.meaningful_asset_record_enrichment,
             old_scope.coverage.content_like_path_count,
             old_scope.coverage.character_path_count,
             old_scope.coverage.non_content_path_count
         ),
         format!(
-            "new snapshot {} scope: mode={} install_or_package_level={} meaningful_content={} meaningful_character={} content_like_paths={} character_paths={} non_content_paths={}",
+            "new snapshot {} scope: acquisition={} mode={} install_or_package_level={} meaningful_content={} meaningful_character={} meaningful_asset_enrichment={} content_like_paths={} character_paths={} non_content_paths={}",
             new_snapshot.version_id,
+            new_scope.acquisition_kind.as_deref().unwrap_or("unknown"),
             new_scope.capture_mode.as_deref().unwrap_or("unknown"),
             new_scope.mostly_install_or_package_level,
             new_scope.meaningful_content_coverage,
             new_scope.meaningful_character_coverage,
+            new_scope.meaningful_asset_record_enrichment,
             new_scope.coverage.content_like_path_count,
             new_scope.coverage.character_path_count,
             new_scope.coverage.non_content_path_count
@@ -1763,7 +1767,7 @@ fn build_scope_notes(old_snapshot: &GameSnapshot, new_snapshot: &GameSnapshot) -
         || new_scope.is_low_signal_for_character_analysis()
     {
         notes.push(
-            "scope warning: compare results are based on install/package-level or low-coverage snapshots; deep character-level interpretation may be limited."
+            "scope warning: compare results are based on shallow filesystem inventory or low-coverage/low-enrichment extractor snapshots; deep character-level interpretation may be limited."
                 .to_string(),
         );
     }
@@ -2072,6 +2076,7 @@ mod tests {
                 fix_like_commits: 1,
                 discovered_patterns: 1,
             },
+            mod_dependency_input: None,
             scope: InferenceScopeContext::default(),
             summary: InferenceSummary {
                 probable_crash_causes: 0,
@@ -2149,6 +2154,7 @@ mod tests {
                 fix_like_commits: 1,
                 discovered_patterns: 1,
             },
+            mod_dependency_input: None,
             scope: InferenceScopeContext::default(),
             summary: InferenceSummary {
                 probable_crash_causes: 1,
@@ -2312,16 +2318,18 @@ mod tests {
                 Some(120),
             )],
             SnapshotScopeContext {
-                capture_mode: Some("local_filesystem_inventory".to_string()),
+                acquisition_kind: Some("extractor_backed_asset_records".to_string()),
+                capture_mode: Some("extractor_backed_asset_records".to_string()),
                 mostly_install_or_package_level: Some(false),
                 meaningful_content_coverage: Some(true),
                 meaningful_character_coverage: Some(true),
+                meaningful_asset_record_enrichment: Some(true),
                 coverage: SnapshotCoverageSignals {
                     content_like_path_count: 12,
                     character_path_count: 6,
                     non_content_path_count: 1,
                 },
-                note: Some("rich local scan".to_string()),
+                note: Some("extractor-backed asset records".to_string()),
             },
         );
         let new_snapshot = sample_snapshot_with_scope(
@@ -2332,16 +2340,18 @@ mod tests {
                 Some(140),
             )],
             SnapshotScopeContext {
-                capture_mode: Some("local_filesystem_inventory".to_string()),
+                acquisition_kind: Some("extractor_backed_asset_records".to_string()),
+                capture_mode: Some("extractor_backed_asset_records".to_string()),
                 mostly_install_or_package_level: Some(false),
                 meaningful_content_coverage: Some(true),
                 meaningful_character_coverage: Some(true),
+                meaningful_asset_record_enrichment: Some(true),
                 coverage: SnapshotCoverageSignals {
                     content_like_path_count: 14,
                     character_path_count: 7,
                     non_content_path_count: 1,
                 },
-                note: Some("rich local scan".to_string()),
+                note: Some("extractor-backed asset records".to_string()),
             },
         );
         let compare_report = SnapshotComparer.compare(&old_snapshot, &new_snapshot);
@@ -2377,6 +2387,7 @@ mod tests {
             context: SnapshotContext {
                 launcher: None,
                 resource_manifest: None,
+                extractor: None,
                 scope,
                 notes: Vec::new(),
             },

@@ -4,11 +4,13 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use serde_json::json;
+
 use whashreonator::{
     cli::{SnapshotArgs, SnapshotCaptureScopeArg},
     pipeline::run_snapshot_command,
     report_storage::{ReportStorage, VersionArtifactKind},
-    snapshot::GameSnapshot,
+    snapshot::{GameSnapshot, assess_snapshot_scope},
 };
 
 #[test]
@@ -26,7 +28,7 @@ fn snapshot_command_exports_machine_readable_snapshot() {
         version_id: "2.4.0".to_string(),
         output: output_path.clone(),
         capture_scope: SnapshotCaptureScopeArg::Full,
-        prepared_inventory: None,
+        extractor_inventory: None,
         store_in_report: false,
         report_root: None,
     })
@@ -42,6 +44,10 @@ fn snapshot_command_exports_machine_readable_snapshot() {
     assert_eq!(parsed.asset_count, 3);
     assert_eq!(parsed.version_id, "2.4.0");
     assert_eq!(
+        parsed.context.scope.acquisition_kind.as_deref(),
+        Some("shallow_filesystem_inventory")
+    );
+    assert_eq!(
         parsed.context.scope.capture_mode.as_deref(),
         Some("local_filesystem_inventory")
     );
@@ -51,6 +57,10 @@ fn snapshot_command_exports_machine_readable_snapshot() {
     assert_eq!(
         parsed.context.scope.mostly_install_or_package_level,
         Some(true)
+    );
+    assert_eq!(
+        parsed.context.scope.meaningful_asset_record_enrichment,
+        Some(false)
     );
     assert!(
         parsed
@@ -101,7 +111,7 @@ fn snapshot_command_auto_detects_version_and_enriches_hashes() {
         version_id: "auto".to_string(),
         output: output_path.clone(),
         capture_scope: SnapshotCaptureScopeArg::Full,
-        prepared_inventory: None,
+        extractor_inventory: None,
         store_in_report: false,
         report_root: None,
     })
@@ -113,6 +123,10 @@ fn snapshot_command_auto_detects_version_and_enriches_hashes() {
 
     assert_eq!(snapshot.version_id, "3.2.1");
     assert_eq!(parsed.version_id, "3.2.1");
+    assert_eq!(
+        parsed.context.scope.acquisition_kind.as_deref(),
+        Some("shallow_filesystem_inventory")
+    );
     assert_eq!(
         parsed.context.scope.capture_mode.as_deref(),
         Some("local_filesystem_inventory")
@@ -130,6 +144,10 @@ fn snapshot_command_auto_detects_version_and_enriches_hashes() {
     );
     assert_eq!(
         parsed.context.scope.meaningful_character_coverage,
+        Some(false)
+    );
+    assert_eq!(
+        parsed.context.scope.meaningful_asset_record_enrichment,
         Some(false)
     );
     assert_eq!(
@@ -171,7 +189,7 @@ fn snapshot_command_supports_content_focused_capture_scope() {
         version_id: "2.4.0".to_string(),
         output: output_path.clone(),
         capture_scope: SnapshotCaptureScopeArg::Content,
-        prepared_inventory: None,
+        extractor_inventory: None,
         store_in_report: false,
         report_root: None,
     })
@@ -183,6 +201,10 @@ fn snapshot_command_supports_content_focused_capture_scope() {
 
     assert_eq!(snapshot.asset_count, 2);
     assert_eq!(parsed.asset_count, 2);
+    assert_eq!(
+        parsed.context.scope.acquisition_kind.as_deref(),
+        Some("shallow_filesystem_inventory")
+    );
     assert!(
         parsed
             .assets
@@ -196,14 +218,14 @@ fn snapshot_command_supports_content_focused_capture_scope() {
     assert_eq!(parsed.context.scope.coverage.content_like_path_count, 2);
     assert_eq!(parsed.context.scope.coverage.character_path_count, 1);
     assert_eq!(parsed.context.scope.coverage.non_content_path_count, 0);
-    assert!(
-        parsed
-            .context
-            .scope
-            .note
-            .as_deref()
-            .is_some_and(|note| { note.contains("path-based filtering only") })
+    assert_eq!(
+        parsed.context.scope.meaningful_asset_record_enrichment,
+        Some(false)
     );
+    assert!(parsed.context.scope.note.as_deref().is_some_and(|note| {
+        note.contains("path-based filtering only")
+            && note.contains("shallow filesystem inventory fallback")
+    }));
 
     let _ = fs::remove_dir_all(&test_root);
 }
@@ -224,7 +246,7 @@ fn snapshot_command_supports_character_focused_capture_scope() {
         version_id: "2.4.0".to_string(),
         output: output_path.clone(),
         capture_scope: SnapshotCaptureScopeArg::Character,
-        prepared_inventory: None,
+        extractor_inventory: None,
         store_in_report: false,
         report_root: None,
     })
@@ -236,6 +258,10 @@ fn snapshot_command_supports_character_focused_capture_scope() {
 
     assert_eq!(snapshot.asset_count, 2);
     assert_eq!(parsed.asset_count, 2);
+    assert_eq!(
+        parsed.context.scope.acquisition_kind.as_deref(),
+        Some("shallow_filesystem_inventory")
+    );
     assert!(
         parsed
             .assets
@@ -249,6 +275,10 @@ fn snapshot_command_supports_character_focused_capture_scope() {
     assert_eq!(parsed.context.scope.coverage.content_like_path_count, 2);
     assert_eq!(parsed.context.scope.coverage.character_path_count, 2);
     assert_eq!(parsed.context.scope.coverage.non_content_path_count, 0);
+    assert_eq!(
+        parsed.context.scope.meaningful_asset_record_enrichment,
+        Some(false)
+    );
 
     let _ = fs::remove_dir_all(&test_root);
 }
@@ -356,8 +386,8 @@ fn prepared_snapshot_command_is_runtime_facing_and_stored_as_official_artifacts(
         source_root: test_root.clone(),
         version_id: "6.0.0".to_string(),
         output: old_output.clone(),
-        capture_scope: SnapshotCaptureScopeArg::Prepared,
-        prepared_inventory: Some(old_inventory.clone()),
+        capture_scope: SnapshotCaptureScopeArg::Extractor,
+        extractor_inventory: Some(old_inventory.clone()),
         store_in_report: true,
         report_root: Some(report_root.clone()),
     })
@@ -366,8 +396,8 @@ fn prepared_snapshot_command_is_runtime_facing_and_stored_as_official_artifacts(
         source_root: test_root.clone(),
         version_id: "6.1.0".to_string(),
         output: new_output.clone(),
-        capture_scope: SnapshotCaptureScopeArg::Prepared,
-        prepared_inventory: Some(new_inventory.clone()),
+        capture_scope: SnapshotCaptureScopeArg::Extractor,
+        extractor_inventory: Some(new_inventory.clone()),
         store_in_report: true,
         report_root: Some(report_root.clone()),
     })
@@ -378,11 +408,51 @@ fn prepared_snapshot_command_is_runtime_facing_and_stored_as_official_artifacts(
 
     assert_eq!(
         old_snapshot.context.scope.capture_mode.as_deref(),
-        Some("prepared_asset_list_inventory")
+        Some("extractor_backed_asset_records")
     );
     assert_eq!(
         old_snapshot.context.scope.mostly_install_or_package_level,
         Some(false)
+    );
+    assert_eq!(
+        old_snapshot
+            .context
+            .scope
+            .meaningful_asset_record_enrichment,
+        Some(false)
+    );
+    assert!(assess_snapshot_scope(&old_snapshot).is_low_signal_for_character_analysis());
+    assert_eq!(
+        old_snapshot
+            .context
+            .extractor
+            .as_ref()
+            .map(|context| context.extraction_tool.as_deref()),
+        Some(Some("fixture-extractor"))
+    );
+    assert_eq!(
+        old_snapshot
+            .context
+            .extractor
+            .as_ref()
+            .map(|context| context.records_with_hashes),
+        Some(1)
+    );
+    assert_eq!(
+        old_snapshot
+            .context
+            .extractor
+            .as_ref()
+            .map(|context| context.records_with_source_context),
+        Some(1)
+    );
+    assert_eq!(
+        old_snapshot
+            .context
+            .extractor
+            .as_ref()
+            .map(|context| context.records_with_rich_metadata),
+        Some(1)
     );
     assert!(
         old_snapshot
@@ -390,7 +460,9 @@ fn prepared_snapshot_command_is_runtime_facing_and_stored_as_official_artifacts(
             .scope
             .note
             .as_deref()
-            .is_some_and(|note| note.contains("fixture-extractor"))
+            .is_some_and(|note| {
+                note.contains("fixture-extractor") && note.contains("enriched_records=1/1")
+            })
     );
     assert_eq!(
         old_result.stored_snapshot_path.as_deref(),
@@ -398,7 +470,7 @@ fn prepared_snapshot_command_is_runtime_facing_and_stored_as_official_artifacts(
     );
     assert!(
         old_result
-            .stored_prepared_inventory_path
+            .stored_extractor_inventory_path
             .as_ref()
             .is_some_and(|path| path.exists())
     );
@@ -413,7 +485,7 @@ fn prepared_snapshot_command_is_runtime_facing_and_stored_as_official_artifacts(
         .expect("stored old snapshot exists");
     assert_eq!(
         stored_old.context.scope.capture_mode.as_deref(),
-        Some("prepared_asset_list_inventory")
+        Some("extractor_backed_asset_records")
     );
     assert_eq!(
         stored_old.assets[0].hash_fields.asset_hash.as_deref(),
@@ -433,7 +505,7 @@ fn prepared_snapshot_command_is_runtime_facing_and_stored_as_official_artifacts(
                 .path
                 .file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name.contains("prepared-inventory"))
+                .is_some_and(|name| name.contains("extractor-inventory"))
     }));
 
     let compare_report = storage
@@ -442,15 +514,222 @@ fn prepared_snapshot_command_is_runtime_facing_and_stored_as_official_artifacts(
     assert_eq!(compare_report.old_version.version_id, "6.0.0");
     assert_eq!(compare_report.new_version.version_id, "6.1.0");
     assert!(compare_report.summary.changed_items > 0);
-    assert_eq!(compare_report.scope_notes.len(), 2);
+    assert_eq!(compare_report.scope_notes.len(), 3);
     assert!(
         compare_report
             .scope_notes
             .iter()
-            .all(|note| !note.contains("scope warning"))
+            .any(|note| note.contains("scope warning"))
     );
 
     let _ = fs::remove_dir_all(&test_root);
+}
+
+#[test]
+fn extractor_snapshot_command_treats_broad_enrichment_as_meaningful() {
+    let test_root = unique_test_dir();
+    let source_root = test_root.join("game");
+    let inventory_path = test_root.join("prepared-broad.json");
+    let output_path = test_root.join("out").join("prepared-broad.snapshot.json");
+
+    fs::create_dir_all(&source_root).expect("create source root");
+    write_prepared_inventory(
+        &inventory_path,
+        "D:/prepared-broad",
+        12,
+        6,
+        "body-broad",
+        "sig-broad",
+        180,
+        360,
+        3,
+        4,
+        "pakchunk2-WindowsNoEditor.pak",
+    );
+
+    let result = run_snapshot_command(&SnapshotArgs {
+        source_root,
+        version_id: "6.2.0".to_string(),
+        output: output_path.clone(),
+        capture_scope: SnapshotCaptureScopeArg::Extractor,
+        extractor_inventory: Some(inventory_path),
+        store_in_report: false,
+        report_root: None,
+    })
+    .expect("run broad extractor snapshot command");
+
+    let output = fs::read_to_string(&output_path).expect("read snapshot output");
+    let parsed: GameSnapshot = serde_json::from_str(&output).expect("parse snapshot json");
+    let scope = assess_snapshot_scope(&parsed);
+
+    assert_eq!(
+        result
+            .snapshot
+            .context
+            .scope
+            .meaningful_asset_record_enrichment,
+        Some(true)
+    );
+    assert_eq!(
+        parsed
+            .context
+            .extractor
+            .as_ref()
+            .map(|context| context.records_with_hashes),
+        Some(6)
+    );
+    assert_eq!(
+        parsed
+            .context
+            .extractor
+            .as_ref()
+            .map(|context| context.records_with_source_context),
+        Some(6)
+    );
+    assert_eq!(
+        parsed
+            .context
+            .extractor
+            .as_ref()
+            .map(|context| context.records_with_rich_metadata),
+        Some(6)
+    );
+    assert!(scope.meaningful_content_coverage);
+    assert!(scope.meaningful_character_coverage);
+    assert!(scope.meaningful_asset_record_enrichment);
+    assert!(!scope.is_low_signal_for_character_analysis());
+    assert!(
+        parsed
+            .context
+            .scope
+            .note
+            .as_deref()
+            .is_some_and(|note| note.contains("enriched_records=6/12 threshold=5"))
+    );
+
+    let _ = fs::remove_dir_all(&test_root);
+}
+
+fn write_prepared_inventory(
+    path: &Path,
+    source_root: &str,
+    total_assets: usize,
+    enriched_assets: usize,
+    body_asset_hash: &str,
+    body_signature: &str,
+    body_vertex_count: u32,
+    body_index_count: u32,
+    body_material_slots: u32,
+    body_section_count: u32,
+    body_container_path: &str,
+) {
+    let assets = (0..total_assets)
+        .map(|index| {
+            let (
+                character_name,
+                logical_name,
+                asset_hash,
+                signature,
+                vertex_count,
+                index_count,
+                material_slots,
+                section_count,
+                container_path,
+            ) = if index == 0 {
+                (
+                    "Encore".to_string(),
+                    "Encore Body".to_string(),
+                    body_asset_hash.to_string(),
+                    body_signature.to_string(),
+                    body_vertex_count,
+                    body_index_count,
+                    body_material_slots,
+                    body_section_count,
+                    body_container_path.to_string(),
+                )
+            } else {
+                (
+                    format!("Fixture{index:02}"),
+                    format!("Fixture{index:02} Body"),
+                    format!("asset-{index}"),
+                    format!("sig-{index}"),
+                    120 + index as u32,
+                    240 + index as u32,
+                    2,
+                    3,
+                    "pakchunk0-WindowsNoEditor.pak".to_string(),
+                )
+            };
+            let asset_path = format!("Content/Character/{character_name}/Body.mesh");
+            let enriched = index < enriched_assets;
+            let metadata = if enriched {
+                json!({
+                    "logical_name": logical_name,
+                    "vertex_count": vertex_count,
+                    "index_count": index_count,
+                    "material_slots": material_slots,
+                    "section_count": section_count,
+                    "layout_markers": ["skinned"],
+                    "tags": ["character", "prepared"]
+                })
+            } else {
+                json!({
+                    "logical_name": logical_name,
+                    "tags": ["character", "prepared"]
+                })
+            };
+            let hash_fields = if enriched {
+                json!({
+                    "asset_hash": asset_hash,
+                    "signature": signature
+                })
+            } else {
+                json!({})
+            };
+            let source = if enriched {
+                json!({
+                    "extraction_tool": "fixture-extractor",
+                    "source_root": source_root,
+                    "source_path": asset_path,
+                    "source_kind": "mesh_record",
+                    "container_path": container_path
+                })
+            } else {
+                json!({})
+            };
+
+            json!({
+                "id": format!("mesh:{}:body", character_name.to_lowercase()),
+                "path": asset_path,
+                "kind": "mesh",
+                "metadata": metadata,
+                "hash_fields": hash_fields,
+                "source": source
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let inventory = json!({
+        "schema_version": "whashreonator.prepared-assets.v1",
+        "context": {
+            "extraction_tool": "fixture-extractor",
+            "extraction_kind": "asset_records",
+            "source_root": source_root,
+            "meaningful_content_coverage": true,
+            "meaningful_character_coverage": true
+        },
+        "assets": assets
+    });
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("create inventory directory");
+    }
+
+    fs::write(
+        path,
+        serde_json::to_string_pretty(&inventory).expect("serialize prepared inventory"),
+    )
+    .expect("write prepared inventory");
 }
 
 fn unique_test_dir() -> PathBuf {

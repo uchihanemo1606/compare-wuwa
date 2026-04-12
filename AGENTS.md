@@ -68,3 +68,34 @@ PRs should include:
 
 ## Security & Configuration Tips
 Do not commit local game folders, generated reports, cloned upstream repos, or private mod collections. Keep generated artifacts isolated under `out/` for dev/debug runs or the executable-relative `report/` folder for release app runs. When testing commands that read local installs or prepared asset dumps, prefer explicit paths so generated JSON and Markdown stay isolated from source files.
+
+## Codex Standing Rules
+Codex should treat the following as always-on repository rules:
+
+- Read code and tests first. Do not use README files as the source of truth.
+- Report back to the user in Vietnamese unless the user explicitly asks for another language.
+- Keep technical identifiers, code symbols, file paths, commands, and literal program output in their original language.
+- Do not drift into mod-authoring, mod packaging, or generic mod-management features. Stay focused on version diff, evidence gathering, continuity, repair-assist, and reviewer-facing outputs.
+- Prefer additive changes, conservative review-first decisions, and backward-compatible schema evolution.
+
+## Real Game Root Verification
+After each implementation phase and automated test pass, Codex must run a real-data verification pass against the real game root:
+
+`C:\Wuthering Waves\Wuthering Waves Game`
+
+This verification is mandatory unless the user explicitly disables it.
+
+Strict safety rules:
+
+- Treat the real game root as read-only input only.
+- Do not modify, rename, delete, or write any file inside the game directory.
+- Do not create outputs, temp files, or reports inside the game directory.
+- All outputs must go only to approved artifact locations such as repo-local `out/`, report storage roots, or executable-relative release/report locations.
+- If any command or code path would write into the game root, stop and correct it before proceeding.
+
+Every final implementation report should include:
+
+- which real-root verification command(s) were run
+- which output path(s) were produced
+- what happened on real data
+- explicit confirmation that nothing was written into the game root

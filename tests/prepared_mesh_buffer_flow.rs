@@ -617,7 +617,9 @@ fn write_inventory(path: &PathBuf, assets: Vec<serde_json::Value>) {
         "context": {
             "extraction_tool": "fixture-extractor",
             "extraction_kind": "asset_records",
-            "source_root": "D:/prepared"
+            "source_root": "D:/prepared",
+            "meaningful_content_coverage": true,
+            "meaningful_character_coverage": true
         },
         "assets": assets
     });

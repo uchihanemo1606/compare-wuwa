@@ -8,14 +8,14 @@ use whashreonator::{
     cli::GenerateProposalsArgs,
     compare::{RemapCompatibility, RiskLevel},
     inference::{
-        InferenceCompareInput, InferenceKnowledgeInput, InferenceReport, InferenceScopeContext,
-        InferenceSummary, InferredMappingContinuityContext, InferredMappingHint,
-        ProbableCrashCause, SuggestedFix,
+        InferenceCompareInput, InferenceKnowledgeInput, InferenceModDependencyInput,
+        InferenceReport, InferenceScopeContext, InferenceSummary, InferredMappingContinuityContext,
+        InferredMappingHint, ProbableCrashCause, SuggestedFix,
     },
     pipeline::run_generate_proposals_command,
     proposal::{MappingProposalOutput, ProposalPatchDraftOutput, ProposalStatus},
     report::VersionContinuityRelation,
-    wwmi::WwmiPatternKind,
+    wwmi::{WwmiPatternKind, dependency::WwmiModDependencyKind},
 };
 
 #[test]
@@ -147,6 +147,64 @@ fn generate_proposals_command_keeps_continuity_unstable_mapping_in_review() {
     let _ = fs::remove_dir_all(&test_root);
 }
 
+#[test]
+fn generate_proposals_command_surfaces_mod_aware_review_first_context() {
+    let test_root = unique_test_dir();
+    let inference_path = test_root.join("tmp").join("inference-mod-aware.json");
+    let mapping_output_path = test_root
+        .join("out")
+        .join("mapping-proposal-mod-aware.json");
+    let summary_output_path = test_root.join("out").join("summary-mod-aware.md");
+
+    fs::create_dir_all(test_root.join("tmp")).expect("create temp input root");
+    fs::write(
+        &inference_path,
+        serde_json::to_string_pretty(&mod_aware_hook_targeting_inference_report())
+            .expect("serialize inference"),
+    )
+    .expect("write inference report");
+
+    run_generate_proposals_command(&GenerateProposalsArgs {
+        inference_report: inference_path,
+        mapping_output: Some(mapping_output_path.clone()),
+        patch_draft_output: None,
+        summary_output: Some(summary_output_path.clone()),
+        min_confidence: 0.85,
+    })
+    .expect("run mod-aware generate proposals command");
+
+    let mapping_output =
+        fs::read_to_string(&mapping_output_path).expect("read mapping proposal output");
+    let summary_output = fs::read_to_string(&summary_output_path).expect("read summary output");
+
+    let parsed_mapping: MappingProposalOutput =
+        serde_json::from_str(&mapping_output).expect("parse mapping proposal output");
+    let mapping = parsed_mapping
+        .mappings
+        .iter()
+        .find(|entry| entry.old_asset_path == "Content/Character/Encore/Hair.mesh")
+        .expect("mod-aware mapping exists");
+
+    assert_eq!(mapping.status, ProposalStatus::NeedsReview);
+    assert!(
+        mapping
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("mod dependency profile keeps this mapping review-first"))
+    );
+    assert!(
+        mapping
+            .related_fix_codes
+            .iter()
+            .any(|code| code == "review_draw_call_and_filter_hooks_before_remap")
+    );
+    assert!(summary_output.contains("Mod dependency profile"));
+    assert!(summary_output.contains("Mod focus:"));
+    assert!(summary_output.contains("hook-targeting-sensitive"));
+
+    let _ = fs::remove_dir_all(&test_root);
+}
+
 fn sample_inference_report() -> InferenceReport {
     InferenceReport {
         schema_version: "whashreonator.inference.v1".to_string(),
@@ -165,6 +223,7 @@ fn sample_inference_report() -> InferenceReport {
             fix_like_commits: 6,
             discovered_patterns: 3,
         },
+        mod_dependency_input: None,
         scope: InferenceScopeContext::default(),
         summary: InferenceSummary {
             probable_crash_causes: 2,
@@ -265,6 +324,7 @@ fn continuity_flagged_inference_report() -> InferenceReport {
             fix_like_commits: 2,
             discovered_patterns: 2,
         },
+        mod_dependency_input: None,
         scope: InferenceScopeContext::default(),
         summary: InferenceSummary {
             probable_crash_causes: 1,
@@ -320,6 +380,102 @@ fn continuity_flagged_inference_report() -> InferenceReport {
                 "same_parent_directory: same folder".to_string(),
             ],
             evidence: vec!["compare candidate confidence 0.920".to_string()],
+        }],
+    }
+}
+
+fn mod_aware_hook_targeting_inference_report() -> InferenceReport {
+    InferenceReport {
+        schema_version: "whashreonator.inference.v1".to_string(),
+        generated_at_unix_ms: 1,
+        compare_input: InferenceCompareInput {
+            old_version_id: "10.0.0".to_string(),
+            new_version_id: "10.1.0".to_string(),
+            changed_assets: 0,
+            added_assets: 1,
+            removed_assets: 1,
+            candidate_mapping_changes: 1,
+        },
+        knowledge_input: InferenceKnowledgeInput {
+            repo: "repo".to_string(),
+            analyzed_commits: 5,
+            fix_like_commits: 3,
+            discovered_patterns: 2,
+        },
+        mod_dependency_input: Some(InferenceModDependencyInput {
+            mod_name: Some("CarlottaMod".to_string()),
+            mod_root: "D:/mod/WWMI/Mods/CarlottaMod".to_string(),
+            ini_file_count: 2,
+            signal_count: 4,
+            dependency_kinds: vec![
+                WwmiModDependencyKind::ObjectGuid,
+                WwmiModDependencyKind::DrawCallTarget,
+                WwmiModDependencyKind::FilterIndex,
+            ],
+        }),
+        scope: InferenceScopeContext::default(),
+        summary: InferenceSummary {
+            probable_crash_causes: 1,
+            suggested_fixes: 1,
+            candidate_mapping_hints: 1,
+            highest_confidence: 0.91,
+        },
+        probable_crash_causes: vec![ProbableCrashCause {
+            code: "mod_hook_targeting_surface_requires_manual_review".to_string(),
+            summary: "hook targeting still needs manual review".to_string(),
+            confidence: 0.75,
+            risk: RiskLevel::Medium,
+            affected_assets: vec![
+                "Content/Character/Encore/Hair.mesh".to_string(),
+                "Content/Character/Encore/Hair_LOD0.mesh".to_string(),
+            ],
+            related_patterns: vec![WwmiPatternKind::MappingOrHashUpdate],
+            reasons: vec![
+                "mod_dependency_surface: this mod uses hook-targeting-sensitive surfaces that stay review-first"
+                    .to_string(),
+            ],
+            evidence: vec![
+                "draw-call/filter/object-guid targeting is present in the scanned mod ini files"
+                    .to_string(),
+            ],
+        }],
+        suggested_fixes: vec![SuggestedFix {
+            code: "review_draw_call_and_filter_hooks_before_remap".to_string(),
+            summary: "review draw-call and filter hooks".to_string(),
+            confidence: 0.80,
+            priority: RiskLevel::High,
+            related_patterns: vec![WwmiPatternKind::MappingOrHashUpdate],
+            actions: vec!["inspect hook-targeting sections first".to_string()],
+            reasons: vec![
+                "mod_dependency_surface: this mod uses hook-targeting-sensitive surfaces, so remap promotion should stay review-first"
+                    .to_string(),
+            ],
+            evidence: vec![
+                "hook-targeting ini sections often need manual retargeting beyond asset remap confidence"
+                    .to_string(),
+            ],
+        }],
+        candidate_mapping_hints: vec![InferredMappingHint {
+            old_asset_path: "Content/Character/Encore/Hair.mesh".to_string(),
+            new_asset_path: "Content/Character/Encore/Hair_LOD0.mesh".to_string(),
+            confidence: 0.91,
+            compatibility: RemapCompatibility::CompatibleWithCaution,
+            needs_review: true,
+            ambiguous: false,
+            confidence_gap: Some(0.20),
+            continuity: None,
+            reasons: vec![
+                "normalized_name_exact: encore hair".to_string(),
+                "same_parent_directory: same folder".to_string(),
+                "mod_dependency_review_first: this mod uses hook-targeting-sensitive surfaces, so even plausible remaps require manual hook revalidation"
+                    .to_string(),
+            ],
+            evidence: vec![
+                "compare candidate confidence 0.910".to_string(),
+                "draw-call/filter/object-guid hooks can break independently of asset similarity"
+                    .to_string(),
+                "mod dependency files: CarlottaMod.ini".to_string(),
+            ],
         }],
     }
 }

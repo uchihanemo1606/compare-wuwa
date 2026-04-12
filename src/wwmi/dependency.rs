@@ -79,6 +79,11 @@ pub fn scan_mod_dependency_profile(mod_root: &Path) -> AppResult<WwmiModDependen
     })
 }
 
+pub fn load_mod_dependency_profile(path: &Path) -> AppResult<WwmiModDependencyProfile> {
+    let profile: WwmiModDependencyProfile = serde_json::from_str(&fs::read_to_string(path)?)?;
+    Ok(profile)
+}
+
 fn collect_ini_files(root: &Path, out: &mut Vec<PathBuf>) -> AppResult<()> {
     for entry in fs::read_dir(root).map_err(|error| {
         AppError::InvalidInput(format!(

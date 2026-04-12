@@ -76,6 +76,23 @@ impl HumanSummaryRenderer {
             proposals.mapping_proposal.summary.needs_review_mappings,
             proposals.mapping_proposal.summary.total_mapping_candidates
         ));
+        if let Some(mod_dependency) = inference.mod_dependency_input.as_ref() {
+            lines.push(format!(
+                "- Mod dependency profile: `{}` ini_files={} signals={} kinds={}",
+                mod_dependency
+                    .mod_name
+                    .as_deref()
+                    .unwrap_or(mod_dependency.mod_root.as_str()),
+                mod_dependency.ini_file_count,
+                mod_dependency.signal_count,
+                mod_dependency
+                    .dependency_kinds
+                    .iter()
+                    .map(mod_dependency_kind_label)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
         if !continuity_causes.is_empty()
             || !continuity_fixes.is_empty()
             || continuity_review_mappings > 0
@@ -315,6 +332,9 @@ fn render_cause(cause: &ProbableCrashCause) -> Vec<String> {
     if let Some(reason) = cause.reasons.first() {
         lines.push(format!("  Why: {reason}"));
     }
+    if let Some(reason) = mod_dependency_reason(&cause.reasons) {
+        lines.push(format!("  Mod focus: {reason}"));
+    }
     lines
 }
 
@@ -329,6 +349,9 @@ fn render_fix(fix: &SuggestedFix) -> Vec<String> {
     }
     if let Some(reason) = fix.reasons.first() {
         lines.push(format!("  Why: {reason}"));
+    }
+    if let Some(reason) = mod_dependency_reason(&fix.reasons) {
+        lines.push(format!("  Mod focus: {reason}"));
     }
     lines
 }
@@ -348,13 +371,69 @@ fn render_mapping(entry: &MappingProposalEntry) -> Vec<String> {
     if let Some(reason) = continuity_reason(entry) {
         lines.push(format!("  Continuity: {reason}"));
     }
+    if let Some(reason) = mod_dependency_reason(&entry.reasons) {
+        lines.push(format!("  Mod focus: {reason}"));
+    }
     if let Some(evidence) = entry.evidence.first() {
         lines.push(format!("  Evidence: {evidence}"));
     }
     if let Some(evidence) = continuity_evidence(entry) {
         lines.push(format!("  Continuity evidence: {evidence}"));
     }
+    if let Some(evidence) = mod_dependency_evidence(&entry.evidence) {
+        lines.push(format!("  Mod evidence: {evidence}"));
+    }
     lines
+}
+
+fn mod_dependency_reason(reasons: &[String]) -> Option<String> {
+    reasons
+        .iter()
+        .find_map(|reason| strip_mod_dependency_prefix(reason))
+}
+
+fn mod_dependency_evidence(evidence: &[String]) -> Option<String> {
+    evidence
+        .iter()
+        .find(|item| {
+            item.contains("mod dependency")
+                || item.contains("mod-side")
+                || item.contains("hook-targeting-sensitive")
+                || item.contains("buffer/layout-sensitive")
+                || item.contains("resource/skeleton-sensitive")
+        })
+        .cloned()
+}
+
+fn strip_mod_dependency_prefix(value: &str) -> Option<String> {
+    value
+        .strip_prefix("mod_dependency_surface: ")
+        .or_else(|| value.strip_prefix("mod_dependency_review_first: "))
+        .map(ToOwned::to_owned)
+}
+
+fn mod_dependency_kind_label(
+    kind: &crate::wwmi::dependency::WwmiModDependencyKind,
+) -> &'static str {
+    match kind {
+        crate::wwmi::dependency::WwmiModDependencyKind::ObjectGuid => "object_guid",
+        crate::wwmi::dependency::WwmiModDependencyKind::DrawCallTarget => "draw_call_target",
+        crate::wwmi::dependency::WwmiModDependencyKind::TextureOverrideHash => {
+            "texture_override_hash"
+        }
+        crate::wwmi::dependency::WwmiModDependencyKind::ResourceFileReference => {
+            "resource_file_reference"
+        }
+        crate::wwmi::dependency::WwmiModDependencyKind::MeshVertexCount => "mesh_vertex_count",
+        crate::wwmi::dependency::WwmiModDependencyKind::ShapeKeyVertexCount => {
+            "shapekey_vertex_count"
+        }
+        crate::wwmi::dependency::WwmiModDependencyKind::BufferLayoutHint => "buffer_layout_hint",
+        crate::wwmi::dependency::WwmiModDependencyKind::SkeletonMergeDependency => {
+            "skeleton_merge_dependency"
+        }
+        crate::wwmi::dependency::WwmiModDependencyKind::FilterIndex => "filter_index",
+    }
 }
 
 fn markdown_table_row(cells: &[String]) -> String {
@@ -493,7 +572,9 @@ fn review_risk_rank(risk: &RiskLevel) -> u8 {
 }
 
 fn mapping_review_rank(entry: &MappingProposalEntry) -> u8 {
-    if mapping_has_continuity_caution(entry) {
+    if mod_dependency_reason(&entry.reasons).is_some() {
+        5
+    } else if mapping_has_continuity_caution(entry) {
         4
     } else if entry
         .reasons
@@ -701,6 +782,7 @@ mod tests {
                 fix_like_commits: 6,
                 discovered_patterns: 3,
             },
+            mod_dependency_input: None,
             scope: InferenceScopeContext::default(),
             summary: InferenceSummary {
                 probable_crash_causes: 2,
@@ -837,6 +919,7 @@ mod tests {
                 fix_like_commits: 2,
                 discovered_patterns: 2,
             },
+            mod_dependency_input: None,
             scope: InferenceScopeContext::default(),
             summary: InferenceSummary {
                 probable_crash_causes: 1,

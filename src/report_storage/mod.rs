@@ -290,21 +290,21 @@ impl ReportStorage {
         Ok(layout.snapshot_path)
     }
 
-    pub fn save_prepared_inventory_input_for_version(
+    pub fn save_extractor_inventory_input_for_version(
         &self,
         version_id: &str,
         inventory_path: &Path,
     ) -> AppResult<PathBuf> {
         if !inventory_path.exists() || !inventory_path.is_file() {
             return Err(AppError::InvalidInput(format!(
-                "prepared inventory input does not exist or is not a file: {}",
+                "extractor inventory input does not exist or is not a file: {}",
                 inventory_path.display()
             )));
         }
 
         let layout = self.ensure_version_layout(version_id)?;
         let target_path = layout.auxiliary_dir.join(format!(
-            "{VERSION_DIR_PREFIX}{}.prepared-inventory.v1.json",
+            "{VERSION_DIR_PREFIX}{}.extractor-inventory.v1.json",
             sanitize_version_segment(version_id)
         ));
 
@@ -313,6 +313,14 @@ impl ReportStorage {
         }
 
         Ok(target_path)
+    }
+
+    pub fn save_prepared_inventory_input_for_version(
+        &self,
+        version_id: &str,
+        inventory_path: &Path,
+    ) -> AppResult<PathBuf> {
+        self.save_extractor_inventory_input_for_version(version_id, inventory_path)
     }
 
     pub fn save_version_continuity_artifact(
@@ -2209,6 +2217,7 @@ mod tests {
                 fix_like_commits: 1,
                 discovered_patterns: 1,
             },
+            mod_dependency_input: None,
             scope: InferenceScopeContext::default(),
             summary: InferenceSummary {
                 probable_crash_causes: 0,
@@ -2254,6 +2263,7 @@ mod tests {
                 fix_like_commits: 2,
                 discovered_patterns: 2,
             },
+            mod_dependency_input: None,
             scope: InferenceScopeContext::default(),
             summary: InferenceSummary {
                 probable_crash_causes: 1,

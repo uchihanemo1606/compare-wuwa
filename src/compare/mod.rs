@@ -38,10 +38,12 @@ pub struct SnapshotCompareScopeContext {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(default)]
 pub struct SnapshotCompareScopeInfo {
+    pub acquisition_kind: Option<String>,
     pub capture_mode: Option<String>,
     pub mostly_install_or_package_level: bool,
     pub meaningful_content_coverage: bool,
     pub meaningful_character_coverage: bool,
+    pub meaningful_asset_record_enrichment: bool,
     pub content_like_path_count: usize,
     pub character_path_count: usize,
     pub non_content_path_count: usize,
@@ -445,17 +447,19 @@ fn build_compare_scope_context(
         || new_scope.is_low_signal_for_character_analysis()
     {
         notes.push(
-            "compare scope includes install/package-level or low-coverage snapshots; deep character-level interpretation is limited"
+            "compare scope includes shallow filesystem inventory or low-coverage/low-enrichment extractor snapshots; deep character-level interpretation is limited"
                 .to_string(),
         );
     }
 
     SnapshotCompareScopeContext {
         old_snapshot: SnapshotCompareScopeInfo {
+            acquisition_kind: old_scope.acquisition_kind.clone(),
             capture_mode: old_scope.capture_mode.clone(),
             mostly_install_or_package_level: old_scope.mostly_install_or_package_level,
             meaningful_content_coverage: old_scope.meaningful_content_coverage,
             meaningful_character_coverage: old_scope.meaningful_character_coverage,
+            meaningful_asset_record_enrichment: old_scope.meaningful_asset_record_enrichment,
             content_like_path_count: old_scope.coverage.content_like_path_count,
             character_path_count: old_scope.coverage.character_path_count,
             non_content_path_count: old_scope.coverage.non_content_path_count,
@@ -463,10 +467,12 @@ fn build_compare_scope_context(
             note: old_scope.note.clone(),
         },
         new_snapshot: SnapshotCompareScopeInfo {
+            acquisition_kind: new_scope.acquisition_kind.clone(),
             capture_mode: new_scope.capture_mode.clone(),
             mostly_install_or_package_level: new_scope.mostly_install_or_package_level,
             meaningful_content_coverage: new_scope.meaningful_content_coverage,
             meaningful_character_coverage: new_scope.meaningful_character_coverage,
+            meaningful_asset_record_enrichment: new_scope.meaningful_asset_record_enrichment,
             content_like_path_count: new_scope.coverage.content_like_path_count,
             character_path_count: new_scope.coverage.character_path_count,
             non_content_path_count: new_scope.coverage.non_content_path_count,
@@ -2120,7 +2126,7 @@ mod tests {
                 .scope
                 .notes
                 .iter()
-                .any(|note| note.contains("low-coverage snapshots"))
+                .any(|note| note.contains("low-coverage/low-enrichment extractor snapshots"))
         );
         assert!(
             report.changed_assets[0]

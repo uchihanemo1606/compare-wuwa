@@ -65,8 +65,12 @@ pub struct SnapshotArgs {
     pub output: PathBuf,
     #[arg(long, value_enum, default_value_t = SnapshotCaptureScopeArg::Full)]
     pub capture_scope: SnapshotCaptureScopeArg,
-    #[arg(long)]
-    pub prepared_inventory: Option<PathBuf>,
+    #[arg(
+        long,
+        alias = "prepared-inventory",
+        visible_alias = "prepared-inventory"
+    )]
+    pub extractor_inventory: Option<PathBuf>,
     #[arg(long)]
     pub store_in_report: bool,
     #[arg(long)]
@@ -78,7 +82,8 @@ pub enum SnapshotCaptureScopeArg {
     Full,
     Content,
     Character,
-    Prepared,
+    #[value(name = "extractor", alias = "prepared")]
+    Extractor,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -119,6 +124,10 @@ pub struct InferFixesArgs {
     pub continuity_artifact: Option<PathBuf>,
     #[arg(long)]
     pub report_root: Option<PathBuf>,
+    #[arg(long)]
+    pub mod_root: Option<PathBuf>,
+    #[arg(long)]
+    pub mod_dependency_profile: Option<PathBuf>,
     #[arg(long)]
     pub output: PathBuf,
 }
@@ -163,7 +172,7 @@ mod tests {
         };
 
         assert_eq!(args.capture_scope, SnapshotCaptureScopeArg::Full);
-        assert!(args.prepared_inventory.is_none());
+        assert!(args.extractor_inventory.is_none());
         assert!(!args.store_in_report);
         assert!(args.report_root.is_none());
     }
@@ -191,7 +200,43 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_command_parses_prepared_capture_and_storage_flags() {
+    fn snapshot_command_parses_extractor_capture_and_storage_flags() {
+        let cli = Cli::parse_from([
+            "whashreonator",
+            "snapshot",
+            "--source-root",
+            "D:/prepared-game",
+            "--version-id",
+            "6.1.0",
+            "--output",
+            "out/snapshot.json",
+            "--capture-scope",
+            "extractor",
+            "--extractor-inventory",
+            "out/prepared-assets.json",
+            "--store-in-report",
+            "--report-root",
+            "out/report",
+        ]);
+
+        let Command::Snapshot(args) = cli.command else {
+            panic!("expected snapshot command");
+        };
+
+        assert_eq!(args.capture_scope, SnapshotCaptureScopeArg::Extractor);
+        assert_eq!(
+            args.extractor_inventory.as_deref(),
+            Some(PathBuf::from("out/prepared-assets.json").as_path())
+        );
+        assert!(args.store_in_report);
+        assert_eq!(
+            args.report_root.as_deref(),
+            Some(PathBuf::from("out/report").as_path())
+        );
+    }
+
+    #[test]
+    fn snapshot_command_keeps_legacy_prepared_alias_compatible() {
         let cli = Cli::parse_from([
             "whashreonator",
             "snapshot",
@@ -205,24 +250,16 @@ mod tests {
             "prepared",
             "--prepared-inventory",
             "out/prepared-assets.json",
-            "--store-in-report",
-            "--report-root",
-            "out/report",
         ]);
 
         let Command::Snapshot(args) = cli.command else {
             panic!("expected snapshot command");
         };
 
-        assert_eq!(args.capture_scope, SnapshotCaptureScopeArg::Prepared);
+        assert_eq!(args.capture_scope, SnapshotCaptureScopeArg::Extractor);
         assert_eq!(
-            args.prepared_inventory.as_deref(),
+            args.extractor_inventory.as_deref(),
             Some(PathBuf::from("out/prepared-assets.json").as_path())
-        );
-        assert!(args.store_in_report);
-        assert_eq!(
-            args.report_root.as_deref(),
-            Some(PathBuf::from("out/report").as_path())
         );
     }
 
@@ -239,6 +276,10 @@ mod tests {
             "out/continuity.json",
             "--report-root",
             "out/report",
+            "--mod-root",
+            "D:/mod/WWMI/Mods/Aemeth",
+            "--mod-dependency-profile",
+            "out/mod-profile.json",
             "--output",
             "out/inference.json",
         ]);
@@ -254,6 +295,14 @@ mod tests {
         assert_eq!(
             args.report_root.as_deref(),
             Some(PathBuf::from("out/report").as_path())
+        );
+        assert_eq!(
+            args.mod_root.as_deref(),
+            Some(PathBuf::from("D:/mod/WWMI/Mods/Aemeth").as_path())
+        );
+        assert_eq!(
+            args.mod_dependency_profile.as_deref(),
+            Some(PathBuf::from("out/mod-profile.json").as_path())
         );
     }
 }

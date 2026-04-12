@@ -21,3 +21,8 @@ Thumbs.db
 # Environment files
 .env
 .env.*
+# Agent files
+AGENTS.md
+#.cursor
+.cursor/
+.aider*

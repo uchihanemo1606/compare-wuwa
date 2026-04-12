@@ -27,9 +27,21 @@ pub trait SnapshotAssetExtractor {
     fn extraction_mode(&self) -> SnapshotExtractionMode;
     fn extract_snapshot_assets(&self, path: &Path) -> AppResult<Vec<ExtractedAssetRecord>>;
 
-    fn scope_note(&self) -> Option<String> {
-        None
+    fn scope_hint(&self) -> SnapshotExtractionScopeHint {
+        SnapshotExtractionScopeHint::default()
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SnapshotExtractionScopeHint {
+    pub meaningful_content_coverage: Option<bool>,
+    pub meaningful_character_coverage: Option<bool>,
+    pub note: Option<String>,
+    pub inventory_path: Option<String>,
+    pub extraction_tool: Option<String>,
+    pub extraction_kind: Option<String>,
+    pub inventory_source_root: Option<String>,
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -58,8 +70,8 @@ impl LocalSnapshotCaptureScope {
 pub enum SnapshotExtractionMode {
     /// Current default implementation: recursive local filesystem inventory.
     InstallFilesystemInventory(LocalSnapshotCaptureScope),
-    /// Hook for tests or future adapter-based ingestion of already prepared assets.
-    PreparedAssetList,
+    /// Official runtime bridge for richer extractor-fed asset records.
+    ExtractorBackedAssetRecords,
     /// Future extension point; proprietary format parsing is intentionally not implemented yet.
     AssetLevelExtractorPlaceholder,
 }
@@ -68,7 +80,17 @@ impl SnapshotExtractionMode {
     pub fn capture_mode(self) -> &'static str {
         match self {
             SnapshotExtractionMode::InstallFilesystemInventory(scope) => scope.capture_mode(),
-            SnapshotExtractionMode::PreparedAssetList => "prepared_asset_list_inventory",
+            SnapshotExtractionMode::ExtractorBackedAssetRecords => "extractor_backed_asset_records",
+            SnapshotExtractionMode::AssetLevelExtractorPlaceholder => {
+                "asset_level_extractor_placeholder"
+            }
+        }
+    }
+
+    pub fn acquisition_kind(self) -> &'static str {
+        match self {
+            SnapshotExtractionMode::InstallFilesystemInventory(_) => "shallow_filesystem_inventory",
+            SnapshotExtractionMode::ExtractorBackedAssetRecords => "extractor_backed_asset_records",
             SnapshotExtractionMode::AssetLevelExtractorPlaceholder => {
                 "asset_level_extractor_placeholder"
             }
@@ -97,7 +119,7 @@ pub struct FilteredLocalSnapshotAssetExtractor {
 #[derive(Debug, Clone)]
 pub struct PreparedSnapshotAssetExtractor {
     assets: Vec<ExtractedAssetRecord>,
-    scope_note: Option<String>,
+    scope_hint: SnapshotExtractionScopeHint,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -160,34 +182,36 @@ impl PreparedSnapshotAssetExtractor {
         validate_extracted_assets("prepared_assets", &assets)?;
         Ok(Self {
             assets,
-            scope_note: None,
+            scope_hint: SnapshotExtractionScopeHint::default(),
         })
     }
 
     pub fn from_inventory(inventory: PreparedAssetInventory) -> AppResult<Self> {
-        let scope_note = prepared_inventory_scope_note(&inventory);
+        let scope_hint = prepared_inventory_scope_hint(&inventory);
         let mut extractor = Self::new(inventory.assets)?;
-        extractor.scope_note = scope_note;
+        extractor.scope_hint = scope_hint;
         Ok(extractor)
     }
 
     pub fn from_json(path: &Path) -> AppResult<Self> {
         let inventory = load_prepared_asset_inventory(path)?;
-        Self::from_inventory(inventory)
+        let mut extractor = Self::from_inventory(inventory)?;
+        extractor.scope_hint.inventory_path = Some(normalize_hint_path(path));
+        Ok(extractor)
     }
 }
 
 impl SnapshotAssetExtractor for PreparedSnapshotAssetExtractor {
     fn extraction_mode(&self) -> SnapshotExtractionMode {
-        SnapshotExtractionMode::PreparedAssetList
+        SnapshotExtractionMode::ExtractorBackedAssetRecords
     }
 
     fn extract_snapshot_assets(&self, _path: &Path) -> AppResult<Vec<ExtractedAssetRecord>> {
         Ok(self.assets.clone())
     }
 
-    fn scope_note(&self) -> Option<String> {
-        self.scope_note.clone()
+    fn scope_hint(&self) -> SnapshotExtractionScopeHint {
+        self.scope_hint.clone()
     }
 }
 
@@ -407,7 +431,9 @@ fn filter_assets_by_capture_scope(
     }
 }
 
-fn prepared_inventory_scope_note(inventory: &PreparedAssetInventory) -> Option<String> {
+fn prepared_inventory_scope_hint(
+    inventory: &PreparedAssetInventory,
+) -> SnapshotExtractionScopeHint {
     let mut parts = Vec::new();
     if let Some(tool) = inventory.context.extraction_tool.as_deref() {
         parts.push(format!("tool={tool}"));
@@ -421,15 +447,36 @@ fn prepared_inventory_scope_note(inventory: &PreparedAssetInventory) -> Option<S
     if !inventory.context.tags.is_empty() {
         parts.push(format!("tags={}", inventory.context.tags.join(",")));
     }
+    if let Some(note) = inventory.context.note.as_deref() {
+        parts.push(format!("note={note}"));
+    }
 
-    if parts.is_empty() {
-        Some("prepared asset-level records were ingested through the extractor seam".to_string())
+    let note = if parts.is_empty() {
+        Some(
+            "extractor-backed asset records were bridged into runtime snapshot acquisition"
+                .to_string(),
+        )
     } else {
         Some(format!(
-            "prepared asset-level records were ingested through the extractor seam ({})",
+            "extractor-backed asset records were bridged into runtime snapshot acquisition ({})",
             parts.join(", ")
         ))
+    };
+
+    SnapshotExtractionScopeHint {
+        meaningful_content_coverage: inventory.context.meaningful_content_coverage,
+        meaningful_character_coverage: inventory.context.meaningful_character_coverage,
+        note,
+        inventory_path: None,
+        extraction_tool: inventory.context.extraction_tool.clone(),
+        extraction_kind: inventory.context.extraction_kind.clone(),
+        inventory_source_root: inventory.context.source_root.clone(),
+        tags: inventory.context.tags.clone(),
     }
+}
+
+fn normalize_hint_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
 }
 
 fn is_content_like_path(path: &str) -> bool {

@@ -41,8 +41,8 @@ pub fn run(cli: Cli) -> AppResult<()> {
             if let Some(path) = result.stored_snapshot_path.as_deref() {
                 println!("stored snapshot: {}", path.display());
             }
-            if let Some(path) = result.stored_prepared_inventory_path.as_deref() {
-                println!("stored prepared-inventory: {}", path.display());
+            if let Some(path) = result.stored_extractor_inventory_path.as_deref() {
+                println!("stored extractor-inventory: {}", path.display());
             }
         }
         Command::SnapshotReport(args) => {
