@@ -9,7 +9,10 @@ use serde::{Deserialize, Serialize};
 use crate::{
     domain::{AssetInternalStructure, AssetSourceContext},
     error::AppResult,
-    snapshot::{GameSnapshot, SnapshotAsset, assess_snapshot_scope, load_snapshot},
+    snapshot::{
+        GameSnapshot, SnapshotAsset, assess_snapshot_scope, load_snapshot,
+        summarize_snapshot_capture_quality,
+    },
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -40,6 +43,32 @@ pub struct SnapshotCompareScopeContext {
 pub struct SnapshotCompareScopeInfo {
     pub acquisition_kind: Option<String>,
     pub capture_mode: Option<String>,
+    #[serde(default)]
+    pub launcher_detected_version: Option<String>,
+    #[serde(default)]
+    pub launcher_reuse_version: Option<String>,
+    #[serde(default)]
+    pub launcher_version_matches_snapshot: Option<bool>,
+    #[serde(default)]
+    pub manifest_resource_count: usize,
+    #[serde(default)]
+    pub manifest_matched_assets: usize,
+    #[serde(default)]
+    pub manifest_unmatched_snapshot_assets: usize,
+    #[serde(default)]
+    pub assets_with_asset_hash: usize,
+    #[serde(default)]
+    pub assets_with_any_hash: usize,
+    #[serde(default)]
+    pub assets_with_signature: usize,
+    #[serde(default)]
+    pub assets_with_source_context: usize,
+    #[serde(default)]
+    pub assets_with_rich_metadata: usize,
+    #[serde(default)]
+    pub meaningfully_enriched_assets: usize,
+    #[serde(default)]
+    pub extractor_record_count: usize,
     pub mostly_install_or_package_level: bool,
     pub meaningful_content_coverage: bool,
     pub meaningful_character_coverage: bool,
@@ -427,6 +456,8 @@ fn build_compare_scope_context(
 ) -> SnapshotCompareScopeContext {
     let old_scope = assess_snapshot_scope(old_snapshot);
     let new_scope = assess_snapshot_scope(new_snapshot);
+    let old_quality = summarize_snapshot_capture_quality(old_snapshot);
+    let new_quality = summarize_snapshot_capture_quality(new_snapshot);
     let old_low_signal = old_scope.is_low_signal_for_character_analysis();
     let new_low_signal = new_scope.is_low_signal_for_character_analysis();
 
@@ -434,9 +465,61 @@ fn build_compare_scope_context(
     if let Some(note) = old_scope.note.as_deref() {
         notes.push(format!("old snapshot {}: {note}", old_snapshot.version_id));
     }
+    notes.push(format!(
+        "old snapshot {} quality: launcher={} reuse={} matches_snapshot={} manifest_resources={} manifest_matches={} unmatched_snapshot_assets={} asset_hashes={}/{} any_hashes={}/{} signatures={}/{} source_context={}/{} rich_metadata={}/{} enriched_assets={}/{} extractor_records={}",
+        old_snapshot.version_id,
+        old_quality.launcher_detected_version.as_deref().unwrap_or("missing"),
+        old_quality.launcher_reuse_version.as_deref().unwrap_or("-"),
+        old_quality
+            .launcher_version_matches_snapshot
+            .map(|value| if value { "yes" } else { "no" })
+            .unwrap_or("unknown"),
+        old_quality.manifest_resource_count,
+        old_quality.manifest_matched_assets,
+        old_quality.manifest_unmatched_snapshot_assets,
+        old_quality.assets_with_asset_hash,
+        old_quality.asset_count,
+        old_quality.assets_with_any_hash,
+        old_quality.asset_count,
+        old_quality.assets_with_signature,
+        old_quality.asset_count,
+        old_quality.assets_with_source_context,
+        old_quality.asset_count,
+        old_quality.assets_with_rich_metadata,
+        old_quality.asset_count,
+        old_quality.meaningfully_enriched_assets,
+        old_quality.asset_count,
+        old_quality.extractor_record_count,
+    ));
     if let Some(note) = new_scope.note.as_deref() {
         notes.push(format!("new snapshot {}: {note}", new_snapshot.version_id));
     }
+    notes.push(format!(
+        "new snapshot {} quality: launcher={} reuse={} matches_snapshot={} manifest_resources={} manifest_matches={} unmatched_snapshot_assets={} asset_hashes={}/{} any_hashes={}/{} signatures={}/{} source_context={}/{} rich_metadata={}/{} enriched_assets={}/{} extractor_records={}",
+        new_snapshot.version_id,
+        new_quality.launcher_detected_version.as_deref().unwrap_or("missing"),
+        new_quality.launcher_reuse_version.as_deref().unwrap_or("-"),
+        new_quality
+            .launcher_version_matches_snapshot
+            .map(|value| if value { "yes" } else { "no" })
+            .unwrap_or("unknown"),
+        new_quality.manifest_resource_count,
+        new_quality.manifest_matched_assets,
+        new_quality.manifest_unmatched_snapshot_assets,
+        new_quality.assets_with_asset_hash,
+        new_quality.asset_count,
+        new_quality.assets_with_any_hash,
+        new_quality.asset_count,
+        new_quality.assets_with_signature,
+        new_quality.asset_count,
+        new_quality.assets_with_source_context,
+        new_quality.asset_count,
+        new_quality.assets_with_rich_metadata,
+        new_quality.asset_count,
+        new_quality.meaningfully_enriched_assets,
+        new_quality.asset_count,
+        new_quality.extractor_record_count,
+    ));
     if old_scope.observed_fallback_used || new_scope.observed_fallback_used {
         notes.push(
             "scope metadata was partially inferred from observed paths because explicit scope fields were missing"
@@ -456,6 +539,19 @@ fn build_compare_scope_context(
         old_snapshot: SnapshotCompareScopeInfo {
             acquisition_kind: old_scope.acquisition_kind.clone(),
             capture_mode: old_scope.capture_mode.clone(),
+            launcher_detected_version: old_quality.launcher_detected_version,
+            launcher_reuse_version: old_quality.launcher_reuse_version,
+            launcher_version_matches_snapshot: old_quality.launcher_version_matches_snapshot,
+            manifest_resource_count: old_quality.manifest_resource_count,
+            manifest_matched_assets: old_quality.manifest_matched_assets,
+            manifest_unmatched_snapshot_assets: old_quality.manifest_unmatched_snapshot_assets,
+            assets_with_asset_hash: old_quality.assets_with_asset_hash,
+            assets_with_any_hash: old_quality.assets_with_any_hash,
+            assets_with_signature: old_quality.assets_with_signature,
+            assets_with_source_context: old_quality.assets_with_source_context,
+            assets_with_rich_metadata: old_quality.assets_with_rich_metadata,
+            meaningfully_enriched_assets: old_quality.meaningfully_enriched_assets,
+            extractor_record_count: old_quality.extractor_record_count,
             mostly_install_or_package_level: old_scope.mostly_install_or_package_level,
             meaningful_content_coverage: old_scope.meaningful_content_coverage,
             meaningful_character_coverage: old_scope.meaningful_character_coverage,
@@ -469,6 +565,19 @@ fn build_compare_scope_context(
         new_snapshot: SnapshotCompareScopeInfo {
             acquisition_kind: new_scope.acquisition_kind.clone(),
             capture_mode: new_scope.capture_mode.clone(),
+            launcher_detected_version: new_quality.launcher_detected_version,
+            launcher_reuse_version: new_quality.launcher_reuse_version,
+            launcher_version_matches_snapshot: new_quality.launcher_version_matches_snapshot,
+            manifest_resource_count: new_quality.manifest_resource_count,
+            manifest_matched_assets: new_quality.manifest_matched_assets,
+            manifest_unmatched_snapshot_assets: new_quality.manifest_unmatched_snapshot_assets,
+            assets_with_asset_hash: new_quality.assets_with_asset_hash,
+            assets_with_any_hash: new_quality.assets_with_any_hash,
+            assets_with_signature: new_quality.assets_with_signature,
+            assets_with_source_context: new_quality.assets_with_source_context,
+            assets_with_rich_metadata: new_quality.assets_with_rich_metadata,
+            meaningfully_enriched_assets: new_quality.meaningfully_enriched_assets,
+            extractor_record_count: new_quality.extractor_record_count,
             mostly_install_or_package_level: new_scope.mostly_install_or_package_level,
             meaningful_content_coverage: new_scope.meaningful_content_coverage,
             meaningful_character_coverage: new_scope.meaningful_character_coverage,

@@ -6,7 +6,10 @@ use std::{
 use crate::{
     compare::{CandidateMappingChange, SnapshotComparer},
     error::{AppError, AppResult},
-    snapshot::{GameSnapshot, SnapshotScopeAssessment, assess_snapshot_scope, load_snapshot},
+    snapshot::{
+        GameSnapshot, SnapshotCaptureQualitySummary, SnapshotScopeAssessment,
+        assess_snapshot_scope, load_snapshot, summarize_snapshot_capture_quality,
+    },
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,6 +39,10 @@ impl SnapshotReportRenderer {
             .iter()
             .map(assess_snapshot_scope)
             .collect::<Vec<_>>();
+        let capture_quality = snapshots
+            .iter()
+            .map(summarize_snapshot_capture_quality)
+            .collect::<Vec<_>>();
         let all_resonators = resonator_counts
             .iter()
             .flat_map(|counts| counts.keys().cloned())
@@ -45,6 +52,7 @@ impl SnapshotReportRenderer {
             &resonator_counts,
             &all_resonators,
             &scope_assessments,
+            &capture_quality,
         );
 
         Ok(SnapshotInventoryReport {
@@ -74,6 +82,7 @@ fn render_markdown(
     resonator_counts: &[BTreeMap<String, usize>],
     all_resonators: &BTreeSet<String>,
     scope_assessments: &[SnapshotScopeAssessment],
+    capture_quality: &[SnapshotCaptureQualitySummary],
 ) -> String {
     let mut lines = Vec::new();
     lines.push("# Snapshot Report".to_string());
@@ -133,13 +142,48 @@ fn render_markdown(
     }
     lines.push(String::new());
 
+    lines.push("## Capture Quality".to_string());
+    lines.push(
+        "| Version | Acquisition | Capture Mode | Low Signal | Launcher Evidence | Manifest Evidence | Hash Coverage | Enrichment Signals | Extractor Evidence |"
+            .to_string(),
+    );
+    lines.push("| --- | --- | --- | --- | --- | --- | --- | --- | --- |".to_string());
+    for ((snapshot, scope), quality) in snapshots
+        .iter()
+        .zip(scope_assessments.iter())
+        .zip(capture_quality.iter())
+    {
+        lines.push(format!(
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            md_cell(&snapshot.version_id),
+            md_cell(scope.acquisition_kind.as_deref().unwrap_or("-")),
+            md_cell(scope.capture_mode.as_deref().unwrap_or("-")),
+            md_cell(if scope.is_low_signal_for_character_analysis() {
+                "yes"
+            } else {
+                "no"
+            }),
+            md_cell(&launcher_evidence(quality)),
+            md_cell(&manifest_evidence(quality)),
+            md_cell(&hash_coverage_evidence(quality)),
+            md_cell(&enrichment_evidence(quality)),
+            md_cell(&extractor_evidence(quality))
+        ));
+    }
+    lines.push(String::new());
+
     lines.push("## Analysis Limitations".to_string());
     let mut low_signal_lines = Vec::new();
-    for (snapshot, scope) in snapshots.iter().zip(scope_assessments.iter()) {
+    for ((snapshot, scope), quality) in snapshots
+        .iter()
+        .zip(scope_assessments.iter())
+        .zip(capture_quality.iter())
+    {
         if scope.is_low_signal_for_character_analysis() {
             low_signal_lines.push(format!(
-                "- {}: shallow filesystem inventory or low-coverage/low-enrichment extractor snapshot; resonator-level and mapping-level interpretation can be incomplete.",
-                snapshot.version_id
+                "- {}: shallow filesystem inventory or low-coverage/low-enrichment extractor snapshot; resonator-level and mapping-level interpretation can be incomplete. Missing/weak signals: {}.",
+                snapshot.version_id,
+                quality.low_signal_reasons(scope).join("; ")
             ));
         }
     }
@@ -337,6 +381,72 @@ fn render_markdown(
     }
 
     lines.join("\n")
+}
+
+fn launcher_evidence(quality: &SnapshotCaptureQualitySummary) -> String {
+    match quality.launcher_detected_version.as_deref() {
+        Some(version) => format!(
+            "detected={} reuse={} matches_snapshot={}",
+            version,
+            quality.launcher_reuse_version.as_deref().unwrap_or("-"),
+            quality
+                .launcher_version_matches_snapshot
+                .map(|value| if value { "yes" } else { "no" })
+                .unwrap_or("unknown")
+        ),
+        None => "missing".to_string(),
+    }
+}
+
+fn manifest_evidence(quality: &SnapshotCaptureQualitySummary) -> String {
+    if quality.manifest_resource_count == 0 {
+        return "missing".to_string();
+    }
+
+    format!(
+        "resources={} matched={} unmatched_snapshot_assets={}",
+        quality.manifest_resource_count,
+        quality.manifest_matched_assets,
+        quality.manifest_unmatched_snapshot_assets
+    )
+}
+
+fn hash_coverage_evidence(quality: &SnapshotCaptureQualitySummary) -> String {
+    format!(
+        "asset_hashes={}/{} any_hashes={}/{} signatures={}/{}",
+        quality.assets_with_asset_hash,
+        quality.asset_count,
+        quality.assets_with_any_hash,
+        quality.asset_count,
+        quality.assets_with_signature,
+        quality.asset_count
+    )
+}
+
+fn enrichment_evidence(quality: &SnapshotCaptureQualitySummary) -> String {
+    format!(
+        "source_context={}/{} rich_metadata={}/{} enriched_assets={}/{}",
+        quality.assets_with_source_context,
+        quality.asset_count,
+        quality.assets_with_rich_metadata,
+        quality.asset_count,
+        quality.meaningfully_enriched_assets,
+        quality.asset_count
+    )
+}
+
+fn extractor_evidence(quality: &SnapshotCaptureQualitySummary) -> String {
+    if quality.extractor_record_count == 0 {
+        return "-".to_string();
+    }
+
+    format!(
+        "records={} hashes={} source_context={} rich_metadata={}",
+        quality.extractor_record_count,
+        quality.extractor_records_with_hashes,
+        quality.extractor_records_with_source_context,
+        quality.extractor_records_with_rich_metadata
+    )
 }
 
 fn scope_label(scope: &SnapshotScopeAssessment) -> &'static str {

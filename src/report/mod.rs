@@ -10,7 +10,7 @@ use crate::{
     domain::{AssetInternalStructure, AssetSourceContext},
     inference::{InferenceReport, InferredMappingContinuityContext},
     proposal::{MappingProposalEntry, MappingProposalOutput, ProposalStatus},
-    snapshot::{GameSnapshot, assess_snapshot_scope},
+    snapshot::{GameSnapshot, assess_snapshot_scope, summarize_snapshot_capture_quality},
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1733,6 +1733,8 @@ fn infer_resonator_name(path: &str) -> Option<String> {
 fn build_scope_notes(old_snapshot: &GameSnapshot, new_snapshot: &GameSnapshot) -> Vec<String> {
     let old_scope = assess_snapshot_scope(old_snapshot);
     let new_scope = assess_snapshot_scope(new_snapshot);
+    let old_quality = summarize_snapshot_capture_quality(old_snapshot);
+    let new_quality = summarize_snapshot_capture_quality(new_snapshot);
 
     let mut notes = vec![
         format!(
@@ -1760,6 +1762,64 @@ fn build_scope_notes(old_snapshot: &GameSnapshot, new_snapshot: &GameSnapshot) -
             new_scope.coverage.content_like_path_count,
             new_scope.coverage.character_path_count,
             new_scope.coverage.non_content_path_count
+        ),
+        format!(
+            "old snapshot {} quality: launcher={} reuse={} matches_snapshot={} manifest_resources={} manifest_matches={} unmatched_snapshot_assets={} asset_hashes={}/{} any_hashes={}/{} signatures={}/{} source_context={}/{} rich_metadata={}/{} enriched_assets={}/{} extractor_records={}",
+            old_snapshot.version_id,
+            old_quality
+                .launcher_detected_version
+                .as_deref()
+                .unwrap_or("missing"),
+            old_quality.launcher_reuse_version.as_deref().unwrap_or("-"),
+            old_quality
+                .launcher_version_matches_snapshot
+                .map(|value| if value { "yes" } else { "no" })
+                .unwrap_or("unknown"),
+            old_quality.manifest_resource_count,
+            old_quality.manifest_matched_assets,
+            old_quality.manifest_unmatched_snapshot_assets,
+            old_quality.assets_with_asset_hash,
+            old_quality.asset_count,
+            old_quality.assets_with_any_hash,
+            old_quality.asset_count,
+            old_quality.assets_with_signature,
+            old_quality.asset_count,
+            old_quality.assets_with_source_context,
+            old_quality.asset_count,
+            old_quality.assets_with_rich_metadata,
+            old_quality.asset_count,
+            old_quality.meaningfully_enriched_assets,
+            old_quality.asset_count,
+            old_quality.extractor_record_count
+        ),
+        format!(
+            "new snapshot {} quality: launcher={} reuse={} matches_snapshot={} manifest_resources={} manifest_matches={} unmatched_snapshot_assets={} asset_hashes={}/{} any_hashes={}/{} signatures={}/{} source_context={}/{} rich_metadata={}/{} enriched_assets={}/{} extractor_records={}",
+            new_snapshot.version_id,
+            new_quality
+                .launcher_detected_version
+                .as_deref()
+                .unwrap_or("missing"),
+            new_quality.launcher_reuse_version.as_deref().unwrap_or("-"),
+            new_quality
+                .launcher_version_matches_snapshot
+                .map(|value| if value { "yes" } else { "no" })
+                .unwrap_or("unknown"),
+            new_quality.manifest_resource_count,
+            new_quality.manifest_matched_assets,
+            new_quality.manifest_unmatched_snapshot_assets,
+            new_quality.assets_with_asset_hash,
+            new_quality.asset_count,
+            new_quality.assets_with_any_hash,
+            new_quality.asset_count,
+            new_quality.assets_with_signature,
+            new_quality.asset_count,
+            new_quality.assets_with_source_context,
+            new_quality.asset_count,
+            new_quality.assets_with_rich_metadata,
+            new_quality.asset_count,
+            new_quality.meaningfully_enriched_assets,
+            new_quality.asset_count,
+            new_quality.extractor_record_count
         ),
     ];
 
@@ -2359,7 +2419,13 @@ mod tests {
         let report =
             VersionDiffReportBuilder.from_compare(&old_snapshot, &new_snapshot, &compare_report);
 
-        assert_eq!(report.scope_notes.len(), 2);
+        assert_eq!(report.scope_notes.len(), 4);
+        assert!(
+            report
+                .scope_notes
+                .iter()
+                .any(|note| note.contains("quality: launcher=missing"))
+        );
         assert!(
             report
                 .scope_notes

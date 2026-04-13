@@ -22,6 +22,7 @@ pub enum Command {
     Snapshot(SnapshotArgs),
     SnapshotReport(SnapshotReportArgs),
     CompareSnapshots(CompareSnapshotsArgs),
+    ScanModDependencies(ScanModDependenciesArgs),
     ExtractWwmiKnowledge(ExtractWwmiKnowledgeArgs),
     InferFixes(InferFixesArgs),
     GenerateProposals(GenerateProposalsArgs),
@@ -102,6 +103,20 @@ pub struct CompareSnapshotsArgs {
     pub new_snapshot: PathBuf,
     #[arg(long)]
     pub output: PathBuf,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ScanModDependenciesArgs {
+    #[arg(long)]
+    pub version_id: String,
+    #[arg(long = "mod-root", required = true)]
+    pub mod_roots: Vec<PathBuf>,
+    #[arg(long)]
+    pub output: PathBuf,
+    #[arg(long)]
+    pub store_in_report: bool,
+    #[arg(long)]
+    pub report_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -303,6 +318,37 @@ mod tests {
         assert_eq!(
             args.mod_dependency_profile.as_deref(),
             Some(PathBuf::from("out/mod-profile.json").as_path())
+        );
+    }
+
+    #[test]
+    fn scan_mod_dependencies_command_parses_repeated_mod_roots_and_storage_flags() {
+        let cli = Cli::parse_from([
+            "whashreonator",
+            "scan-mod-dependencies",
+            "--version-id",
+            "3.2.1",
+            "--mod-root",
+            "D:/mods/Aemeth",
+            "--mod-root",
+            "D:/mods/CarlottaMod",
+            "--output",
+            "out/mod-baselines.json",
+            "--store-in-report",
+            "--report-root",
+            "out/report",
+        ]);
+
+        let Command::ScanModDependencies(args) = cli.command else {
+            panic!("expected scan-mod-dependencies command");
+        };
+
+        assert_eq!(args.version_id, "3.2.1");
+        assert_eq!(args.mod_roots.len(), 2);
+        assert!(args.store_in_report);
+        assert_eq!(
+            args.report_root.as_deref(),
+            Some(PathBuf::from("out/report").as_path())
         );
     }
 }

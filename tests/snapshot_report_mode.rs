@@ -32,6 +32,7 @@ fn snapshot_report_command_exports_markdown_tables() {
     assert!(output.contains("# Snapshot Report"));
     assert!(output.contains("## Version Summary"));
     assert!(output.contains("## Scope & Coverage"));
+    assert!(output.contains("## Capture Quality"));
     assert!(output.contains("## Analysis Limitations"));
     assert!(output.contains("| Version | Reuse Version | Total Assets | Resonators | Character Assets | Other Assets | Source Root |"));
     assert!(output.contains("| 2.4.0 | - | 3 | 1 | 2 | 1 | fixtures/2.4.0 |"));
@@ -94,7 +95,9 @@ fn snapshot_report_flags_install_level_snapshots_as_low_signal() {
     let output = fs::read_to_string(&report_output).expect("read output");
 
     assert!(output.contains("## Version Summary"));
+    assert!(output.contains("## Capture Quality"));
     assert!(output.contains("## Analysis Limitations"));
+    assert!(output.contains("| 3.0.0 | shallow_filesystem_inventory | local_filesystem_inventory | yes | missing | missing | asset_hashes=0/1 any_hashes=0/1 signatures=0/1 |"));
     assert!(output.contains(
         "shallow filesystem inventory or low-coverage/low-enrichment extractor snapshot; resonator-level and mapping-level interpretation can be incomplete."
     ));
@@ -175,8 +178,12 @@ fn snapshot_report_marks_sparse_extractor_snapshots_as_partial_and_low_signal() 
     let output = fs::read_to_string(&report_output).expect("read output");
 
     assert!(output.contains("## Scope & Coverage"));
+    assert!(output.contains("## Capture Quality"));
     assert!(output.contains(
         "| 7.0.0 | extractor_backed_asset_records | extractor_backed_asset_records | mixed or partial coverage |"
+    ));
+    assert!(output.contains(
+        "| 7.0.0 | extractor_backed_asset_records | extractor_backed_asset_records | yes | missing | missing | asset_hashes=1/12 any_hashes=1/12 signatures=1/12 |"
     ));
     assert!(output.contains("enriched_records=1/12 threshold=5"));
     assert!(

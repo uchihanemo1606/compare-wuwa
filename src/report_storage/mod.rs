@@ -9,6 +9,7 @@ use crate::{
     error::{AppError, AppResult},
     export::{
         export_inference_output, export_mapping_proposal_output,
+        export_mod_dependency_baseline_set_output, export_mod_dependency_profile_output,
         export_proposal_patch_draft_output, export_snapshot_compare_output, export_snapshot_output,
         export_text_output, export_version_continuity_output, export_version_diff_report_v2,
     },
@@ -22,6 +23,7 @@ use crate::{
         load_version_diff_report_v2,
     },
     snapshot::{GameSnapshot, load_snapshot},
+    wwmi::dependency::{WwmiModDependencyBaselineSet, WwmiModDependencyProfile},
 };
 
 const VERSION_DIR_PREFIX: &str = "wuwa_";
@@ -288,6 +290,41 @@ impl ReportStorage {
         let layout = self.ensure_version_layout(&snapshot.version_id)?;
         export_snapshot_output(snapshot, &layout.snapshot_path)?;
         Ok(layout.snapshot_path)
+    }
+
+    pub fn save_mod_dependency_profile_for_version(
+        &self,
+        version_id: &str,
+        profile: &WwmiModDependencyProfile,
+    ) -> AppResult<PathBuf> {
+        let layout = self.ensure_version_layout(version_id)?;
+        let profile_name = sanitize_version_segment(
+            profile
+                .mod_name
+                .as_deref()
+                .unwrap_or(profile.mod_root.as_str()),
+        );
+        let target_path = layout.auxiliary_dir.join(format!(
+            "{VERSION_DIR_PREFIX}{}.{}.mod-dependency-profile.v1.json",
+            sanitize_version_segment(version_id),
+            profile_name
+        ));
+        export_mod_dependency_profile_output(profile, &target_path)?;
+        Ok(target_path)
+    }
+
+    pub fn save_mod_dependency_baseline_set_for_version(
+        &self,
+        version_id: &str,
+        baseline_set: &WwmiModDependencyBaselineSet,
+    ) -> AppResult<PathBuf> {
+        let layout = self.ensure_version_layout(version_id)?;
+        let target_path = layout.auxiliary_dir.join(format!(
+            "{VERSION_DIR_PREFIX}{}.mod-dependency-baselines.v1.json",
+            sanitize_version_segment(version_id)
+        ));
+        export_mod_dependency_baseline_set_output(baseline_set, &target_path)?;
+        Ok(target_path)
     }
 
     pub fn save_extractor_inventory_input_for_version(

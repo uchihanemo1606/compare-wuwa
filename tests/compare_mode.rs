@@ -65,6 +65,8 @@ fn compare_snapshots_command_exports_change_categories() {
     assert_eq!(parsed.summary.added_assets, 1);
     assert_eq!(parsed.summary.changed_assets, 0);
     assert_eq!(parsed.summary.candidate_mapping_changes, 1);
+    assert_eq!(parsed.scope.old_snapshot.assets_with_any_hash, 0);
+    assert_eq!(parsed.scope.new_snapshot.assets_with_any_hash, 0);
 
     let _ = fs::remove_dir_all(&test_root);
 }
@@ -145,6 +147,16 @@ fn compare_snapshots_command_keeps_sparse_extractor_pairs_low_signal() {
     assert!(parsed.scope.low_signal_compare);
     assert!(!parsed.scope.old_snapshot.meaningful_asset_record_enrichment);
     assert!(!parsed.scope.new_snapshot.meaningful_asset_record_enrichment);
+    assert_eq!(parsed.scope.old_snapshot.extractor_record_count, 12);
+    assert_eq!(parsed.scope.old_snapshot.assets_with_asset_hash, 1);
+    assert_eq!(parsed.scope.old_snapshot.assets_with_source_context, 1);
+    assert!(
+        parsed
+            .scope
+            .notes
+            .iter()
+            .any(|note| note.contains("manifest_resources=0"))
+    );
     assert!(
         parsed
             .scope

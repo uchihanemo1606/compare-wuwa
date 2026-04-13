@@ -3,12 +3,14 @@ use std::path::{Path, PathBuf};
 use tracing::info;
 
 use crate::wwmi::dependency::{
-    WwmiModDependencyProfile, load_mod_dependency_profile, scan_mod_dependency_profile,
+    WwmiModDependencyBaselineSet, WwmiModDependencyProfile, build_mod_dependency_baseline_set,
+    load_mod_dependency_profile, scan_mod_dependency_profile,
 };
 use crate::{
     cli::{
         CompareSnapshotsArgs, ExtractWwmiKnowledgeArgs, GenerateProposalsArgs, InferFixesArgs,
-        MapArgs, MapLocalArgs, SnapshotArgs, SnapshotCaptureScopeArg, SnapshotReportArgs,
+        MapArgs, MapLocalArgs, ScanModDependenciesArgs, SnapshotArgs, SnapshotCaptureScopeArg,
+        SnapshotReportArgs,
     },
     compare::{SnapshotCompareReport, SnapshotComparer, load_snapshot_compare_report},
     config::AppConfig,
@@ -16,9 +18,10 @@ use crate::{
     error::{AppError, AppResult},
     export::{
         Exporter, JsonExporter, export_inference_output, export_mapping_output,
-        export_mapping_proposal_output, export_patch_draft_output,
-        export_proposal_patch_draft_output, export_snapshot_compare_output, export_snapshot_output,
-        export_text_output, export_wwmi_knowledge_output,
+        export_mapping_proposal_output, export_mod_dependency_baseline_set_output,
+        export_patch_draft_output, export_proposal_patch_draft_output,
+        export_snapshot_compare_output, export_snapshot_output, export_text_output,
+        export_wwmi_knowledge_output,
     },
     fingerprint::{DefaultFingerprinter, Fingerprinter},
     human_summary::HumanSummaryRenderer,
@@ -84,6 +87,13 @@ pub struct SnapshotCommandResult {
     pub snapshot: GameSnapshot,
     pub stored_snapshot_path: Option<PathBuf>,
     pub stored_extractor_inventory_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScanModDependenciesResult {
+    pub baseline_set: WwmiModDependencyBaselineSet,
+    pub stored_baseline_set_path: Option<PathBuf>,
+    pub stored_profile_paths: Vec<PathBuf>,
 }
 
 impl SourceMapOutputs {
@@ -295,6 +305,51 @@ pub fn run_compare_snapshots_command(
     );
 
     Ok(report)
+}
+
+pub fn run_scan_mod_dependencies_command(
+    args: &ScanModDependenciesArgs,
+) -> AppResult<ScanModDependenciesResult> {
+    let profiles = args
+        .mod_roots
+        .iter()
+        .map(|path| scan_mod_dependency_profile(path.as_path()))
+        .collect::<AppResult<Vec<_>>>()?;
+    let baseline_set = build_mod_dependency_baseline_set(&args.version_id, profiles)?;
+    export_mod_dependency_baseline_set_output(&baseline_set, args.output.as_path())?;
+
+    let mut stored_baseline_set_path = None;
+    let mut stored_profile_paths = Vec::new();
+    if args.store_in_report {
+        let storage = match args.report_root.as_ref() {
+            Some(root) => ReportStorage::new(root.clone()),
+            None => ReportStorage::default(),
+        };
+        stored_baseline_set_path = Some(storage.save_mod_dependency_baseline_set_for_version(
+            &baseline_set.version_id,
+            &baseline_set,
+        )?);
+        stored_profile_paths = baseline_set
+            .profiles
+            .iter()
+            .map(|profile| {
+                storage.save_mod_dependency_profile_for_version(&baseline_set.version_id, profile)
+            })
+            .collect::<AppResult<Vec<_>>>()?;
+    }
+
+    info!(
+        output = %args.output.display(),
+        version_id = %baseline_set.version_id,
+        profile_count = baseline_set.profile_count,
+        "mod dependency baseline set exported"
+    );
+
+    Ok(ScanModDependenciesResult {
+        baseline_set,
+        stored_baseline_set_path,
+        stored_profile_paths,
+    })
 }
 
 pub fn build_version_diff_report_v2(

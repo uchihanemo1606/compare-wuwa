@@ -175,6 +175,61 @@ pub struct SnapshotResourceManifestContext {
     pub unmatched_snapshot_assets: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SnapshotCaptureQualitySummary {
+    pub launcher_detected_version: Option<String>,
+    pub launcher_reuse_version: Option<String>,
+    pub launcher_version_matches_snapshot: Option<bool>,
+    pub manifest_resource_count: usize,
+    pub manifest_matched_assets: usize,
+    pub manifest_unmatched_snapshot_assets: usize,
+    pub asset_count: usize,
+    pub assets_with_asset_hash: usize,
+    pub assets_with_any_hash: usize,
+    pub assets_with_signature: usize,
+    pub assets_with_source_context: usize,
+    pub assets_with_rich_metadata: usize,
+    pub meaningfully_enriched_assets: usize,
+    pub extractor_record_count: usize,
+    pub extractor_records_with_hashes: usize,
+    pub extractor_records_with_source_context: usize,
+    pub extractor_records_with_rich_metadata: usize,
+}
+
+impl SnapshotCaptureQualitySummary {
+    pub fn low_signal_reasons(&self, scope: &SnapshotScopeAssessment) -> Vec<String> {
+        let mut reasons = Vec::new();
+        if scope.mostly_install_or_package_level {
+            reasons.push("install/package-level coverage dominates this snapshot".to_string());
+        }
+        if !scope.meaningful_content_coverage {
+            reasons
+                .push("content-like coverage is still below the meaningful threshold".to_string());
+        }
+        if !scope.meaningful_character_coverage {
+            reasons.push(
+                "character-like coverage is still below the meaningful threshold".to_string(),
+            );
+        }
+        if !scope.meaningful_asset_record_enrichment {
+            reasons.push(
+                "asset-level enrichment is still too sparse for strong later compare confidence"
+                    .to_string(),
+            );
+        }
+        if self.launcher_detected_version.is_none() {
+            reasons.push("launcher version evidence is missing".to_string());
+        }
+        if self.manifest_resource_count == 0 {
+            reasons.push("resource manifest evidence is missing".to_string());
+        } else if self.manifest_matched_assets == 0 {
+            reasons.push("resource manifest did not match any snapshot assets".to_string());
+        }
+
+        reasons
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SnapshotBuilder<S, F> {
     asset_source: S,
@@ -732,6 +787,101 @@ pub fn assess_snapshot_scope(snapshot: &GameSnapshot) -> SnapshotScopeAssessment
         coverage,
         note: scope.note.clone(),
         observed_fallback_used,
+    }
+}
+
+pub fn summarize_snapshot_capture_quality(
+    snapshot: &GameSnapshot,
+) -> SnapshotCaptureQualitySummary {
+    SnapshotCaptureQualitySummary {
+        launcher_detected_version: snapshot
+            .context
+            .launcher
+            .as_ref()
+            .map(|launcher| launcher.detected_version.clone()),
+        launcher_reuse_version: snapshot
+            .context
+            .launcher
+            .as_ref()
+            .and_then(|launcher| launcher.reuse_version.clone()),
+        launcher_version_matches_snapshot: snapshot
+            .context
+            .launcher
+            .as_ref()
+            .map(|launcher| launcher.detected_version == snapshot.version_id),
+        manifest_resource_count: snapshot
+            .context
+            .resource_manifest
+            .as_ref()
+            .map(|manifest| manifest.resource_count)
+            .unwrap_or_default(),
+        manifest_matched_assets: snapshot
+            .context
+            .resource_manifest
+            .as_ref()
+            .map(|manifest| manifest.matched_assets)
+            .unwrap_or_default(),
+        manifest_unmatched_snapshot_assets: snapshot
+            .context
+            .resource_manifest
+            .as_ref()
+            .map(|manifest| manifest.unmatched_snapshot_assets)
+            .unwrap_or_default(),
+        asset_count: snapshot.asset_count,
+        assets_with_asset_hash: snapshot
+            .assets
+            .iter()
+            .filter(|asset| asset.hash_fields.asset_hash.is_some())
+            .count(),
+        assets_with_any_hash: snapshot
+            .assets
+            .iter()
+            .filter(|asset| has_snapshot_hash_fields(&asset.hash_fields))
+            .count(),
+        assets_with_signature: snapshot
+            .assets
+            .iter()
+            .filter(|asset| asset.hash_fields.signature.is_some())
+            .count(),
+        assets_with_source_context: snapshot
+            .assets
+            .iter()
+            .filter(|asset| has_source_context(&asset.source))
+            .count(),
+        assets_with_rich_metadata: snapshot
+            .assets
+            .iter()
+            .filter(|asset| has_rich_asset_metadata(&asset.metadata))
+            .count(),
+        meaningfully_enriched_assets: snapshot
+            .assets
+            .iter()
+            .filter(|asset| is_meaningfully_enriched_snapshot_asset(asset))
+            .count(),
+        extractor_record_count: snapshot
+            .context
+            .extractor
+            .as_ref()
+            .map(|extractor| extractor.record_count)
+            .unwrap_or_default(),
+        extractor_records_with_hashes: snapshot
+            .context
+            .extractor
+            .as_ref()
+            .map(|extractor| extractor.records_with_hashes)
+            .unwrap_or_default(),
+        extractor_records_with_source_context: snapshot
+            .context
+            .extractor
+            .as_ref()
+            .map(|extractor| extractor.records_with_source_context)
+            .unwrap_or_default(),
+        extractor_records_with_rich_metadata: snapshot
+            .context
+            .extractor
+            .as_ref()
+            .map(|extractor| extractor.records_with_rich_metadata)
+            .unwrap_or_default(),
     }
 }
 

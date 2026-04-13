@@ -66,6 +66,20 @@ pub fn run(cli: Cli) -> AppResult<()> {
             );
             println!("wrote compare-report: {}", args.output.display());
         }
+        Command::ScanModDependencies(args) => {
+            let result = pipeline::run_scan_mod_dependencies_command(&args)?;
+            println!(
+                "mod dependency baselines exported: version={} profiles={}",
+                result.baseline_set.version_id, result.baseline_set.profile_count
+            );
+            println!("wrote mod-dependency-baselines: {}", args.output.display());
+            if let Some(path) = result.stored_baseline_set_path.as_deref() {
+                println!("stored mod-dependency-baselines: {}", path.display());
+            }
+            for path in &result.stored_profile_paths {
+                println!("stored mod-dependency-profile: {}", path.display());
+            }
+        }
         Command::ExtractWwmiKnowledge(args) => {
             let knowledge = pipeline::run_extract_wwmi_knowledge_command(&args)?;
             println!(

@@ -175,6 +175,74 @@ fn snapshot_command_auto_detects_version_and_enriches_hashes() {
 }
 
 #[test]
+fn snapshot_command_can_store_auto_detected_baseline_with_launcher_and_manifest_context() {
+    let test_root = unique_test_dir();
+    let source_root = test_root.join("game");
+    let report_root = test_root.join("out").join("report");
+    let storage = ReportStorage::new(report_root.clone());
+    let output_path = test_root.join("out").join("snapshot-auto-stored.json");
+
+    seed_local_asset(
+        &source_root,
+        "Client/Content/Paks/pakchunk0-WindowsNoEditor.pak",
+    );
+    fs::write(
+        source_root.join("launcherDownloadConfig.json"),
+        r#"{"version":"3.2.1","reUseVersion":"","state":"ready","isPreDownload":false,"appId":"50004"}"#,
+    )
+    .expect("write launcher config");
+    fs::write(
+        source_root.join("LocalGameResources.json"),
+        r#"{"resource":[{"dest":"Client/Content/Paks/pakchunk0-WindowsNoEditor.pak","size":123,"md5":"abc123"}]}"#,
+    )
+    .expect("write resource manifest");
+
+    let result = run_snapshot_command(&SnapshotArgs {
+        source_root,
+        version_id: "auto".to_string(),
+        output: output_path,
+        capture_scope: SnapshotCaptureScopeArg::Full,
+        extractor_inventory: None,
+        store_in_report: true,
+        report_root: Some(report_root),
+    })
+    .expect("run stored auto snapshot command");
+
+    assert_eq!(result.snapshot.version_id, "3.2.1");
+    assert_eq!(
+        result.stored_snapshot_path.as_deref(),
+        Some(storage.snapshot_path_for_version("3.2.1").as_path())
+    );
+
+    let stored_snapshot = storage
+        .load_snapshot_by_version("3.2.1")
+        .expect("load stored snapshot")
+        .expect("stored snapshot exists");
+    assert_eq!(
+        stored_snapshot
+            .context
+            .launcher
+            .as_ref()
+            .map(|launcher| launcher.detected_version.as_str()),
+        Some("3.2.1")
+    );
+    assert_eq!(
+        stored_snapshot
+            .context
+            .resource_manifest
+            .as_ref()
+            .map(|manifest| manifest.matched_assets),
+        Some(1)
+    );
+    assert!(stored_snapshot.assets.iter().any(|asset| {
+        asset.path == "Client/Content/Paks/pakchunk0-WindowsNoEditor.pak"
+            && asset.hash_fields.asset_hash.as_deref() == Some("abc123")
+    }));
+
+    let _ = fs::remove_dir_all(&test_root);
+}
+
+#[test]
 fn snapshot_command_supports_content_focused_capture_scope() {
     let test_root = unique_test_dir();
     let source_root = test_root.join("game");
@@ -514,7 +582,13 @@ fn prepared_snapshot_command_is_runtime_facing_and_stored_as_official_artifacts(
     assert_eq!(compare_report.old_version.version_id, "6.0.0");
     assert_eq!(compare_report.new_version.version_id, "6.1.0");
     assert!(compare_report.summary.changed_items > 0);
-    assert_eq!(compare_report.scope_notes.len(), 3);
+    assert_eq!(compare_report.scope_notes.len(), 5);
+    assert!(
+        compare_report
+            .scope_notes
+            .iter()
+            .any(|note| note.contains("quality: launcher=missing"))
+    );
     assert!(
         compare_report
             .scope_notes

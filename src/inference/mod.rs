@@ -878,10 +878,7 @@ fn build_mod_dependency_insights(profile: &WwmiModDependencyProfile) -> ModDepen
         },
         mapping_hash: build_mod_dependency_surface_summary(
             profile,
-            &[
-                WwmiModDependencyKind::TextureOverrideHash,
-                WwmiModDependencyKind::ResourceFileReference,
-            ],
+            &[WwmiModDependencyKind::TextureOverrideHash],
             "mapping/hash-sensitive",
         ),
         buffer_layout: build_mod_dependency_surface_summary(
@@ -2791,6 +2788,7 @@ mod tests {
                     non_content_path_count: 2,
                     low_signal_for_character_analysis: true,
                     note: Some("install-level snapshot".to_string()),
+                    ..Default::default()
                 },
                 new_snapshot: SnapshotCompareScopeInfo {
                     acquisition_kind: Some("shallow_filesystem_inventory".to_string()),
@@ -2804,6 +2802,7 @@ mod tests {
                     non_content_path_count: 3,
                     low_signal_for_character_analysis: true,
                     note: Some("install-level snapshot".to_string()),
+                    ..Default::default()
                 },
                 low_signal_compare: true,
                 notes: vec!["low-signal compare scope".to_string()],
@@ -2960,6 +2959,7 @@ mod tests {
                     non_content_path_count: 2,
                     low_signal_for_character_analysis: true,
                     note: Some("legacy low-signal snapshot".to_string()),
+                    ..Default::default()
                 },
                 new_snapshot: SnapshotCompareScopeInfo {
                     acquisition_kind: Some("shallow_filesystem_inventory".to_string()),
@@ -2973,6 +2973,7 @@ mod tests {
                     non_content_path_count: 2,
                     low_signal_for_character_analysis: true,
                     note: Some("legacy low-signal snapshot".to_string()),
+                    ..Default::default()
                 },
                 low_signal_compare: true,
                 notes: vec!["low-signal compare scope".to_string()],

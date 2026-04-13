@@ -11,7 +11,10 @@ use crate::{
     proposal::{MappingProposalOutput, ProposalPatchDraftOutput},
     report::{VersionContinuityArtifact, VersionDiffReportV2},
     snapshot::GameSnapshot,
-    wwmi::WwmiKnowledgeBase,
+    wwmi::{
+        WwmiKnowledgeBase,
+        dependency::{WwmiModDependencyBaselineSet, WwmiModDependencyProfile},
+    },
 };
 
 pub trait Exporter {
@@ -49,6 +52,20 @@ pub fn export_snapshot_compare_output(
 
 pub fn export_wwmi_knowledge_output(knowledge: &WwmiKnowledgeBase, output: &Path) -> AppResult<()> {
     write_pretty_json(output, knowledge)
+}
+
+pub fn export_mod_dependency_profile_output(
+    profile: &WwmiModDependencyProfile,
+    output: &Path,
+) -> AppResult<()> {
+    write_pretty_json(output, profile)
+}
+
+pub fn export_mod_dependency_baseline_set_output(
+    baseline_set: &WwmiModDependencyBaselineSet,
+    output: &Path,
+) -> AppResult<()> {
+    write_pretty_json(output, baseline_set)
 }
 
 pub fn export_inference_output(report: &InferenceReport, output: &Path) -> AppResult<()> {

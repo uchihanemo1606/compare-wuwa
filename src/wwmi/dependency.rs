@@ -2,6 +2,7 @@ use std::{
     collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
@@ -38,6 +39,16 @@ pub struct WwmiModDependencyProfile {
     pub mod_root: String,
     pub ini_file_count: usize,
     pub signals: Vec<WwmiModDependencySignal>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct WwmiModDependencyBaselineSet {
+    pub schema_version: String,
+    pub generated_at_unix_ms: u128,
+    pub version_id: String,
+    pub profile_count: usize,
+    pub profiles: Vec<WwmiModDependencyProfile>,
 }
 
 impl WwmiModDependencyProfile {
@@ -82,6 +93,29 @@ pub fn scan_mod_dependency_profile(mod_root: &Path) -> AppResult<WwmiModDependen
 pub fn load_mod_dependency_profile(path: &Path) -> AppResult<WwmiModDependencyProfile> {
     let profile: WwmiModDependencyProfile = serde_json::from_str(&fs::read_to_string(path)?)?;
     Ok(profile)
+}
+
+pub fn build_mod_dependency_baseline_set(
+    version_id: &str,
+    mut profiles: Vec<WwmiModDependencyProfile>,
+) -> AppResult<WwmiModDependencyBaselineSet> {
+    profiles.sort_by(|left, right| {
+        left.mod_name
+            .as_deref()
+            .unwrap_or(left.mod_root.as_str())
+            .cmp(right.mod_name.as_deref().unwrap_or(right.mod_root.as_str()))
+    });
+
+    Ok(WwmiModDependencyBaselineSet {
+        schema_version: "whashreonator.wwmi-mod-dependency-baselines.v1".to_string(),
+        generated_at_unix_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| AppError::InvalidInput(format!("system clock error: {error}")))?
+            .as_millis(),
+        version_id: version_id.to_string(),
+        profile_count: profiles.len(),
+        profiles,
+    })
 }
 
 fn collect_ini_files(root: &Path, out: &mut Vec<PathBuf>) -> AppResult<()> {

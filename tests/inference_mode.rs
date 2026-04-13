@@ -5,7 +5,6 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use serde_json::json;
 use whashreonator::{
     cli::InferFixesArgs,
     compare::{
@@ -246,6 +245,79 @@ filename = SwordDiffuse.dds
             .evidence
             .iter()
             .any(|evidence| evidence.contains("mod dependency files"))
+    );
+
+    let _ = fs::remove_dir_all(&test_root);
+}
+
+#[test]
+fn infer_fixes_command_does_not_treat_resource_only_profiles_as_mapping_hash_sensitive() {
+    let test_root = unique_test_dir();
+    let compare_path = test_root.join("compare.json");
+    let knowledge_path = test_root.join("knowledge.json");
+    let base_output_path = test_root.join("out").join("inference-base.json");
+    let mod_output_path = test_root.join("out").join("inference-resource-only.json");
+    let mod_root = test_root.join("mods").join("ResourceOnlyMod");
+
+    fs::create_dir_all(&test_root).expect("create test root");
+    fs::write(
+        &compare_path,
+        serde_json::to_string_pretty(&sample_compare_report()).expect("serialize compare"),
+    )
+    .expect("write compare report");
+    fs::write(
+        &knowledge_path,
+        serde_json::to_string_pretty(&sample_knowledge()).expect("serialize knowledge"),
+    )
+    .expect("write knowledge report");
+    write_mod_ini(
+        &mod_root,
+        "mod.ini",
+        r#"
+[ResourceSword]
+filename = SwordDiffuse.dds
+"#,
+    );
+
+    let base_report = run_infer_fixes_command(&InferFixesArgs {
+        compare_report: compare_path.clone(),
+        wwmi_knowledge: knowledge_path.clone(),
+        continuity_artifact: None,
+        report_root: None,
+        mod_root: None,
+        mod_dependency_profile: None,
+        output: base_output_path,
+    })
+    .expect("run baseline inference command");
+    let mod_report = run_infer_fixes_command(&InferFixesArgs {
+        compare_report: compare_path,
+        wwmi_knowledge: knowledge_path,
+        continuity_artifact: None,
+        report_root: None,
+        mod_root: Some(mod_root),
+        mod_dependency_profile: None,
+        output: mod_output_path,
+    })
+    .expect("run resource-only mod-aware inference command");
+
+    let base_fix = base_report
+        .suggested_fixes
+        .iter()
+        .find(|fix| fix.code == "review_candidate_asset_remaps")
+        .expect("baseline remap fix");
+    let mod_fix = mod_report
+        .suggested_fixes
+        .iter()
+        .find(|fix| fix.code == "review_candidate_asset_remaps")
+        .expect("mod-aware remap fix");
+
+    assert!(mod_report.mod_dependency_input.is_some());
+    assert_eq!(mod_fix.confidence, base_fix.confidence);
+    assert!(
+        mod_fix
+            .reasons
+            .iter()
+            .all(|reason| !reason.contains("mapping/hash-sensitive"))
     );
 
     let _ = fs::remove_dir_all(&test_root);
