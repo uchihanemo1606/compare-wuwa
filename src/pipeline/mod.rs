@@ -4,7 +4,7 @@ use tracing::info;
 
 use crate::wwmi::dependency::{
     WwmiModDependencyBaselineSet, WwmiModDependencyProfile, build_mod_dependency_baseline_set,
-    load_mod_dependency_profile, scan_mod_dependency_profile,
+    load_mod_dependency_baseline_set, load_mod_dependency_profile, scan_mod_dependency_profile,
 };
 use crate::{
     cli::{
@@ -388,11 +388,14 @@ pub fn run_infer_fixes_command(args: &InferFixesArgs) -> AppResult<InferenceRepo
     let knowledge = load_wwmi_knowledge(args.wwmi_knowledge.as_path())?;
     let continuity = resolve_inference_continuity(args, &compare_report)?;
     let mod_dependency_profile = resolve_inference_mod_dependency_profile(args)?;
-    let report = FixInferenceEngine.infer_with_continuity_and_mod_profile(
+    let representative_mod_baseline_set =
+        resolve_inference_representative_mod_baseline_set(args, &compare_report)?;
+    let report = FixInferenceEngine.infer_with_context(
         &compare_report,
         &knowledge,
         continuity.as_ref(),
         mod_dependency_profile.as_ref(),
+        representative_mod_baseline_set.as_ref(),
     );
     export_inference_output(&report, args.output.as_path())?;
     info!(
@@ -446,6 +449,28 @@ fn resolve_inference_mod_dependency_profile(
     }
 
     Ok(None)
+}
+
+fn resolve_inference_representative_mod_baseline_set(
+    args: &InferFixesArgs,
+    compare_report: &SnapshotCompareReport,
+) -> AppResult<Option<WwmiModDependencyBaselineSet>> {
+    if let Some(path) = args.representative_mod_baseline_set.as_deref() {
+        return Ok(Some(load_mod_dependency_baseline_set(path)?));
+    }
+
+    let Some(report_root) = args.report_root.as_ref() else {
+        return Ok(None);
+    };
+
+    let storage = ReportStorage::new(report_root.clone());
+    if let Some(baseline_set) =
+        storage.load_latest_mod_dependency_baseline_set(&compare_report.old_snapshot.version_id)?
+    {
+        return Ok(Some(baseline_set));
+    }
+
+    storage.load_latest_mod_dependency_baseline_set(&compare_report.new_snapshot.version_id)
 }
 
 pub fn run_generate_proposals_command(args: &GenerateProposalsArgs) -> AppResult<ProposalResult> {

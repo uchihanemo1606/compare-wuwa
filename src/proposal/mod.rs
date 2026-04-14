@@ -730,6 +730,7 @@ mod tests {
                 discovered_patterns: 3,
             },
             mod_dependency_input: None,
+            representative_mod_baseline_input: None,
             scope: InferenceScopeContext::default(),
             summary: InferenceSummary {
                 probable_crash_causes: 1,
@@ -795,6 +796,7 @@ mod tests {
                     evidence: vec!["compare candidate confidence 0.950".to_string()],
                 },
             ],
+            representative_risk_projections: Vec::new(),
         };
 
         let artifacts = ProposalEngine.generate(&report, 0.90);
@@ -845,6 +847,7 @@ mod tests {
                 discovered_patterns: 1,
             },
             mod_dependency_input: None,
+            representative_mod_baseline_input: None,
             scope: InferenceScopeContext {
                 low_signal_compare: true,
                 old_snapshot_low_signal: true,
@@ -901,6 +904,7 @@ mod tests {
                     evidence: vec!["compare candidate confidence 0.960".to_string()],
                 },
             ],
+            representative_risk_projections: Vec::new(),
         };
 
         let artifacts = ProposalEngine.generate(&report, 0.90);
@@ -948,6 +952,7 @@ mod tests {
                 discovered_patterns: 2,
             },
             mod_dependency_input: None,
+            representative_mod_baseline_input: None,
             scope: InferenceScopeContext::default(),
             summary: InferenceSummary {
                 probable_crash_causes: 1,
@@ -993,6 +998,7 @@ mod tests {
                 ],
                 evidence: vec!["compare candidate confidence 0.940".to_string()],
             }],
+            representative_risk_projections: Vec::new(),
         };
 
         let artifacts = ProposalEngine.generate(&report, 0.90);
@@ -1030,6 +1036,7 @@ mod tests {
                 discovered_patterns: 2,
             },
             mod_dependency_input: None,
+            representative_mod_baseline_input: None,
             scope: InferenceScopeContext::default(),
             summary: InferenceSummary {
                 probable_crash_causes: 0,
@@ -1072,6 +1079,7 @@ mod tests {
                     evidence: vec!["compare candidate confidence 0.970".to_string()],
                 },
             ],
+            representative_risk_projections: Vec::new(),
         };
 
         let artifacts = ProposalEngine.generate(&report, 0.90);
@@ -1120,6 +1128,7 @@ mod tests {
                 discovered_patterns: 2,
             },
             mod_dependency_input: None,
+            representative_mod_baseline_input: None,
             scope: InferenceScopeContext::default(),
             summary: InferenceSummary {
                 probable_crash_causes: 1,
@@ -1176,6 +1185,7 @@ mod tests {
                 ],
                 evidence: vec!["compare candidate confidence 0.950".to_string()],
             }],
+            representative_risk_projections: Vec::new(),
         };
 
         let artifacts = ProposalEngine.generate(&report, 0.90);
@@ -1226,6 +1236,7 @@ mod tests {
                 discovered_patterns: 1,
             },
             mod_dependency_input: None,
+            representative_mod_baseline_input: None,
             scope: InferenceScopeContext::default(),
             summary: InferenceSummary {
                 probable_crash_causes: 0,
@@ -1264,6 +1275,7 @@ mod tests {
                 ],
                 evidence: vec!["compare candidate confidence 0.940".to_string()],
             }],
+            representative_risk_projections: Vec::new(),
         };
 
         let artifacts = ProposalEngine.generate(&report, 0.90);

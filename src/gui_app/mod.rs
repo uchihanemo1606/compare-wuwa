@@ -1322,6 +1322,7 @@ mod tests {
                 discovered_patterns: 2,
             },
             mod_dependency_input: None,
+            representative_mod_baseline_input: None,
             scope: InferenceScopeContext::default(),
             summary: InferenceSummary {
                 probable_crash_causes: 1,
@@ -1380,6 +1381,7 @@ mod tests {
                 reasons: vec!["same_parent_directory: same folder".to_string()],
                 evidence: vec!["compare candidate confidence 0.900".to_string()],
             }],
+            representative_risk_projections: Vec::new(),
         }
     }
 }

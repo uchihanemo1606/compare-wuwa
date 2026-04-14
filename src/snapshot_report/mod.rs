@@ -144,7 +144,7 @@ fn render_markdown(
 
     lines.push("## Capture Quality".to_string());
     lines.push(
-        "| Version | Acquisition | Capture Mode | Low Signal | Launcher Evidence | Manifest Evidence | Hash Coverage | Enrichment Signals | Extractor Evidence |"
+        "| Version | Acquisition | Capture Mode | Low Signal | Launcher Evidence | Manifest Coverage | Hash Coverage | Asset-level Enrichment | Extractor Evidence |"
             .to_string(),
     );
     lines.push("| --- | --- | --- | --- | --- | --- | --- | --- | --- |".to_string());
@@ -184,6 +184,12 @@ fn render_markdown(
                 "- {}: shallow filesystem inventory or low-coverage/low-enrichment extractor snapshot; resonator-level and mapping-level interpretation can be incomplete. Missing/weak signals: {}.",
                 snapshot.version_id,
                 quality.low_signal_reasons(scope).join("; ")
+            ));
+        }
+        if has_shallow_hash_or_manifest_only_support(scope, quality) {
+            low_signal_lines.push(format!(
+                "- {}: manifest/hash coverage exists, but it remains shallow support and should not be read as rich asset-level enrichment.",
+                snapshot.version_id
             ));
         }
     }
@@ -433,6 +439,17 @@ fn enrichment_evidence(quality: &SnapshotCaptureQualitySummary) -> String {
         quality.meaningfully_enriched_assets,
         quality.asset_count
     )
+}
+
+fn has_shallow_hash_or_manifest_only_support(
+    scope: &SnapshotScopeAssessment,
+    quality: &SnapshotCaptureQualitySummary,
+) -> bool {
+    !scope.meaningful_asset_record_enrichment
+        && (quality.manifest_resource_count > 0
+            || quality.assets_with_asset_hash > 0
+            || quality.assets_with_any_hash > 0
+            || quality.assets_with_signature > 0)
 }
 
 fn extractor_evidence(quality: &SnapshotCaptureQualitySummary) -> String {

@@ -466,7 +466,7 @@ fn build_compare_scope_context(
         notes.push(format!("old snapshot {}: {note}", old_snapshot.version_id));
     }
     notes.push(format!(
-        "old snapshot {} quality: launcher={} reuse={} matches_snapshot={} manifest_resources={} manifest_matches={} unmatched_snapshot_assets={} asset_hashes={}/{} any_hashes={}/{} signatures={}/{} source_context={}/{} rich_metadata={}/{} enriched_assets={}/{} extractor_records={}",
+        "old snapshot {} quality: launcher={} reuse={} matches_snapshot={} manifest_coverage=resources:{} matched:{} unmatched_snapshot_assets:{} hash_coverage=asset_hashes:{}/{} any_hashes:{}/{} signatures:{}/{} asset_enrichment=source_context:{}/{} rich_metadata:{}/{} enriched_assets:{}/{} extractor_records={}",
         old_snapshot.version_id,
         old_quality.launcher_detected_version.as_deref().unwrap_or("missing"),
         old_quality.launcher_reuse_version.as_deref().unwrap_or("-"),
@@ -495,7 +495,7 @@ fn build_compare_scope_context(
         notes.push(format!("new snapshot {}: {note}", new_snapshot.version_id));
     }
     notes.push(format!(
-        "new snapshot {} quality: launcher={} reuse={} matches_snapshot={} manifest_resources={} manifest_matches={} unmatched_snapshot_assets={} asset_hashes={}/{} any_hashes={}/{} signatures={}/{} source_context={}/{} rich_metadata={}/{} enriched_assets={}/{} extractor_records={}",
+        "new snapshot {} quality: launcher={} reuse={} matches_snapshot={} manifest_coverage=resources:{} matched:{} unmatched_snapshot_assets:{} hash_coverage=asset_hashes:{}/{} any_hashes:{}/{} signatures:{}/{} asset_enrichment=source_context:{}/{} rich_metadata:{}/{} enriched_assets:{}/{} extractor_records={}",
         new_snapshot.version_id,
         new_quality.launcher_detected_version.as_deref().unwrap_or("missing"),
         new_quality.launcher_reuse_version.as_deref().unwrap_or("-"),
@@ -531,6 +531,14 @@ fn build_compare_scope_context(
     {
         notes.push(
             "compare scope includes shallow filesystem inventory or low-coverage/low-enrichment extractor snapshots; deep character-level interpretation is limited"
+                .to_string(),
+        );
+    }
+    if has_shallow_hash_or_manifest_only_support(&old_scope, &old_quality)
+        || has_shallow_hash_or_manifest_only_support(&new_scope, &new_quality)
+    {
+        notes.push(
+            "manifest/hash coverage may be present for this compare pair, but shallow coverage is not equivalent to rich asset-level enrichment"
                 .to_string(),
         );
     }
@@ -591,6 +599,17 @@ fn build_compare_scope_context(
         low_signal_compare: old_low_signal || new_low_signal,
         notes,
     }
+}
+
+fn has_shallow_hash_or_manifest_only_support(
+    scope: &crate::snapshot::SnapshotScopeAssessment,
+    quality: &crate::snapshot::SnapshotCaptureQualitySummary,
+) -> bool {
+    !scope.meaningful_asset_record_enrichment
+        && (quality.manifest_resource_count > 0
+            || quality.assets_with_asset_hash > 0
+            || quality.assets_with_any_hash > 0
+            || quality.assets_with_signature > 0)
 }
 
 pub fn load_snapshot_compare_report(path: &Path) -> AppResult<SnapshotCompareReport> {

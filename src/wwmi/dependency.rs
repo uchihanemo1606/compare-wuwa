@@ -95,6 +95,12 @@ pub fn load_mod_dependency_profile(path: &Path) -> AppResult<WwmiModDependencyPr
     Ok(profile)
 }
 
+pub fn load_mod_dependency_baseline_set(path: &Path) -> AppResult<WwmiModDependencyBaselineSet> {
+    let baseline_set: WwmiModDependencyBaselineSet =
+        serde_json::from_str(&fs::read_to_string(path)?)?;
+    Ok(baseline_set)
+}
+
 pub fn build_mod_dependency_baseline_set(
     version_id: &str,
     mut profiles: Vec<WwmiModDependencyProfile>,

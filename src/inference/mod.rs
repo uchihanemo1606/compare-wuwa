@@ -20,7 +20,9 @@ use crate::{
     },
     wwmi::{
         WwmiKnowledgeBase, WwmiPatternKind,
-        dependency::{WwmiModDependencyKind, WwmiModDependencyProfile},
+        dependency::{
+            WwmiModDependencyBaselineSet, WwmiModDependencyKind, WwmiModDependencyProfile,
+        },
         load_wwmi_knowledge,
     },
 };
@@ -34,11 +36,15 @@ pub struct InferenceReport {
     #[serde(default)]
     pub mod_dependency_input: Option<InferenceModDependencyInput>,
     #[serde(default)]
+    pub representative_mod_baseline_input: Option<InferenceRepresentativeModBaselineInput>,
+    #[serde(default)]
     pub scope: InferenceScopeContext,
     pub summary: InferenceSummary,
     pub probable_crash_causes: Vec<ProbableCrashCause>,
     pub suggested_fixes: Vec<SuggestedFix>,
     pub candidate_mapping_hints: Vec<InferredMappingHint>,
+    #[serde(default)]
+    pub representative_risk_projections: Vec<RepresentativeModRiskProjection>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -76,6 +82,21 @@ pub struct InferenceModDependencyInput {
     pub ini_file_count: usize,
     pub signal_count: usize,
     pub dependency_kinds: Vec<WwmiModDependencyKind>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct InferenceRepresentativeModBaselineInput {
+    pub version_id: String,
+    pub profile_count: usize,
+    pub risk_class_counts: Vec<InferenceRepresentativeRiskClassCount>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct InferenceRepresentativeRiskClassCount {
+    pub risk_class: RepresentativeModRiskClass,
+    pub profile_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -125,6 +146,35 @@ pub struct InferredMappingHint {
     #[serde(default)]
     pub continuity: Option<InferredMappingContinuityContext>,
     pub reasons: Vec<String>,
+    pub evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RepresentativeModRiskClass {
+    #[default]
+    MappingHashSensitive,
+    BufferLayoutSensitive,
+    ResourceSkeletonSensitive,
+    DrawCallFilterHookSensitive,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RepresentativeModRiskProjection {
+    pub risk_class: RepresentativeModRiskClass,
+    pub summary: String,
+    pub confidence: f32,
+    pub priority: RiskLevel,
+    pub representative_profile_count: usize,
+    #[serde(default)]
+    pub review_first: bool,
+    #[serde(default)]
+    pub triggering_compare_signals: Vec<String>,
+    #[serde(default)]
+    pub sample_mod_names: Vec<String>,
+    #[serde(default)]
+    pub reasons: Vec<String>,
+    #[serde(default)]
     pub evidence: Vec<String>,
 }
 
@@ -196,11 +246,29 @@ struct ModDependencyInsights {
 }
 
 #[derive(Debug, Clone)]
+struct RepresentativeModBaselineInsights {
+    input: InferenceRepresentativeModBaselineInput,
+    mapping_hash: Option<RepresentativeBaselineSurfaceSummary>,
+    buffer_layout: Option<RepresentativeBaselineSurfaceSummary>,
+    resource_or_skeleton: Option<RepresentativeBaselineSurfaceSummary>,
+    draw_call_filter_hook: Option<RepresentativeBaselineSurfaceSummary>,
+}
+
+#[derive(Debug, Clone)]
 struct ModDependencySurfaceSummary {
     dependency_kinds: Vec<WwmiModDependencyKind>,
     signal_count: usize,
     source_files: Vec<String>,
     sections: Vec<String>,
+    label: &'static str,
+}
+
+#[derive(Debug, Clone)]
+struct RepresentativeBaselineSurfaceSummary {
+    risk_class: RepresentativeModRiskClass,
+    profile_count: usize,
+    sample_mod_names: Vec<String>,
+    dependency_kinds: Vec<WwmiModDependencyKind>,
     label: &'static str,
 }
 
@@ -220,7 +288,7 @@ impl FixInferenceEngine {
         compare_report: &SnapshotCompareReport,
         wwmi_knowledge: &WwmiKnowledgeBase,
     ) -> InferenceReport {
-        self.infer_with_continuity_and_mod_profile(compare_report, wwmi_knowledge, None, None)
+        self.infer_with_context(compare_report, wwmi_knowledge, None, None, None)
     }
 
     pub fn infer_with_continuity(
@@ -229,7 +297,7 @@ impl FixInferenceEngine {
         wwmi_knowledge: &WwmiKnowledgeBase,
         continuity: Option<&VersionContinuityIndex>,
     ) -> InferenceReport {
-        self.infer_with_continuity_and_mod_profile(compare_report, wwmi_knowledge, continuity, None)
+        self.infer_with_context(compare_report, wwmi_knowledge, continuity, None, None)
     }
 
     pub fn infer_with_continuity_and_mod_profile(
@@ -239,8 +307,31 @@ impl FixInferenceEngine {
         continuity: Option<&VersionContinuityIndex>,
         mod_dependency_profile: Option<&WwmiModDependencyProfile>,
     ) -> InferenceReport {
+        self.infer_with_context(
+            compare_report,
+            wwmi_knowledge,
+            continuity,
+            mod_dependency_profile,
+            None,
+        )
+    }
+
+    pub fn infer_with_context(
+        &self,
+        compare_report: &SnapshotCompareReport,
+        wwmi_knowledge: &WwmiKnowledgeBase,
+        continuity: Option<&VersionContinuityIndex>,
+        mod_dependency_profile: Option<&WwmiModDependencyProfile>,
+        representative_mod_baseline_set: Option<&WwmiModDependencyBaselineSet>,
+    ) -> InferenceReport {
         let mod_dependency = mod_dependency_profile.map(build_mod_dependency_insights);
-        let scope = build_inference_scope_context(compare_report, mod_dependency.as_ref());
+        let representative_mod_baseline =
+            representative_mod_baseline_set.map(build_representative_mod_baseline_insights);
+        let scope = build_inference_scope_context(
+            compare_report,
+            mod_dependency.as_ref(),
+            representative_mod_baseline.as_ref(),
+        );
         let confidence_scale = if scope.low_signal_compare { 0.85 } else { 1.0 };
         let continuity_context =
             continuity.map(|index| build_inference_continuity_context(compare_report, index));
@@ -803,6 +894,17 @@ impl FixInferenceEngine {
             );
         }
 
+        let representative_risk_projections = representative_mod_baseline
+            .as_ref()
+            .map(|baseline| {
+                build_representative_risk_projections(
+                    compare_report,
+                    scope.low_signal_compare,
+                    baseline,
+                )
+            })
+            .unwrap_or_default();
+
         candidate_mapping_hints.sort_by(|left, right| {
             right
                 .confidence
@@ -848,6 +950,9 @@ impl FixInferenceEngine {
                 discovered_patterns: wwmi_knowledge.summary.discovered_patterns,
             },
             mod_dependency_input: mod_dependency.as_ref().map(|value| value.input.clone()),
+            representative_mod_baseline_input: representative_mod_baseline
+                .as_ref()
+                .map(|value| value.input.clone()),
             scope,
             summary: InferenceSummary {
                 probable_crash_causes: probable_crash_causes.len(),
@@ -858,6 +963,7 @@ impl FixInferenceEngine {
             probable_crash_causes,
             suggested_fixes,
             candidate_mapping_hints,
+            representative_risk_projections,
         }
     }
 }
@@ -910,6 +1016,74 @@ fn build_mod_dependency_insights(profile: &WwmiModDependencyProfile) -> ModDepen
     }
 }
 
+fn build_representative_mod_baseline_insights(
+    baseline_set: &WwmiModDependencyBaselineSet,
+) -> RepresentativeModBaselineInsights {
+    let mapping_hash = build_representative_surface_summary(
+        &baseline_set.profiles,
+        &[WwmiModDependencyKind::TextureOverrideHash],
+        RepresentativeModRiskClass::MappingHashSensitive,
+        "mapping/hash-sensitive",
+    );
+    let buffer_layout = build_representative_surface_summary(
+        &baseline_set.profiles,
+        &[
+            WwmiModDependencyKind::BufferLayoutHint,
+            WwmiModDependencyKind::MeshVertexCount,
+            WwmiModDependencyKind::ShapeKeyVertexCount,
+        ],
+        RepresentativeModRiskClass::BufferLayoutSensitive,
+        "buffer/layout-sensitive",
+    );
+    let resource_or_skeleton = build_representative_surface_summary(
+        &baseline_set.profiles,
+        &[
+            WwmiModDependencyKind::ResourceFileReference,
+            WwmiModDependencyKind::SkeletonMergeDependency,
+        ],
+        RepresentativeModRiskClass::ResourceSkeletonSensitive,
+        "resource/skeleton-sensitive",
+    );
+    let draw_call_filter_hook = build_representative_surface_summary(
+        &baseline_set.profiles,
+        &[
+            WwmiModDependencyKind::ObjectGuid,
+            WwmiModDependencyKind::DrawCallTarget,
+            WwmiModDependencyKind::FilterIndex,
+        ],
+        RepresentativeModRiskClass::DrawCallFilterHookSensitive,
+        "draw-call/filter/hook-sensitive",
+    );
+
+    let mut risk_class_counts = Vec::new();
+    for surface in [
+        mapping_hash.as_ref(),
+        buffer_layout.as_ref(),
+        resource_or_skeleton.as_ref(),
+        draw_call_filter_hook.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        risk_class_counts.push(InferenceRepresentativeRiskClassCount {
+            risk_class: surface.risk_class.clone(),
+            profile_count: surface.profile_count,
+        });
+    }
+
+    RepresentativeModBaselineInsights {
+        input: InferenceRepresentativeModBaselineInput {
+            version_id: baseline_set.version_id.clone(),
+            profile_count: baseline_set.profile_count,
+            risk_class_counts,
+        },
+        mapping_hash,
+        buffer_layout,
+        resource_or_skeleton,
+        draw_call_filter_hook,
+    }
+}
+
 fn build_mod_dependency_surface_summary(
     profile: &WwmiModDependencyProfile,
     kinds: &[WwmiModDependencyKind],
@@ -948,6 +1122,53 @@ fn build_mod_dependency_surface_summary(
         signal_count: matched.len(),
         source_files,
         sections,
+        label,
+    })
+}
+
+fn build_representative_surface_summary(
+    profiles: &[WwmiModDependencyProfile],
+    kinds: &[WwmiModDependencyKind],
+    risk_class: RepresentativeModRiskClass,
+    label: &'static str,
+) -> Option<RepresentativeBaselineSurfaceSummary> {
+    let matched_profiles = profiles
+        .iter()
+        .filter(|profile| {
+            profile
+                .signals
+                .iter()
+                .any(|signal| kinds.contains(&signal.kind))
+        })
+        .collect::<Vec<_>>();
+    if matched_profiles.is_empty() {
+        return None;
+    }
+
+    let dependency_kinds = matched_profiles
+        .iter()
+        .flat_map(|profile| profile.signals.iter())
+        .filter(|signal| kinds.contains(&signal.kind))
+        .map(|signal| signal.kind.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let sample_mod_names = matched_profiles
+        .iter()
+        .map(|profile| {
+            profile
+                .mod_name
+                .clone()
+                .unwrap_or_else(|| profile.mod_root.clone())
+        })
+        .take(3)
+        .collect::<Vec<_>>();
+
+    Some(RepresentativeBaselineSurfaceSummary {
+        risk_class,
+        profile_count: matched_profiles.len(),
+        sample_mod_names,
+        dependency_kinds,
         label,
     })
 }
@@ -1104,6 +1325,7 @@ fn infer_mapping_hint(
 fn build_inference_scope_context(
     compare_report: &SnapshotCompareReport,
     mod_dependency: Option<&ModDependencyInsights>,
+    representative_mod_baseline: Option<&RepresentativeModBaselineInsights>,
 ) -> InferenceScopeContext {
     let mut notes = compare_report.scope.notes.clone();
     if compare_report.scope.low_signal_compare {
@@ -1112,6 +1334,8 @@ fn build_inference_scope_context(
                 .to_string(),
         );
     }
+    append_scope_capture_quality_guardrail(&mut notes, &compare_report.scope.old_snapshot);
+    append_scope_capture_quality_guardrail(&mut notes, &compare_report.scope.new_snapshot);
     if let Some(mod_dependency) = mod_dependency {
         notes.push(format!(
             "mod dependency profile {} scanned {} ini file(s), {} signal(s), dependency kinds={}",
@@ -1123,6 +1347,13 @@ fn build_inference_scope_context(
             mod_dependency.input.ini_file_count,
             mod_dependency.input.signal_count,
             join_dependency_kind_labels(&mod_dependency.input.dependency_kinds)
+        ));
+    }
+    if let Some(representative_mod_baseline) = representative_mod_baseline {
+        notes.push(format!(
+            "representative mod baseline set {} loaded with {} profile(s)",
+            representative_mod_baseline.input.version_id,
+            representative_mod_baseline.input.profile_count
         ));
     }
 
@@ -1137,6 +1368,22 @@ fn build_inference_scope_context(
             .new_snapshot
             .low_signal_for_character_analysis,
         notes,
+    }
+}
+
+fn append_scope_capture_quality_guardrail(
+    notes: &mut Vec<String>,
+    scope: &crate::compare::SnapshotCompareScopeInfo,
+) {
+    let has_hash_or_manifest_coverage = scope.manifest_resource_count > 0
+        || scope.assets_with_asset_hash > 0
+        || scope.assets_with_any_hash > 0
+        || scope.assets_with_signature > 0;
+    if has_hash_or_manifest_coverage && !scope.meaningful_asset_record_enrichment {
+        notes.push(
+            "manifest/hash coverage is present, but that remains shallow evidence and should not be treated as rich asset-level enrichment"
+                .to_string(),
+        );
     }
 }
 
@@ -1438,6 +1685,225 @@ fn apply_mod_dependency_inference_adjustments(
                 "draw-call/filter/object-guid hooks can break independently of asset similarity",
             );
         }
+    }
+}
+
+fn build_representative_risk_projections(
+    compare_report: &SnapshotCompareReport,
+    low_signal_compare: bool,
+    baseline: &RepresentativeModBaselineInsights,
+) -> Vec<RepresentativeModRiskProjection> {
+    let mut projections = Vec::new();
+
+    if let Some(surface) = baseline.mapping_hash.as_ref() {
+        let signals = mapping_hash_projection_signals(compare_report);
+        if !signals.is_empty() {
+            projections.push(build_representative_projection(
+                surface,
+                "Compare drift touches removed paths, remap candidates, or identity/hash-adjacent changes that commonly affect mapping/hash-sensitive mods.",
+                signals,
+                low_signal_compare,
+                RiskLevel::High,
+                0.64,
+            ));
+        }
+    }
+
+    if let Some(surface) = baseline.buffer_layout.as_ref() {
+        let signals = buffer_layout_projection_signals(compare_report);
+        if !signals.is_empty() {
+            projections.push(build_representative_projection(
+                surface,
+                "Compare drift carries structural or layout-sensitive movement that representative buffer/layout-sensitive mods should review first.",
+                signals,
+                low_signal_compare,
+                RiskLevel::High,
+                0.69,
+            ));
+        }
+    }
+
+    if let Some(surface) = baseline.resource_or_skeleton.as_ref() {
+        let signals = resource_skeleton_projection_signals(compare_report);
+        if !signals.is_empty() {
+            projections.push(build_representative_projection(
+                surface,
+                "Compare drift touches container/resource/skeleton surfaces that representative resource/skeleton-sensitive mods commonly bind to.",
+                signals,
+                low_signal_compare,
+                RiskLevel::High,
+                0.61,
+            ));
+        }
+    }
+
+    if let Some(surface) = baseline.draw_call_filter_hook.as_ref() {
+        let signals = draw_call_filter_hook_projection_signals(compare_report);
+        if !signals.is_empty() {
+            projections.push(build_representative_projection(
+                surface,
+                "Compare drift would still require manual hook retargeting for representative draw-call/filter/hook-sensitive mods.",
+                signals,
+                true,
+                RiskLevel::Medium,
+                0.55,
+            ));
+        }
+    }
+
+    projections.sort_by(|left, right| {
+        review_risk_rank(&right.priority)
+            .cmp(&review_risk_rank(&left.priority))
+            .then_with(|| right.confidence.total_cmp(&left.confidence))
+            .then_with(|| {
+                representative_risk_class_label(&left.risk_class)
+                    .cmp(representative_risk_class_label(&right.risk_class))
+            })
+    });
+    projections
+}
+
+fn build_representative_projection(
+    surface: &RepresentativeBaselineSurfaceSummary,
+    summary: &str,
+    triggering_compare_signals: Vec<String>,
+    review_first: bool,
+    priority: RiskLevel,
+    base_confidence: f32,
+) -> RepresentativeModRiskProjection {
+    let confidence = if review_first {
+        (base_confidence - 0.04).clamp(0.0, 1.0)
+    } else {
+        base_confidence.clamp(0.0, 1.0)
+    };
+
+    RepresentativeModRiskProjection {
+        risk_class: surface.risk_class.clone(),
+        summary: summary.to_string(),
+        confidence,
+        priority,
+        representative_profile_count: surface.profile_count,
+        review_first,
+        triggering_compare_signals: triggering_compare_signals.clone(),
+        sample_mod_names: surface.sample_mod_names.clone(),
+        reasons: vec![
+            format!(
+                "representative baseline set contains {} {} profile(s)",
+                surface.profile_count, surface.label
+            ),
+            format!(
+                "projection triggered by compare signals: {}",
+                triggering_compare_signals.join(", ")
+            ),
+        ],
+        evidence: vec![
+            format!(
+                "representative dependency kinds: {}",
+                join_dependency_kind_labels(&surface.dependency_kinds)
+            ),
+            format!(
+                "representative sample mods: {}",
+                if surface.sample_mod_names.is_empty() {
+                    "-".to_string()
+                } else {
+                    surface.sample_mod_names.join(", ")
+                }
+            ),
+        ],
+    }
+}
+
+fn mapping_hash_projection_signals(compare_report: &SnapshotCompareReport) -> Vec<String> {
+    let mut signals = Vec::new();
+    if !compare_report.removed_assets.is_empty() {
+        signals.push("removed_assets".to_string());
+    }
+    if !compare_report.candidate_mapping_changes.is_empty() {
+        signals.push("candidate_mapping_changes".to_string());
+    }
+    if compare_report.changed_assets.iter().any(|change| {
+        change.changed_fields.iter().any(|field| {
+            matches!(
+                field.as_str(),
+                "asset_hash" | "shader_hash" | "signature" | "path_presence"
+            )
+        })
+    }) {
+        signals.push("hash_or_identity_field_drift".to_string());
+    }
+    signals
+}
+
+fn buffer_layout_projection_signals(compare_report: &SnapshotCompareReport) -> Vec<String> {
+    let mut signals = Vec::new();
+    if compare_report
+        .changed_assets
+        .iter()
+        .any(|change| is_structural_change(change))
+    {
+        signals.push("structural_changed_assets".to_string());
+    }
+    if compare_report
+        .candidate_mapping_changes
+        .iter()
+        .any(|candidate| candidate.compatibility == RemapCompatibility::StructurallyRisky)
+    {
+        signals.push("structurally_risky_candidate_remaps".to_string());
+    }
+    if compare_report.summary.lineage_layout_drift_assets > 0 {
+        signals.push("lineage_layout_drift".to_string());
+    }
+    signals
+}
+
+fn resource_skeleton_projection_signals(compare_report: &SnapshotCompareReport) -> Vec<String> {
+    let mut signals = Vec::new();
+    if compare_report.summary.container_moved_assets > 0 {
+        signals.push("container_moved_assets".to_string());
+    }
+    if !resource_or_skeleton_affected_assets(compare_report).is_empty() {
+        signals.push("resource_or_skeleton_field_drift".to_string());
+    }
+    signals
+}
+
+fn draw_call_filter_hook_projection_signals(compare_report: &SnapshotCompareReport) -> Vec<String> {
+    let mut signals = Vec::new();
+    if !compare_report.candidate_mapping_changes.is_empty() {
+        signals.push("candidate_mapping_changes".to_string());
+    }
+    if !compare_report.removed_assets.is_empty() {
+        signals.push("removed_assets".to_string());
+    }
+    if compare_report.changed_assets.iter().any(|change| {
+        change.changed_fields.iter().any(|field| {
+            matches!(
+                field.as_str(),
+                "container_path" | "source_kind" | "asset_hash" | "signature"
+            )
+        })
+    }) {
+        signals.push("hook_targeting_context_drift".to_string());
+    }
+    signals
+}
+
+fn representative_risk_class_label(risk_class: &RepresentativeModRiskClass) -> &'static str {
+    match risk_class {
+        RepresentativeModRiskClass::MappingHashSensitive => "mapping/hash-sensitive",
+        RepresentativeModRiskClass::BufferLayoutSensitive => "buffer/layout-sensitive",
+        RepresentativeModRiskClass::ResourceSkeletonSensitive => "resource/skeleton-sensitive",
+        RepresentativeModRiskClass::DrawCallFilterHookSensitive => {
+            "draw-call/filter/hook-sensitive"
+        }
+    }
+}
+
+fn review_risk_rank(risk: &RiskLevel) -> u8 {
+    match risk {
+        RiskLevel::High => 3,
+        RiskLevel::Medium => 2,
+        RiskLevel::Low => 1,
     }
 }
 

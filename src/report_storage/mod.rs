@@ -23,7 +23,9 @@ use crate::{
         load_version_diff_report_v2,
     },
     snapshot::{GameSnapshot, load_snapshot},
-    wwmi::dependency::{WwmiModDependencyBaselineSet, WwmiModDependencyProfile},
+    wwmi::dependency::{
+        WwmiModDependencyBaselineSet, WwmiModDependencyProfile, load_mod_dependency_baseline_set,
+    },
 };
 
 const VERSION_DIR_PREFIX: &str = "wuwa_";
@@ -730,6 +732,35 @@ impl ReportStorage {
             if let Ok(content) = fs::read_to_string(&path)
                 && let Ok(parsed) = serde_json::from_str::<InferenceReport>(&content)
             {
+                return Ok(Some(parsed));
+            }
+        }
+
+        Ok(None)
+    }
+
+    pub fn load_latest_mod_dependency_baseline_set(
+        &self,
+        version_id: &str,
+    ) -> AppResult<Option<WwmiModDependencyBaselineSet>> {
+        let mut candidates = self
+            .list_version_artifacts(version_id)?
+            .into_iter()
+            .filter(|artifact| {
+                artifact.kind == VersionArtifactKind::Auxiliary
+                    && artifact.path.extension().is_some_and(|ext| ext == "json")
+                    && artifact
+                        .path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.contains("mod-dependency-baselines"))
+            })
+            .map(|artifact| artifact.path)
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| right.cmp(left));
+
+        for path in candidates {
+            if let Ok(parsed) = load_mod_dependency_baseline_set(&path) {
                 return Ok(Some(parsed));
             }
         }
@@ -2255,6 +2286,7 @@ mod tests {
                 discovered_patterns: 1,
             },
             mod_dependency_input: None,
+            representative_mod_baseline_input: None,
             scope: InferenceScopeContext::default(),
             summary: InferenceSummary {
                 probable_crash_causes: 0,
@@ -2276,6 +2308,7 @@ mod tests {
                 reasons: vec!["exact path".to_string()],
                 evidence: vec!["compare confidence".to_string()],
             }],
+            representative_risk_projections: Vec::new(),
         }
     }
 
@@ -2301,6 +2334,7 @@ mod tests {
                 discovered_patterns: 2,
             },
             mod_dependency_input: None,
+            representative_mod_baseline_input: None,
             scope: InferenceScopeContext::default(),
             summary: InferenceSummary {
                 probable_crash_causes: 1,
@@ -2364,6 +2398,7 @@ mod tests {
                     "structured continuity history reaches terminal state removed in 8.2.0".to_string(),
                 ],
             }],
+            representative_risk_projections: Vec::new(),
         }
     }
 

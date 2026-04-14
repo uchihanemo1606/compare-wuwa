@@ -582,18 +582,25 @@ fn prepared_snapshot_command_is_runtime_facing_and_stored_as_official_artifacts(
     assert_eq!(compare_report.old_version.version_id, "6.0.0");
     assert_eq!(compare_report.new_version.version_id, "6.1.0");
     assert!(compare_report.summary.changed_items > 0);
-    assert_eq!(compare_report.scope_notes.len(), 5);
+    assert_eq!(compare_report.scope_notes.len(), 6);
     assert!(
         compare_report
             .scope_notes
             .iter()
-            .any(|note| note.contains("quality: launcher=missing"))
+            .any(|note| note.contains("quality: launcher=missing")
+                && note.contains("manifest_coverage=resources:"))
     );
     assert!(
         compare_report
             .scope_notes
             .iter()
             .any(|note| note.contains("scope warning"))
+    );
+    assert!(
+        compare_report
+            .scope_notes
+            .iter()
+            .any(|note| note.contains("shallow coverage should not be read as rich asset-level enrichment"))
     );
 
     let _ = fs::remove_dir_all(&test_root);

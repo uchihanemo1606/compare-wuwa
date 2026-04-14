@@ -23,7 +23,10 @@ use whashreonator::{
     wwmi::{
         WwmiEvidenceCommit, WwmiFixPattern, WwmiKeywordStat, WwmiKnowledgeBase,
         WwmiKnowledgeRepoInfo, WwmiKnowledgeSummary, WwmiPatternKind,
-        dependency::{WwmiModDependencyKind, WwmiModDependencyProfile, WwmiModDependencySignal},
+        dependency::{
+            WwmiModDependencyBaselineSet, WwmiModDependencyKind, WwmiModDependencyProfile,
+            WwmiModDependencySignal,
+        },
     },
 };
 
@@ -54,6 +57,7 @@ fn infer_fixes_command_exports_crash_causes_and_suggested_fixes() {
         report_root: None,
         mod_root: None,
         mod_dependency_profile: None,
+        representative_mod_baseline_set: None,
         output: output_path.clone(),
     })
     .expect("run inference command");
@@ -125,6 +129,7 @@ fn infer_fixes_command_uses_report_root_continuity_history() {
         report_root: Some(report_root),
         mod_root: None,
         mod_dependency_profile: None,
+        representative_mod_baseline_set: None,
         output: output_path.clone(),
     })
     .expect("run inference command with continuity");
@@ -202,6 +207,7 @@ filename = SwordDiffuse.dds
         report_root: None,
         mod_root: None,
         mod_dependency_profile: None,
+        representative_mod_baseline_set: None,
         output: base_output_path,
     })
     .expect("run baseline inference command");
@@ -212,6 +218,7 @@ filename = SwordDiffuse.dds
         report_root: None,
         mod_root: Some(mod_root),
         mod_dependency_profile: None,
+        representative_mod_baseline_set: None,
         output: mod_output_path,
     })
     .expect("run mod-aware inference command");
@@ -286,6 +293,7 @@ filename = SwordDiffuse.dds
         report_root: None,
         mod_root: None,
         mod_dependency_profile: None,
+        representative_mod_baseline_set: None,
         output: base_output_path,
     })
     .expect("run baseline inference command");
@@ -296,6 +304,7 @@ filename = SwordDiffuse.dds
         report_root: None,
         mod_root: Some(mod_root),
         mod_dependency_profile: None,
+        representative_mod_baseline_set: None,
         output: mod_output_path,
     })
     .expect("run resource-only mod-aware inference command");
@@ -376,6 +385,7 @@ fn infer_fixes_command_uses_mod_dependency_profile_to_keep_buffer_sensitive_rema
         report_root: None,
         mod_root: None,
         mod_dependency_profile: None,
+        representative_mod_baseline_set: None,
         output: base_output_path,
     })
     .expect("run baseline inference");
@@ -386,6 +396,7 @@ fn infer_fixes_command_uses_mod_dependency_profile_to_keep_buffer_sensitive_rema
         report_root: None,
         mod_root: None,
         mod_dependency_profile: Some(profile_path),
+        representative_mod_baseline_set: None,
         output: mod_output_path,
     })
     .expect("run mod-aware inference");
@@ -462,6 +473,7 @@ run = CommandListMergeSkeleton
         report_root: None,
         mod_root: Some(mod_root),
         mod_dependency_profile: None,
+        representative_mod_baseline_set: None,
         output: output_path,
     })
     .expect("run resource/skeleton-aware inference");
@@ -487,6 +499,223 @@ run = CommandListMergeSkeleton
         fix.actions
             .iter()
             .any(|action| action.contains("merged-skeleton"))
+    );
+
+    let _ = fs::remove_dir_all(&test_root);
+}
+
+#[test]
+fn infer_fixes_command_loads_representative_baseline_set_from_report_root_and_projects_surfaces() {
+    let test_root = unique_test_dir();
+    let report_root = test_root.join("out").join("report");
+    let storage = ReportStorage::new(report_root.clone());
+    let compare_path = test_root.join("compare.json");
+    let knowledge_path = test_root.join("knowledge.json");
+    let output_path = test_root.join("out").join("inference-representative.json");
+
+    fs::create_dir_all(&test_root).expect("create test root");
+    fs::write(
+        &compare_path,
+        serde_json::to_string_pretty(&sample_compare_report()).expect("serialize compare"),
+    )
+    .expect("write compare report");
+    fs::write(
+        &knowledge_path,
+        serde_json::to_string_pretty(&sample_knowledge()).expect("serialize knowledge"),
+    )
+    .expect("write knowledge report");
+    storage
+        .save_mod_dependency_baseline_set_for_version(
+            "2.4.0",
+            &sample_representative_baseline_set("2.4.0"),
+        )
+        .expect("store representative baseline set");
+
+    let report = run_infer_fixes_command(&InferFixesArgs {
+        compare_report: compare_path,
+        wwmi_knowledge: knowledge_path,
+        continuity_artifact: None,
+        report_root: Some(report_root),
+        mod_root: None,
+        mod_dependency_profile: None,
+        representative_mod_baseline_set: None,
+        output: output_path,
+    })
+    .expect("run representative baseline inference");
+
+    let representative = report
+        .representative_mod_baseline_input
+        .as_ref()
+        .expect("representative baseline input");
+    assert_eq!(representative.version_id, "2.4.0");
+    assert_eq!(representative.profile_count, 4);
+
+    assert!(
+        report
+            .representative_risk_projections
+            .iter()
+            .any(|projection| {
+                projection.risk_class
+                    == whashreonator::inference::RepresentativeModRiskClass::MappingHashSensitive
+            })
+    );
+    assert!(
+        report
+            .representative_risk_projections
+            .iter()
+            .any(|projection| {
+                projection.risk_class
+                    == whashreonator::inference::RepresentativeModRiskClass::BufferLayoutSensitive
+            })
+    );
+    assert!(
+        report
+            .representative_risk_projections
+            .iter()
+            .any(|projection| {
+                projection.risk_class
+            == whashreonator::inference::RepresentativeModRiskClass::DrawCallFilterHookSensitive
+            && projection.review_first
+            })
+    );
+    assert!(
+        report
+            .representative_risk_projections
+            .iter()
+            .all(|projection| {
+                projection
+                    .evidence
+                    .iter()
+                    .any(|item| item.contains("representative sample mods"))
+            })
+    );
+
+    let _ = fs::remove_dir_all(&test_root);
+}
+
+#[test]
+fn infer_fixes_command_projects_resource_skeleton_surface_from_explicit_representative_set() {
+    let test_root = unique_test_dir();
+    let compare_path = test_root.join("compare-resource.json");
+    let knowledge_path = test_root.join("knowledge.json");
+    let baseline_path = test_root.join("resource-baselines.json");
+    let output_path = test_root
+        .join("out")
+        .join("inference-resource-representative.json");
+
+    fs::create_dir_all(&test_root).expect("create test root");
+    fs::write(
+        &compare_path,
+        serde_json::to_string_pretty(&sample_resource_skeleton_compare_report())
+            .expect("serialize compare"),
+    )
+    .expect("write compare report");
+    fs::write(
+        &knowledge_path,
+        serde_json::to_string_pretty(&sample_knowledge()).expect("serialize knowledge"),
+    )
+    .expect("write knowledge report");
+    fs::write(
+        &baseline_path,
+        serde_json::to_string_pretty(&sample_representative_baseline_set("6.5.0"))
+            .expect("serialize baseline set"),
+    )
+    .expect("write representative baseline set");
+
+    let report = run_infer_fixes_command(&InferFixesArgs {
+        compare_report: compare_path,
+        wwmi_knowledge: knowledge_path,
+        continuity_artifact: None,
+        report_root: None,
+        mod_root: None,
+        mod_dependency_profile: None,
+        representative_mod_baseline_set: Some(baseline_path),
+        output: output_path,
+    })
+    .expect("run explicit representative baseline inference");
+
+    let projection = report
+        .representative_risk_projections
+        .iter()
+        .find(|projection| {
+            projection.risk_class
+                == whashreonator::inference::RepresentativeModRiskClass::ResourceSkeletonSensitive
+        })
+        .expect("resource/skeleton representative projection");
+    assert_eq!(projection.priority, RiskLevel::High);
+    assert!(
+        projection
+            .triggering_compare_signals
+            .iter()
+            .any(|signal| signal == "resource_or_skeleton_field_drift")
+    );
+
+    let _ = fs::remove_dir_all(&test_root);
+}
+
+#[test]
+fn infer_fixes_command_keeps_representative_projection_review_first_in_low_signal_scope() {
+    let test_root = unique_test_dir();
+    let compare_path = test_root.join("compare-low-signal.json");
+    let knowledge_path = test_root.join("knowledge.json");
+    let baseline_path = test_root.join("low-signal-baselines.json");
+    let output_path = test_root
+        .join("out")
+        .join("inference-low-signal-representative.json");
+
+    let mut compare = sample_compare_report();
+    compare.scope.low_signal_compare = true;
+    compare.scope.old_snapshot.low_signal_for_character_analysis = true;
+    compare
+        .scope
+        .old_snapshot
+        .meaningful_asset_record_enrichment = false;
+    compare.scope.new_snapshot.low_signal_for_character_analysis = true;
+    compare
+        .scope
+        .new_snapshot
+        .meaningful_asset_record_enrichment = false;
+    compare
+        .scope
+        .notes
+        .push("low-signal fixture scope".to_string());
+
+    fs::create_dir_all(&test_root).expect("create test root");
+    fs::write(
+        &compare_path,
+        serde_json::to_string_pretty(&compare).expect("serialize compare"),
+    )
+    .expect("write compare report");
+    fs::write(
+        &knowledge_path,
+        serde_json::to_string_pretty(&sample_knowledge()).expect("serialize knowledge"),
+    )
+    .expect("write knowledge report");
+    fs::write(
+        &baseline_path,
+        serde_json::to_string_pretty(&sample_representative_baseline_set("2.4.0"))
+            .expect("serialize baseline set"),
+    )
+    .expect("write representative baseline set");
+
+    let report = run_infer_fixes_command(&InferFixesArgs {
+        compare_report: compare_path,
+        wwmi_knowledge: knowledge_path,
+        continuity_artifact: None,
+        report_root: None,
+        mod_root: None,
+        mod_dependency_profile: None,
+        representative_mod_baseline_set: Some(baseline_path),
+        output: output_path,
+    })
+    .expect("run low-signal representative inference");
+
+    assert!(!report.representative_risk_projections.is_empty());
+    assert!(
+        report
+            .representative_risk_projections
+            .iter()
+            .all(|projection| projection.review_first)
     );
 
     let _ = fs::remove_dir_all(&test_root);
@@ -791,6 +1020,77 @@ fn sample_knowledge() -> WwmiKnowledgeBase {
             detected_keywords: vec!["crash".to_string()],
             reasons: vec!["subject contains fix".to_string()],
         }],
+    }
+}
+
+fn sample_representative_baseline_set(version_id: &str) -> WwmiModDependencyBaselineSet {
+    WwmiModDependencyBaselineSet {
+        schema_version: "whashreonator.wwmi-mod-dependency-baselines.v1".to_string(),
+        generated_at_unix_ms: 1,
+        version_id: version_id.to_string(),
+        profile_count: 4,
+        profiles: vec![
+            WwmiModDependencyProfile {
+                mod_name: Some("HashFocusedMod".to_string()),
+                mod_root: "D:/mods/HashFocusedMod".to_string(),
+                ini_file_count: 1,
+                signals: vec![WwmiModDependencySignal {
+                    kind: WwmiModDependencyKind::TextureOverrideHash,
+                    value: "0xDEADBEEF".to_string(),
+                    source_file: "HashFocusedMod.ini".to_string(),
+                    section: Some("TextureOverrideBody".to_string()),
+                }],
+            },
+            WwmiModDependencyProfile {
+                mod_name: Some("BufferFocusedMod".to_string()),
+                mod_root: "D:/mods/BufferFocusedMod".to_string(),
+                ini_file_count: 1,
+                signals: vec![WwmiModDependencySignal {
+                    kind: WwmiModDependencyKind::BufferLayoutHint,
+                    value: "override_byte_stride=32".to_string(),
+                    source_file: "BufferFocusedMod.ini".to_string(),
+                    section: Some("TextureOverrideBody".to_string()),
+                }],
+            },
+            WwmiModDependencyProfile {
+                mod_name: Some("ResourceSkeletonMod".to_string()),
+                mod_root: "D:/mods/ResourceSkeletonMod".to_string(),
+                ini_file_count: 1,
+                signals: vec![
+                    WwmiModDependencySignal {
+                        kind: WwmiModDependencyKind::ResourceFileReference,
+                        value: "BodyDiffuse.dds".to_string(),
+                        source_file: "ResourceSkeletonMod.ini".to_string(),
+                        section: Some("ResourceBody".to_string()),
+                    },
+                    WwmiModDependencySignal {
+                        kind: WwmiModDependencyKind::SkeletonMergeDependency,
+                        value: "run = CommandListMergeSkeleton".to_string(),
+                        source_file: "ResourceSkeletonMod.ini".to_string(),
+                        section: Some("CommandListMergeSkeleton".to_string()),
+                    },
+                ],
+            },
+            WwmiModDependencyProfile {
+                mod_name: Some("HookFocusedMod".to_string()),
+                mod_root: "D:/mods/HookFocusedMod".to_string(),
+                ini_file_count: 1,
+                signals: vec![
+                    WwmiModDependencySignal {
+                        kind: WwmiModDependencyKind::DrawCallTarget,
+                        value: "match_first_index=100".to_string(),
+                        source_file: "HookFocusedMod.ini".to_string(),
+                        section: Some("TextureOverrideHair".to_string()),
+                    },
+                    WwmiModDependencySignal {
+                        kind: WwmiModDependencyKind::FilterIndex,
+                        value: "7".to_string(),
+                        source_file: "HookFocusedMod.ini".to_string(),
+                        section: Some("TextureOverrideHair".to_string()),
+                    },
+                ],
+            },
+        ],
     }
 }
 

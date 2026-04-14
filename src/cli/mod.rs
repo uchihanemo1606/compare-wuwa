@@ -144,6 +144,8 @@ pub struct InferFixesArgs {
     #[arg(long)]
     pub mod_dependency_profile: Option<PathBuf>,
     #[arg(long)]
+    pub representative_mod_baseline_set: Option<PathBuf>,
+    #[arg(long)]
     pub output: PathBuf,
 }
 
@@ -295,6 +297,8 @@ mod tests {
             "D:/mod/WWMI/Mods/Aemeth",
             "--mod-dependency-profile",
             "out/mod-profile.json",
+            "--representative-mod-baseline-set",
+            "out/mod-baselines.json",
             "--output",
             "out/inference.json",
         ]);
@@ -318,6 +322,10 @@ mod tests {
         assert_eq!(
             args.mod_dependency_profile.as_deref(),
             Some(PathBuf::from("out/mod-profile.json").as_path())
+        );
+        assert_eq!(
+            args.representative_mod_baseline_set.as_deref(),
+            Some(PathBuf::from("out/mod-baselines.json").as_path())
         );
     }
 

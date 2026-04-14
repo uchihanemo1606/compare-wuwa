@@ -155,7 +155,7 @@ fn compare_snapshots_command_keeps_sparse_extractor_pairs_low_signal() {
             .scope
             .notes
             .iter()
-            .any(|note| note.contains("manifest_resources=0"))
+            .any(|note| note.contains("manifest_coverage=resources:0"))
     );
     assert!(
         parsed

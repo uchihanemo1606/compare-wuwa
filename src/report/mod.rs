@@ -4,11 +4,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     compare::{
-        AssetLineageKind, CandidateMappingChange, RemapCompatibility, SnapshotAssetChange,
+        AssetLineageKind, CandidateMappingChange, RemapCompatibility, RiskLevel,
+        SnapshotAssetChange,
         SnapshotAssetSummary, SnapshotChangeType, SnapshotCompareReason, SnapshotCompareReport,
     },
     domain::{AssetInternalStructure, AssetSourceContext},
-    inference::{InferenceReport, InferredMappingContinuityContext},
+    inference::{InferenceReport, InferredMappingContinuityContext, RepresentativeModRiskClass},
     proposal::{MappingProposalEntry, MappingProposalOutput, ProposalStatus},
     snapshot::{GameSnapshot, assess_snapshot_scope, summarize_snapshot_capture_quality},
 };
@@ -314,6 +315,8 @@ pub struct ReportReason {
 pub struct VersionReviewSection {
     pub summary: VersionReviewSummary,
     pub continuity: VersionContinuityReviewSection,
+    #[serde(default)]
+    pub representative_mod_risks: VersionRepresentativeModRiskReviewSection,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -322,6 +325,10 @@ pub struct VersionReviewSummary {
     pub review_mapping_count: usize,
     pub continuity_review_mapping_count: usize,
     pub continuity_caution_present: bool,
+    #[serde(default)]
+    pub representative_projection_count: usize,
+    #[serde(default)]
+    pub representative_review_first_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -335,6 +342,34 @@ pub struct VersionContinuityReviewSection {
     pub fixes: Vec<VersionReviewFix>,
     pub mappings: Vec<VersionReviewMapping>,
     pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct VersionRepresentativeModRiskReviewSection {
+    pub projection_count: usize,
+    pub review_first_count: usize,
+    pub projections: Vec<VersionRepresentativeModRiskProjection>,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct VersionRepresentativeModRiskProjection {
+    pub risk_class: RepresentativeModRiskClass,
+    pub summary: String,
+    pub confidence: f32,
+    pub priority: RiskLevel,
+    pub representative_profile_count: usize,
+    #[serde(default)]
+    pub review_first: bool,
+    #[serde(default)]
+    pub triggering_compare_signals: Vec<String>,
+    #[serde(default)]
+    pub sample_mod_names: Vec<String>,
+    #[serde(default)]
+    pub reasons: Vec<String>,
+    #[serde(default)]
+    pub evidence: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -564,6 +599,26 @@ fn build_review_section(
     let caution_present = !continuity_causes.is_empty()
         || !continuity_fixes.is_empty()
         || !continuity_review_mappings.is_empty();
+    let representative_projections = inference
+        .representative_risk_projections
+        .iter()
+        .map(|projection| VersionRepresentativeModRiskProjection {
+            risk_class: projection.risk_class.clone(),
+            summary: projection.summary.clone(),
+            confidence: projection.confidence,
+            priority: projection.priority.clone(),
+            representative_profile_count: projection.representative_profile_count,
+            review_first: projection.review_first,
+            triggering_compare_signals: projection.triggering_compare_signals.clone(),
+            sample_mod_names: projection.sample_mod_names.clone(),
+            reasons: projection.reasons.clone(),
+            evidence: projection.evidence.clone(),
+        })
+        .collect::<Vec<_>>();
+    let representative_review_first_count = representative_projections
+        .iter()
+        .filter(|projection| projection.review_first)
+        .count();
 
     let mut continuity_notes = Vec::new();
     if caution_present {
@@ -586,6 +641,8 @@ fn build_review_section(
             review_mapping_count,
             continuity_review_mapping_count: continuity_review_mappings.len(),
             continuity_caution_present: caution_present,
+            representative_projection_count: representative_projections.len(),
+            representative_review_first_count,
         },
         continuity: VersionContinuityReviewSection {
             caution_present,
@@ -597,7 +654,38 @@ fn build_review_section(
             mappings: continuity_review_mappings,
             notes: continuity_notes,
         },
+        representative_mod_risks: VersionRepresentativeModRiskReviewSection {
+            projection_count: representative_projections.len(),
+            review_first_count: representative_review_first_count,
+            notes: representative_projection_notes(&representative_projections),
+            projections: representative_projections,
+        },
     }
+}
+
+fn representative_projection_notes(
+    projections: &[VersionRepresentativeModRiskProjection],
+) -> Vec<String> {
+    if projections.is_empty() {
+        return Vec::new();
+    }
+
+    let review_first_count = projections
+        .iter()
+        .filter(|projection| projection.review_first)
+        .count();
+    let mut notes = vec![format!(
+        "representative mod risk projection present: projections={} review_first={}",
+        projections.len(),
+        review_first_count
+    )];
+    if let Some(first) = projections.first() {
+        notes.push(format!(
+            "top representative risk surface: {:?} across {} representative profile(s)",
+            first.risk_class, first.representative_profile_count
+        ));
+    }
+    notes
 }
 
 fn build_review_mapping(mapping: &MappingProposalEntry) -> VersionReviewMapping {
@@ -1764,7 +1852,7 @@ fn build_scope_notes(old_snapshot: &GameSnapshot, new_snapshot: &GameSnapshot) -
             new_scope.coverage.non_content_path_count
         ),
         format!(
-            "old snapshot {} quality: launcher={} reuse={} matches_snapshot={} manifest_resources={} manifest_matches={} unmatched_snapshot_assets={} asset_hashes={}/{} any_hashes={}/{} signatures={}/{} source_context={}/{} rich_metadata={}/{} enriched_assets={}/{} extractor_records={}",
+            "old snapshot {} quality: launcher={} reuse={} matches_snapshot={} manifest_coverage=resources:{} matched:{} unmatched_snapshot_assets:{} hash_coverage=asset_hashes:{}/{} any_hashes:{}/{} signatures:{}/{} asset_enrichment=source_context:{}/{} rich_metadata:{}/{} enriched_assets:{}/{} extractor_records={}",
             old_snapshot.version_id,
             old_quality
                 .launcher_detected_version
@@ -1793,7 +1881,7 @@ fn build_scope_notes(old_snapshot: &GameSnapshot, new_snapshot: &GameSnapshot) -
             old_quality.extractor_record_count
         ),
         format!(
-            "new snapshot {} quality: launcher={} reuse={} matches_snapshot={} manifest_resources={} manifest_matches={} unmatched_snapshot_assets={} asset_hashes={}/{} any_hashes={}/{} signatures={}/{} source_context={}/{} rich_metadata={}/{} enriched_assets={}/{} extractor_records={}",
+            "new snapshot {} quality: launcher={} reuse={} matches_snapshot={} manifest_coverage=resources:{} matched:{} unmatched_snapshot_assets:{} hash_coverage=asset_hashes:{}/{} any_hashes:{}/{} signatures:{}/{} asset_enrichment=source_context:{}/{} rich_metadata:{}/{} enriched_assets:{}/{} extractor_records={}",
             new_snapshot.version_id,
             new_quality
                 .launcher_detected_version
@@ -1831,8 +1919,27 @@ fn build_scope_notes(old_snapshot: &GameSnapshot, new_snapshot: &GameSnapshot) -
                 .to_string(),
         );
     }
+    if has_shallow_hash_or_manifest_only_support(&old_scope, &old_quality)
+        || has_shallow_hash_or_manifest_only_support(&new_scope, &new_quality)
+    {
+        notes.push(
+            "scope warning: manifest/hash coverage may be present here, but shallow coverage should not be read as rich asset-level enrichment."
+                .to_string(),
+        );
+    }
 
     notes
+}
+
+fn has_shallow_hash_or_manifest_only_support(
+    scope: &crate::snapshot::SnapshotScopeAssessment,
+    quality: &crate::snapshot::SnapshotCaptureQualitySummary,
+) -> bool {
+    !scope.meaningful_asset_record_enrichment
+        && (quality.manifest_resource_count > 0
+            || quality.assets_with_asset_hash > 0
+            || quality.assets_with_any_hash > 0
+            || quality.assets_with_signature > 0)
 }
 
 fn unchanged_assets<'a>(
@@ -2137,6 +2244,7 @@ mod tests {
                 discovered_patterns: 1,
             },
             mod_dependency_input: None,
+            representative_mod_baseline_input: None,
             scope: InferenceScopeContext::default(),
             summary: InferenceSummary {
                 probable_crash_causes: 0,
@@ -2158,6 +2266,7 @@ mod tests {
                 reasons: vec!["strong evidence".to_string()],
                 evidence: Vec::new(),
             }],
+            representative_risk_projections: Vec::new(),
         };
 
         let report = VersionDiffReportBuilder.enrich_with_inference(report, &inference);
@@ -2215,6 +2324,7 @@ mod tests {
                 discovered_patterns: 1,
             },
             mod_dependency_input: None,
+            representative_mod_baseline_input: None,
             scope: InferenceScopeContext::default(),
             summary: InferenceSummary {
                 probable_crash_causes: 1,
@@ -2278,6 +2388,7 @@ mod tests {
                     "structured continuity history reaches terminal state removed in 8.2.0".to_string(),
                 ],
             }],
+            representative_risk_projections: Vec::new(),
         };
         let proposals = ProposalEngine.generate(&inference, 0.85);
 
@@ -2424,7 +2535,8 @@ mod tests {
             report
                 .scope_notes
                 .iter()
-                .any(|note| note.contains("quality: launcher=missing"))
+                .any(|note| note.contains("quality: launcher=missing")
+                    && note.contains("manifest_coverage=resources:"))
         );
         assert!(
             report

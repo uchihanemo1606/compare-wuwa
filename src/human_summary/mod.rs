@@ -1,6 +1,9 @@
 use crate::{
     compare::{RemapCompatibility, RiskLevel},
-    inference::{InferenceReport, ProbableCrashCause, SuggestedFix},
+    inference::{
+        InferenceReport, ProbableCrashCause, RepresentativeModRiskClass,
+        RepresentativeModRiskProjection, SuggestedFix,
+    },
     proposal::{MappingProposalEntry, ProposalArtifacts, ProposalStatus},
     report::{VersionDiffReportV2, VersionReviewCause, VersionReviewFix, VersionReviewMapping},
 };
@@ -53,6 +56,15 @@ impl HumanSummaryRenderer {
             .iter()
             .filter(|entry| mapping_has_continuity_caution(entry))
             .count();
+        let mut representative_projections = inference
+            .representative_risk_projections
+            .iter()
+            .collect::<Vec<_>>();
+        representative_projections.sort_by(|left, right| {
+            review_risk_rank(&right.priority)
+                .cmp(&review_risk_rank(&left.priority))
+                .then_with(|| right.confidence.total_cmp(&left.confidence))
+        });
 
         lines.push("# WhashReonator Summary".to_string());
         lines.push(String::new());
@@ -91,6 +103,14 @@ impl HumanSummaryRenderer {
                     .map(mod_dependency_kind_label)
                     .collect::<Vec<_>>()
                     .join(", ")
+            ));
+        }
+        if let Some(representative) = inference.representative_mod_baseline_input.as_ref() {
+            lines.push(format!(
+                "- Representative mod baseline set: version `{}` profiles={} risk_classes={}",
+                representative.version_id,
+                representative.profile_count,
+                representative.risk_class_counts.len()
             ));
         }
         if !continuity_causes.is_empty()
@@ -158,6 +178,14 @@ impl HumanSummaryRenderer {
                 }
             }
 
+            if !representative_projections.is_empty() {
+                lines.push(String::new());
+                lines.push("### Representative Mod Risk Projection".to_string());
+                for projection in representative_projections.into_iter().take(4) {
+                    lines.extend(render_representative_projection(projection));
+                }
+            }
+
             lines.push(String::new());
             lines.push("### Needs Review".to_string());
             if sorted_needs_review.is_empty() {
@@ -195,6 +223,12 @@ impl HumanSummaryRenderer {
         {
             lines.push(
                 "- Review broader continuity thread history before trusting remap-only repair on continuity-flagged mappings."
+                    .to_string(),
+            );
+        }
+        if !inference.representative_risk_projections.is_empty() {
+            lines.push(
+                "- Use representative risk projection as reviewer triage only; it does not replace single-mod validation."
                     .to_string(),
             );
         }
@@ -247,6 +281,32 @@ impl ReviewBundleRenderer {
         } else {
             for note in report.review.continuity.notes.iter().take(3) {
                 lines.push(format!("- {note}"));
+            }
+        }
+        lines.push(String::new());
+
+        lines.push("## Representative Mod Risk Projection".to_string());
+        if report
+            .review
+            .representative_mod_risks
+            .projections
+            .is_empty()
+        {
+            lines.push(
+                "No representative mod risk projections were saved in this bundle.".to_string(),
+            );
+        } else {
+            lines.push("| Risk class | Priority | Confidence | Representative profiles | Review first | Summary |".to_string());
+            lines.push("| --- | --- | ---: | ---: | --- | --- |".to_string());
+            for projection in &report.review.representative_mod_risks.projections {
+                lines.push(markdown_table_row(&[
+                    code_cell(representative_risk_class_label(&projection.risk_class)),
+                    format!("{:?}", projection.priority),
+                    format!("{:.3}", projection.confidence),
+                    projection.representative_profile_count.to_string(),
+                    yes_no(projection.review_first).to_string(),
+                    projection.summary.clone(),
+                ]));
             }
         }
         lines.push(String::new());
@@ -386,6 +446,31 @@ fn render_mapping(entry: &MappingProposalEntry) -> Vec<String> {
     lines
 }
 
+fn render_representative_projection(projection: &RepresentativeModRiskProjection) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "- `{}` [{:?}, {:.3}] {}",
+        representative_risk_class_label(&projection.risk_class),
+        projection.priority,
+        projection.confidence,
+        projection.summary
+    ));
+    lines.push(format!(
+        "  Representative profiles: {}",
+        projection.representative_profile_count
+    ));
+    if projection.review_first {
+        lines.push("  Review stance: review-first".to_string());
+    }
+    if let Some(signal) = projection.triggering_compare_signals.first() {
+        lines.push(format!("  Trigger: {signal}"));
+    }
+    if let Some(mod_name) = projection.sample_mod_names.first() {
+        lines.push(format!("  Sample mod: {mod_name}"));
+    }
+    lines
+}
+
 fn mod_dependency_reason(reasons: &[String]) -> Option<String> {
     reasons
         .iter()
@@ -433,6 +518,17 @@ fn mod_dependency_kind_label(
             "skeleton_merge_dependency"
         }
         crate::wwmi::dependency::WwmiModDependencyKind::FilterIndex => "filter_index",
+    }
+}
+
+fn representative_risk_class_label(risk_class: &RepresentativeModRiskClass) -> &'static str {
+    match risk_class {
+        RepresentativeModRiskClass::MappingHashSensitive => "mapping/hash-sensitive",
+        RepresentativeModRiskClass::BufferLayoutSensitive => "buffer/layout-sensitive",
+        RepresentativeModRiskClass::ResourceSkeletonSensitive => "resource/skeleton-sensitive",
+        RepresentativeModRiskClass::DrawCallFilterHookSensitive => {
+            "draw-call/filter/hook-sensitive"
+        }
     }
 }
 
@@ -748,9 +844,11 @@ mod tests {
         compare::RemapCompatibility,
         compare::RiskLevel,
         inference::{
-            InferenceCompareInput, InferenceKnowledgeInput, InferenceReport, InferenceScopeContext,
-            InferenceSummary, InferredMappingContinuityContext, InferredMappingHint,
-            ProbableCrashCause, SuggestedFix,
+            InferenceCompareInput, InferenceKnowledgeInput, InferenceReport,
+            InferenceRepresentativeModBaselineInput, InferenceRepresentativeRiskClassCount,
+            InferenceScopeContext, InferenceSummary, InferredMappingContinuityContext,
+            InferredMappingHint, ProbableCrashCause, RepresentativeModRiskClass,
+            RepresentativeModRiskProjection, SuggestedFix,
         },
         proposal::{ProposalArtifacts, ProposalEngine, ProposalStatus},
         report::{
@@ -783,6 +881,14 @@ mod tests {
                 discovered_patterns: 3,
             },
             mod_dependency_input: None,
+            representative_mod_baseline_input: Some(InferenceRepresentativeModBaselineInput {
+                version_id: "2.4.0".to_string(),
+                profile_count: 3,
+                risk_class_counts: vec![InferenceRepresentativeRiskClassCount {
+                    risk_class: RepresentativeModRiskClass::BufferLayoutSensitive,
+                    profile_count: 2,
+                }],
+            }),
             scope: InferenceScopeContext::default(),
             summary: InferenceSummary {
                 probable_crash_causes: 2,
@@ -874,6 +980,20 @@ mod tests {
                     ],
                 },
             ],
+            representative_risk_projections: vec![RepresentativeModRiskProjection {
+                risk_class: RepresentativeModRiskClass::BufferLayoutSensitive,
+                summary:
+                    "Representative buffer/layout-sensitive mods should review this drift first."
+                        .to_string(),
+                confidence: 0.71,
+                priority: RiskLevel::High,
+                representative_profile_count: 2,
+                review_first: false,
+                triggering_compare_signals: vec!["structural_changed_assets".to_string()],
+                sample_mod_names: vec!["BufferFocusedMod".to_string()],
+                reasons: vec!["representative projection".to_string()],
+                evidence: vec!["representative sample mods: BufferFocusedMod".to_string()],
+            }],
         };
         let proposals: ProposalArtifacts = ProposalEngine.generate(&inference, 0.85);
 
@@ -883,6 +1003,7 @@ mod tests {
         assert!(markdown.contains("## Fix Before Remap"));
         assert!(markdown.contains("### Likely Crash Causes"));
         assert!(markdown.contains("### Suggested Fixes"));
+        assert!(markdown.contains("### Representative Mod Risk Projection"));
         assert!(markdown.contains("## Safe To Try Now"));
         assert!(markdown.contains("### Proposed Mappings"));
         assert!(markdown.contains("Hair.mesh"));
@@ -920,6 +1041,7 @@ mod tests {
                 discovered_patterns: 2,
             },
             mod_dependency_input: None,
+            representative_mod_baseline_input: None,
             scope: InferenceScopeContext::default(),
             summary: InferenceSummary {
                 probable_crash_causes: 1,
@@ -978,6 +1100,7 @@ mod tests {
                 reasons: vec!["same_parent_directory: same folder".to_string()],
                 evidence: vec!["compare candidate confidence 0.920".to_string()],
             }],
+            representative_risk_projections: Vec::new(),
         };
         let proposals: ProposalArtifacts = ProposalEngine.generate(&inference, 0.85);
 
@@ -1061,6 +1184,8 @@ mod tests {
                         review_mapping_count: 1,
                         continuity_review_mapping_count: 1,
                         continuity_caution_present: true,
+                        representative_projection_count: 0,
+                        representative_review_first_count: 0,
                     },
                     continuity: VersionContinuityReviewSection {
                         caution_present: true,
@@ -1115,6 +1240,7 @@ mod tests {
                             "mapping Content/Character/Encore/Body.mesh -> Content/Character/Encore/Body_v2.mesh stays review-first because broader continuity history is unstable".to_string(),
                         ],
                     },
+                    representative_mod_risks: Default::default(),
                 }
             } else {
                 VersionReviewSection::default()
