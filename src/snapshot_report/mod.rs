@@ -144,20 +144,21 @@ fn render_markdown(
 
     lines.push("## Capture Quality".to_string());
     lines.push(
-        "| Version | Acquisition | Capture Mode | Low Signal | Launcher Evidence | Manifest Coverage | Hash Coverage | Asset-level Enrichment | Extractor Evidence |"
+        "| Version | Acquisition | Capture Mode | Evidence Tier | Low Signal | Launcher Evidence | Manifest Coverage | Hash Coverage | Asset-level Enrichment | Extractor Evidence |"
             .to_string(),
     );
-    lines.push("| --- | --- | --- | --- | --- | --- | --- | --- | --- |".to_string());
+    lines.push("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |".to_string());
     for ((snapshot, scope), quality) in snapshots
         .iter()
         .zip(scope_assessments.iter())
         .zip(capture_quality.iter())
     {
         lines.push(format!(
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
             md_cell(&snapshot.version_id),
             md_cell(scope.acquisition_kind.as_deref().unwrap_or("-")),
             md_cell(scope.capture_mode.as_deref().unwrap_or("-")),
+            md_cell(evidence_tier(scope, quality)),
             md_cell(if scope.is_low_signal_for_character_analysis() {
                 "yes"
             } else {
@@ -194,10 +195,22 @@ fn render_markdown(
         }
     }
     if low_signal_lines.is_empty() {
-        lines.push(
-            "Scope metadata indicates character/content coverage is present for the analyzed snapshots."
-                .to_string(),
-        );
+        if snapshots
+            .iter()
+            .zip(scope_assessments.iter())
+            .zip(capture_quality.iter())
+            .all(|((_, scope), quality)| is_version_aligned_rich_extractor_snapshot(scope, quality))
+        {
+            lines.push(
+                "All analyzed snapshots are extractor-backed, version-aligned, and content/character-rich enough for the current compare/report layer."
+                    .to_string(),
+            );
+        } else {
+            lines.push(
+                "Scope metadata indicates character/content coverage is present for the analyzed snapshots."
+                    .to_string(),
+            );
+        }
     } else {
         lines.push(
             "The following snapshots are low-signal for deep character/resonator analysis:"
@@ -458,12 +471,57 @@ fn extractor_evidence(quality: &SnapshotCaptureQualitySummary) -> String {
     }
 
     format!(
-        "records={} hashes={} source_context={} rich_metadata={}",
+        "records={} hashes={} source_context={} rich_metadata={} schema={} inventory_version={} matches_snapshot={} launcher_matches_inventory={}",
         quality.extractor_record_count,
         quality.extractor_records_with_hashes,
         quality.extractor_records_with_source_context,
-        quality.extractor_records_with_rich_metadata
+        quality.extractor_records_with_rich_metadata,
+        quality
+            .extractor_inventory_schema_version
+            .as_deref()
+            .unwrap_or("-"),
+        quality
+            .extractor_inventory_version_id
+            .as_deref()
+            .unwrap_or("-"),
+        quality
+            .extractor_inventory_version_matches_snapshot
+            .map(|value| if value { "yes" } else { "no" })
+            .unwrap_or("unknown"),
+        quality
+            .launcher_version_matches_extractor_inventory
+            .map(|value| if value { "yes" } else { "no" })
+            .unwrap_or("unknown")
     )
+}
+
+fn evidence_tier(
+    scope: &SnapshotScopeAssessment,
+    quality: &SnapshotCaptureQualitySummary,
+) -> &'static str {
+    match scope.acquisition_kind.as_deref() {
+        Some("shallow_filesystem_inventory") => "shallow support only",
+        Some("extractor_backed_asset_records")
+            if is_version_aligned_rich_extractor_snapshot(scope, quality) =>
+        {
+            "extractor-backed rich evidence"
+        }
+        Some("extractor_backed_asset_records") => "extractor-backed partial",
+        _ if scope.is_low_signal_for_character_analysis() => "mixed or partial",
+        _ => "mixed or partial",
+    }
+}
+
+fn is_version_aligned_rich_extractor_snapshot(
+    scope: &SnapshotScopeAssessment,
+    quality: &SnapshotCaptureQualitySummary,
+) -> bool {
+    scope.acquisition_kind.as_deref() == Some("extractor_backed_asset_records")
+        && scope.meaningful_content_coverage
+        && scope.meaningful_character_coverage
+        && scope.meaningful_asset_record_enrichment
+        && quality.extractor_record_count > 0
+        && quality.extractor_inventory_version_matches_snapshot == Some(true)
 }
 
 fn scope_label(scope: &SnapshotScopeAssessment) -> &'static str {

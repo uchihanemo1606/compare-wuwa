@@ -1869,22 +1869,26 @@ fn resource_skeleton_projection_signals(compare_report: &SnapshotCompareReport) 
 
 fn draw_call_filter_hook_projection_signals(compare_report: &SnapshotCompareReport) -> Vec<String> {
     let mut signals = Vec::new();
-    if !compare_report.candidate_mapping_changes.is_empty() {
-        signals.push("candidate_mapping_changes".to_string());
-    }
-    if !compare_report.removed_assets.is_empty() {
-        signals.push("removed_assets".to_string());
-    }
-    if compare_report.changed_assets.iter().any(|change| {
+    let has_mapping_shift = !compare_report.candidate_mapping_changes.is_empty()
+        && !compare_report.removed_assets.is_empty();
+    let has_hook_context_drift = compare_report.changed_assets.iter().any(|change| {
         change.changed_fields.iter().any(|field| {
             matches!(
                 field.as_str(),
                 "container_path" | "source_kind" | "asset_hash" | "signature"
             )
         })
-    }) {
-        signals.push("hook_targeting_context_drift".to_string());
+    }) || compare_report.summary.container_moved_assets > 0;
+
+    if !has_hook_context_drift {
+        return signals;
     }
+
+    if has_mapping_shift {
+        signals.push("candidate_mapping_changes".to_string());
+        signals.push("removed_assets".to_string());
+    }
+    signals.push("hook_targeting_context_drift".to_string());
     signals
 }
 

@@ -97,7 +97,7 @@ fn snapshot_report_flags_install_level_snapshots_as_low_signal() {
     assert!(output.contains("## Version Summary"));
     assert!(output.contains("## Capture Quality"));
     assert!(output.contains("## Analysis Limitations"));
-    assert!(output.contains("| 3.0.0 | shallow_filesystem_inventory | local_filesystem_inventory | yes | missing | missing | asset_hashes=0/1 any_hashes=0/1 signatures=0/1 | source_context=0/1 rich_metadata=0/1 enriched_assets=0/1 |"));
+    assert!(output.contains("| 3.0.0 | shallow_filesystem_inventory | local_filesystem_inventory | shallow support only | yes | missing | missing | asset_hashes=0/1 any_hashes=0/1 signatures=0/1 | source_context=0/1 rich_metadata=0/1 enriched_assets=0/1 |"));
     assert!(output.contains(
         "shallow filesystem inventory or low-coverage/low-enrichment extractor snapshot; resonator-level and mapping-level interpretation can be incomplete."
     ));
@@ -124,6 +124,7 @@ fn snapshot_report_marks_sparse_extractor_snapshots_as_partial_and_low_signal() 
     write_prepared_inventory(
         &old_inventory,
         "D:/prepared-old",
+        None,
         12,
         1,
         "body-old",
@@ -137,6 +138,7 @@ fn snapshot_report_marks_sparse_extractor_snapshots_as_partial_and_low_signal() 
     write_prepared_inventory(
         &new_inventory,
         "D:/prepared-new",
+        None,
         12,
         1,
         "body-new",
@@ -183,7 +185,7 @@ fn snapshot_report_marks_sparse_extractor_snapshots_as_partial_and_low_signal() 
         "| 7.0.0 | extractor_backed_asset_records | extractor_backed_asset_records | mixed or partial coverage |"
     ));
     assert!(output.contains(
-        "| 7.0.0 | extractor_backed_asset_records | extractor_backed_asset_records | yes | missing | missing | asset_hashes=1/12 any_hashes=1/12 signatures=1/12 | source_context=1/12 rich_metadata=1/12 enriched_assets=1/12 |"
+        "| 7.0.0 | extractor_backed_asset_records | extractor_backed_asset_records | extractor-backed partial | yes | missing | missing | asset_hashes=1/12 any_hashes=1/12 signatures=1/12 | source_context=1/12 rich_metadata=1/12 enriched_assets=1/12 |"
     ));
     assert!(output.contains(
         "manifest/hash coverage exists, but it remains shallow support and should not be read as rich asset-level enrichment."
@@ -201,6 +203,90 @@ fn snapshot_report_marks_sparse_extractor_snapshots_as_partial_and_low_signal() 
     let _ = fs::remove_dir_all(&test_root);
 }
 
+#[test]
+fn snapshot_report_highlights_version_aligned_rich_extractor_evidence() {
+    let test_root = unique_test_dir();
+    let old_root = test_root.join("old-game");
+    let new_root = test_root.join("new-game");
+    let old_inventory = test_root.join("old-rich.prepared.json");
+    let new_inventory = test_root.join("new-rich.prepared.json");
+    let old_snapshot = test_root.join("out").join("old.rich.snapshot.json");
+    let new_snapshot = test_root.join("out").join("new.rich.snapshot.json");
+    let report_output = test_root
+        .join("out")
+        .join("snapshot-report-extractor-rich.md");
+
+    fs::create_dir_all(&old_root).expect("create old root");
+    fs::create_dir_all(&new_root).expect("create new root");
+    write_prepared_inventory(
+        &old_inventory,
+        "D:/prepared-old",
+        Some("8.0.0"),
+        12,
+        6,
+        "body-old",
+        "sig-old",
+        120,
+        240,
+        2,
+        3,
+        "pakchunk0-WindowsNoEditor.pak",
+    );
+    write_prepared_inventory(
+        &new_inventory,
+        "D:/prepared-new",
+        Some("8.1.0"),
+        12,
+        6,
+        "body-new",
+        "sig-new",
+        180,
+        360,
+        3,
+        4,
+        "pakchunk1-WindowsNoEditor.pak",
+    );
+
+    run_snapshot_command(&SnapshotArgs {
+        source_root: old_root,
+        version_id: "8.0.0".to_string(),
+        output: old_snapshot.clone(),
+        capture_scope: SnapshotCaptureScopeArg::Extractor,
+        extractor_inventory: Some(old_inventory),
+        store_in_report: false,
+        report_root: None,
+    })
+    .expect("export old rich extractor snapshot");
+    run_snapshot_command(&SnapshotArgs {
+        source_root: new_root,
+        version_id: "8.1.0".to_string(),
+        output: new_snapshot.clone(),
+        capture_scope: SnapshotCaptureScopeArg::Extractor,
+        extractor_inventory: Some(new_inventory),
+        store_in_report: false,
+        report_root: None,
+    })
+    .expect("export new rich extractor snapshot");
+
+    run_snapshot_report_command(&SnapshotReportArgs {
+        snapshots: vec![old_snapshot, new_snapshot],
+        output: report_output.clone(),
+    })
+    .expect("run rich extractor snapshot report");
+
+    let output = fs::read_to_string(&report_output).expect("read output");
+
+    assert!(output.contains(
+        "| 8.0.0 | extractor_backed_asset_records | extractor_backed_asset_records | extractor-backed rich evidence | no |"
+    ));
+    assert!(output.contains("matches_snapshot=yes"));
+    assert!(output.contains(
+        "All analyzed snapshots are extractor-backed, version-aligned, and content/character-rich enough"
+    ));
+
+    let _ = fs::remove_dir_all(&test_root);
+}
+
 fn seed_local_asset(root: &Path, relative_path: &str) {
     let full_path = root.join(relative_path);
     if let Some(parent) = full_path.parent() {
@@ -213,6 +299,7 @@ fn seed_local_asset(root: &Path, relative_path: &str) {
 fn write_prepared_inventory(
     path: &Path,
     source_root: &str,
+    inventory_version_id: Option<&str>,
     total_assets: usize,
     enriched_assets: usize,
     body_asset_hash: &str,
@@ -315,6 +402,7 @@ fn write_prepared_inventory(
             "extraction_tool": "fixture-extractor",
             "extraction_kind": "asset_records",
             "source_root": source_root,
+            "version_id": inventory_version_id,
             "meaningful_content_coverage": true,
             "meaningful_character_coverage": true
         },

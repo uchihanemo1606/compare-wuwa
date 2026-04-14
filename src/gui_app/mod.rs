@@ -647,6 +647,7 @@ fn artifact_kind_label(kind: VersionArtifactKind) -> &'static str {
         VersionArtifactKind::InferenceData => "inference",
         VersionArtifactKind::ProposalData => "proposal",
         VersionArtifactKind::HumanSummary => "human_summary",
+        VersionArtifactKind::ExtractorInventory => "extractor_inventory",
         VersionArtifactKind::BufferData => "buffer",
         VersionArtifactKind::HashData => "hash",
         VersionArtifactKind::Auxiliary => "auxiliary",

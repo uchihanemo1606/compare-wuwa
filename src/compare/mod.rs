@@ -542,6 +542,11 @@ fn build_compare_scope_context(
                 .to_string(),
         );
     }
+    notes.push(format!(
+        "compare evidence posture: old={} new={}",
+        compare_evidence_tier(&old_scope, &old_quality),
+        compare_evidence_tier(&new_scope, &new_quality)
+    ));
 
     SnapshotCompareScopeContext {
         old_snapshot: SnapshotCompareScopeInfo {
@@ -598,6 +603,27 @@ fn build_compare_scope_context(
         },
         low_signal_compare: old_low_signal || new_low_signal,
         notes,
+    }
+}
+
+fn compare_evidence_tier(
+    scope: &crate::snapshot::SnapshotScopeAssessment,
+    quality: &crate::snapshot::SnapshotCaptureQualitySummary,
+) -> &'static str {
+    match scope.acquisition_kind.as_deref() {
+        Some("shallow_filesystem_inventory") => "shallow_support_only",
+        Some("extractor_backed_asset_records")
+            if scope.meaningful_content_coverage
+                && scope.meaningful_character_coverage
+                && scope.meaningful_asset_record_enrichment
+                && quality.extractor_record_count > 0
+                && quality.extractor_inventory_version_matches_snapshot == Some(true) =>
+        {
+            "extractor_backed_rich"
+        }
+        Some("extractor_backed_asset_records") => "extractor_backed_partial",
+        _ if scope.is_low_signal_for_character_analysis() => "mixed_or_low_signal",
+        _ => "mixed_or_partial",
     }
 }
 

@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
 };
@@ -38,6 +39,8 @@ pub struct SnapshotExtractionScopeHint {
     pub meaningful_character_coverage: Option<bool>,
     pub note: Option<String>,
     pub inventory_path: Option<String>,
+    pub inventory_schema_version: Option<String>,
+    pub inventory_version_id: Option<String>,
     pub extraction_tool: Option<String>,
     pub extraction_kind: Option<String>,
     pub inventory_source_root: Option<String>,
@@ -243,7 +246,7 @@ where
 
 pub fn load_prepared_asset_inventory(path: &Path) -> AppResult<PreparedAssetInventory> {
     let inventory: PreparedAssetInventory = serde_json::from_str(&fs::read_to_string(path)?)?;
-    validate_extracted_assets("prepared_inventory.assets", &inventory.assets)?;
+    validate_prepared_asset_inventory("prepared_inventory", &inventory)?;
     Ok(inventory)
 }
 
@@ -303,7 +306,22 @@ fn validate_extracted_assets(label: &str, assets: &[ExtractedAssetRecord]) -> Ap
         .collect::<Vec<_>>();
     validate_assets(label, &plain_assets)?;
 
+    let mut seen_ids = BTreeSet::<String>::new();
+    let mut seen_paths = BTreeSet::<String>::new();
+
     for (index, asset) in assets.iter().enumerate() {
+        if !seen_ids.insert(asset.asset.id.clone()) {
+            return Err(AppError::InvalidInput(format!(
+                "{label}[{index}].id duplicates an earlier extracted asset id: {}",
+                asset.asset.id
+            )));
+        }
+        if !seen_paths.insert(asset.asset.path.clone()) {
+            return Err(AppError::InvalidInput(format!(
+                "{label}[{index}].path duplicates an earlier extracted asset path: {}",
+                asset.asset.path
+            )));
+        }
         validate_optional_field(
             &format!("{label}[{index}].hash_fields.asset_hash"),
             asset.hash_fields.asset_hash.as_deref(),
@@ -316,6 +334,93 @@ fn validate_extracted_assets(label: &str, assets: &[ExtractedAssetRecord]) -> Ap
             &format!("{label}[{index}].hash_fields.signature"),
             asset.hash_fields.signature.as_deref(),
         )?;
+    }
+
+    Ok(())
+}
+
+fn validate_prepared_asset_inventory(
+    label: &str,
+    inventory: &PreparedAssetInventory,
+) -> AppResult<()> {
+    if inventory.schema_version != "whashreonator.prepared-assets.v1" {
+        return Err(AppError::InvalidInput(format!(
+            "{label}.schema_version must be whashreonator.prepared-assets.v1"
+        )));
+    }
+
+    validate_optional_field(
+        &format!("{label}.context.extraction_tool"),
+        inventory.context.extraction_tool.as_deref(),
+    )?;
+    validate_optional_field(
+        &format!("{label}.context.extraction_kind"),
+        inventory.context.extraction_kind.as_deref(),
+    )?;
+    validate_optional_field(
+        &format!("{label}.context.source_root"),
+        inventory.context.source_root.as_deref(),
+    )?;
+    validate_optional_field(
+        &format!("{label}.context.version_id"),
+        inventory.context.version_id.as_deref(),
+    )?;
+    validate_optional_field(
+        &format!("{label}.context.note"),
+        inventory.context.note.as_deref(),
+    )?;
+
+    if let Some(extraction_kind) = inventory.context.extraction_kind.as_deref()
+        && !extraction_kind.eq_ignore_ascii_case("asset_records")
+    {
+        return Err(AppError::InvalidInput(format!(
+            "{label}.context.extraction_kind must stay on asset_records for the current extractor-backed integration"
+        )));
+    }
+
+    validate_extracted_assets(&format!("{label}.assets"), &inventory.assets)?;
+
+    let inventory_source_root = inventory
+        .context
+        .source_root
+        .as_deref()
+        .map(normalize_context_path);
+    for (index, asset) in inventory.assets.iter().enumerate() {
+        validate_optional_field(
+            &format!("{label}.assets[{index}].source.extraction_tool"),
+            asset.source.extraction_tool.as_deref(),
+        )?;
+        validate_optional_field(
+            &format!("{label}.assets[{index}].source.source_root"),
+            asset.source.source_root.as_deref(),
+        )?;
+        validate_optional_field(
+            &format!("{label}.assets[{index}].source.source_path"),
+            asset.source.source_path.as_deref(),
+        )?;
+        validate_optional_field(
+            &format!("{label}.assets[{index}].source.container_path"),
+            asset.source.container_path.as_deref(),
+        )?;
+        validate_optional_field(
+            &format!("{label}.assets[{index}].source.source_kind"),
+            asset.source.source_kind.as_deref(),
+        )?;
+
+        if let (Some(inventory_root), Some(asset_root)) = (
+            inventory_source_root.as_deref(),
+            asset
+                .source
+                .source_root
+                .as_deref()
+                .map(normalize_context_path)
+                .as_deref(),
+        ) && inventory_root != asset_root
+        {
+            return Err(AppError::InvalidInput(format!(
+                "{label}.assets[{index}].source.source_root must stay aligned with {label}.context.source_root"
+            )));
+        }
     }
 
     Ok(())
@@ -468,6 +573,8 @@ fn prepared_inventory_scope_hint(
         meaningful_character_coverage: inventory.context.meaningful_character_coverage,
         note,
         inventory_path: None,
+        inventory_schema_version: Some(inventory.schema_version.clone()),
+        inventory_version_id: inventory.context.version_id.clone(),
         extraction_tool: inventory.context.extraction_tool.clone(),
         extraction_kind: inventory.context.extraction_kind.clone(),
         inventory_source_root: inventory.context.source_root.clone(),
@@ -477,6 +584,10 @@ fn prepared_inventory_scope_hint(
 
 fn normalize_hint_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
+}
+
+fn normalize_context_path(value: &str) -> String {
+    value.replace('\\', "/").trim().to_string()
 }
 
 fn is_content_like_path(path: &str) -> bool {
@@ -636,6 +747,49 @@ mod tests {
         assert_eq!(
             inventory.assets[0].source.container_path.as_deref(),
             Some("pakchunk0-WindowsNoEditor.pak")
+        );
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[test]
+    fn prepared_asset_inventory_loader_rejects_non_asset_records_contract() {
+        let test_root = unique_test_dir();
+        fs::create_dir_all(&test_root).expect("create test root");
+        let inventory_path = test_root.join("prepared-assets-invalid.json");
+        fs::write(
+            &inventory_path,
+            r#"{
+                "schema_version":"whashreonator.prepared-assets.v1",
+                "context":{
+                    "extraction_tool":"fixture-extractor",
+                    "extraction_kind":"mesh_table",
+                    "source_root":"D:/prepared",
+                    "version_id":"8.0.0"
+                },
+                "assets":[
+                    {
+                        "id":"mesh:encore:body",
+                        "path":"Content/Character/Encore/Body.mesh",
+                        "kind":"mesh"
+                    },
+                    {
+                        "id":"mesh:encore:body:duplicate",
+                        "path":"Content/Character/Encore/Body.mesh",
+                        "kind":"mesh"
+                    }
+                ]
+            }"#,
+        )
+        .expect("write invalid prepared inventory");
+
+        let error = load_prepared_asset_inventory(&inventory_path)
+            .expect_err("invalid extractor inventory contract should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("context.extraction_kind must stay on asset_records")
         );
 
         let _ = fs::remove_dir_all(&test_root);

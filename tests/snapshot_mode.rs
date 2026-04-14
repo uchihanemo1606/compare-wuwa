@@ -495,6 +495,30 @@ fn prepared_snapshot_command_is_runtime_facing_and_stored_as_official_artifacts(
             .context
             .extractor
             .as_ref()
+            .and_then(|context| context.inventory_schema_version.as_deref()),
+        Some("whashreonator.prepared-assets.v1")
+    );
+    assert_eq!(
+        old_snapshot
+            .context
+            .extractor
+            .as_ref()
+            .and_then(|context| context.inventory_version_id.as_deref()),
+        None
+    );
+    assert_eq!(
+        old_snapshot
+            .context
+            .extractor
+            .as_ref()
+            .and_then(|context| context.inventory_version_matches_snapshot),
+        None
+    );
+    assert_eq!(
+        old_snapshot
+            .context
+            .extractor
+            .as_ref()
             .map(|context| context.extraction_tool.as_deref()),
         Some(Some("fixture-extractor"))
     );
@@ -568,7 +592,7 @@ fn prepared_snapshot_command_is_runtime_facing_and_stored_as_official_artifacts(
             && artifact.path == storage.snapshot_path_for_version("6.1.0")
     }));
     assert!(new_artifacts.iter().any(|artifact| {
-        artifact.kind == VersionArtifactKind::Auxiliary
+        artifact.kind == VersionArtifactKind::ExtractorInventory
             && artifact
                 .path
                 .file_name()
@@ -582,7 +606,7 @@ fn prepared_snapshot_command_is_runtime_facing_and_stored_as_official_artifacts(
     assert_eq!(compare_report.old_version.version_id, "6.0.0");
     assert_eq!(compare_report.new_version.version_id, "6.1.0");
     assert!(compare_report.summary.changed_items > 0);
-    assert_eq!(compare_report.scope_notes.len(), 6);
+    assert_eq!(compare_report.scope_notes.len(), 7);
     assert!(
         compare_report
             .scope_notes
@@ -596,12 +620,19 @@ fn prepared_snapshot_command_is_runtime_facing_and_stored_as_official_artifacts(
             .iter()
             .any(|note| note.contains("scope warning"))
     );
-    assert!(
-        compare_report
-            .scope_notes
-            .iter()
-            .any(|note| note.contains("shallow coverage should not be read as rich asset-level enrichment"))
-    );
+    assert!(compare_report.scope_notes.iter().any(|note| {
+        note.contains("shallow coverage should not be read as rich asset-level enrichment")
+    }));
+    assert!(compare_report.scope_notes.iter().any(|note| {
+        note.contains(
+            "compare evidence posture: old=extractor_backed_partial new=extractor_backed_partial",
+        )
+    }));
+    let stored_inventory = storage
+        .load_latest_extractor_inventory_input("6.0.0")
+        .expect("load stored extractor inventory")
+        .expect("stored extractor inventory exists");
+    assert!(stored_inventory.contains("\"schema_version\":\"whashreonator.prepared-assets.v1\""));
 
     let _ = fs::remove_dir_all(&test_root);
 }
@@ -686,6 +717,59 @@ fn extractor_snapshot_command_treats_broad_enrichment_as_meaningful() {
             .note
             .as_deref()
             .is_some_and(|note| note.contains("enriched_records=6/12 threshold=5"))
+    );
+
+    let _ = fs::remove_dir_all(&test_root);
+}
+
+#[test]
+fn prepared_snapshot_command_rejects_mismatched_inventory_version() {
+    let test_root = unique_test_dir();
+    let source_root = test_root.join("game");
+    let inventory_path = test_root.join("prepared-mismatch.json");
+    let output_path = test_root
+        .join("out")
+        .join("prepared-mismatch.snapshot.json");
+
+    fs::create_dir_all(&source_root).expect("create source root");
+    fs::write(
+        &inventory_path,
+        r#"{
+            "schema_version":"whashreonator.prepared-assets.v1",
+            "context":{
+                "extraction_tool":"fixture-extractor",
+                "extraction_kind":"asset_records",
+                "source_root":"D:/prepared-mismatch",
+                "version_id":"6.1.0"
+            },
+            "assets":[
+                {
+                    "id":"mesh:encore:body",
+                    "path":"Content/Character/Encore/Body.mesh",
+                    "kind":"mesh",
+                    "metadata":{"logical_name":"Encore Body"},
+                    "source":{"source_root":"D:/prepared-mismatch"}
+                }
+            ]
+        }"#,
+    )
+    .expect("write mismatched prepared inventory");
+
+    let error = run_snapshot_command(&SnapshotArgs {
+        source_root,
+        version_id: "6.0.0".to_string(),
+        output: output_path,
+        capture_scope: SnapshotCaptureScopeArg::Extractor,
+        extractor_inventory: Some(inventory_path),
+        store_in_report: false,
+        report_root: None,
+    })
+    .expect_err("mismatched inventory version should fail");
+
+    assert!(
+        error
+            .to_string()
+            .contains("extractor inventory declares version_id 6.1.0")
     );
 
     let _ = fs::remove_dir_all(&test_root);

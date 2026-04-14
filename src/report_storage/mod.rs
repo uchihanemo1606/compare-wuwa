@@ -55,6 +55,7 @@ pub enum VersionArtifactKind {
     InferenceData,
     ProposalData,
     HumanSummary,
+    ExtractorInventory,
     BufferData,
     HashData,
     Auxiliary,
@@ -768,6 +769,30 @@ impl ReportStorage {
         Ok(None)
     }
 
+    pub fn load_latest_extractor_inventory_input(
+        &self,
+        version_id: &str,
+    ) -> AppResult<Option<String>> {
+        let mut candidates = self
+            .list_version_artifacts(version_id)?
+            .into_iter()
+            .filter(|artifact| {
+                artifact.kind == VersionArtifactKind::ExtractorInventory
+                    && artifact.path.extension().is_some_and(|ext| ext == "json")
+            })
+            .map(|artifact| artifact.path)
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| right.cmp(left));
+
+        for path in candidates {
+            if let Ok(content) = fs::read_to_string(&path) {
+                return Ok(Some(content));
+            }
+        }
+
+        Ok(None)
+    }
+
     pub fn load_latest_mapping_proposal(
         &self,
         version_id: &str,
@@ -997,6 +1022,14 @@ fn collect_artifacts_from_new_layout(version_dir: &Path) -> AppResult<Vec<Versio
                 "summary" => VersionArtifactKind::HumanSummary,
                 "buffer" => VersionArtifactKind::BufferData,
                 "hash" => VersionArtifactKind::HashData,
+                "auxiliary"
+                    if file
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.contains("extractor-inventory")) =>
+                {
+                    VersionArtifactKind::ExtractorInventory
+                }
                 _ => VersionArtifactKind::Auxiliary,
             };
             artifacts.push(VersionArtifactEntry {

@@ -572,10 +572,9 @@ fn infer_fixes_command_loads_representative_baseline_set_from_report_root_and_pr
         report
             .representative_risk_projections
             .iter()
-            .any(|projection| {
+            .all(|projection| {
                 projection.risk_class
-            == whashreonator::inference::RepresentativeModRiskClass::DrawCallFilterHookSensitive
-            && projection.review_first
+                    != whashreonator::inference::RepresentativeModRiskClass::DrawCallFilterHookSensitive
             })
     );
     assert!(
@@ -589,6 +588,100 @@ fn infer_fixes_command_loads_representative_baseline_set_from_report_root_and_pr
                     .any(|item| item.contains("representative sample mods"))
             })
     );
+
+    let _ = fs::remove_dir_all(&test_root);
+}
+
+#[test]
+fn infer_fixes_command_rejects_mismatched_explicit_representative_baseline_version() {
+    let test_root = unique_test_dir();
+    let compare_path = test_root.join("compare.json");
+    let knowledge_path = test_root.join("knowledge.json");
+    let baseline_path = test_root.join("mismatched-baselines.json");
+    let output_path = test_root
+        .join("out")
+        .join("inference-mismatched-representative.json");
+
+    fs::create_dir_all(&test_root).expect("create test root");
+    fs::write(
+        &compare_path,
+        serde_json::to_string_pretty(&sample_compare_report()).expect("serialize compare"),
+    )
+    .expect("write compare report");
+    fs::write(
+        &knowledge_path,
+        serde_json::to_string_pretty(&sample_knowledge()).expect("serialize knowledge"),
+    )
+    .expect("write knowledge report");
+    fs::write(
+        &baseline_path,
+        serde_json::to_string_pretty(&sample_representative_baseline_set("2.5.0"))
+            .expect("serialize baseline set"),
+    )
+    .expect("write representative baseline set");
+
+    let error = run_infer_fixes_command(&InferFixesArgs {
+        compare_report: compare_path,
+        wwmi_knowledge: knowledge_path,
+        continuity_artifact: None,
+        report_root: None,
+        mod_root: None,
+        mod_dependency_profile: None,
+        representative_mod_baseline_set: Some(baseline_path),
+        output: output_path,
+    })
+    .expect_err("mismatched representative baseline should fail");
+
+    assert!(
+        error
+            .to_string()
+            .contains("does not match compare old snapshot version")
+    );
+
+    let _ = fs::remove_dir_all(&test_root);
+}
+
+#[test]
+fn infer_fixes_command_does_not_autoload_new_version_representative_baseline() {
+    let test_root = unique_test_dir();
+    let report_root = test_root.join("out").join("report");
+    let storage = ReportStorage::new(report_root.clone());
+    let compare_path = test_root.join("compare.json");
+    let knowledge_path = test_root.join("knowledge.json");
+    let output_path = test_root.join("out").join("inference-no-old-baseline.json");
+
+    fs::create_dir_all(&test_root).expect("create test root");
+    fs::write(
+        &compare_path,
+        serde_json::to_string_pretty(&sample_compare_report()).expect("serialize compare"),
+    )
+    .expect("write compare report");
+    fs::write(
+        &knowledge_path,
+        serde_json::to_string_pretty(&sample_knowledge()).expect("serialize knowledge"),
+    )
+    .expect("write knowledge report");
+    storage
+        .save_mod_dependency_baseline_set_for_version(
+            "2.5.0",
+            &sample_representative_baseline_set("2.5.0"),
+        )
+        .expect("store new-version representative baseline set");
+
+    let report = run_infer_fixes_command(&InferFixesArgs {
+        compare_report: compare_path,
+        wwmi_knowledge: knowledge_path,
+        continuity_artifact: None,
+        report_root: Some(report_root),
+        mod_root: None,
+        mod_dependency_profile: None,
+        representative_mod_baseline_set: None,
+        output: output_path,
+    })
+    .expect("run inference without old-version representative baseline");
+
+    assert!(report.representative_mod_baseline_input.is_none());
+    assert!(report.representative_risk_projections.is_empty());
 
     let _ = fs::remove_dir_all(&test_root);
 }
@@ -648,6 +741,66 @@ fn infer_fixes_command_projects_resource_skeleton_surface_from_explicit_represen
             .triggering_compare_signals
             .iter()
             .any(|signal| signal == "resource_or_skeleton_field_drift")
+    );
+
+    let _ = fs::remove_dir_all(&test_root);
+}
+
+#[test]
+fn infer_fixes_command_projects_hook_sensitive_surface_only_when_hook_context_drifts() {
+    let test_root = unique_test_dir();
+    let compare_path = test_root.join("compare-hook.json");
+    let knowledge_path = test_root.join("knowledge.json");
+    let baseline_path = test_root.join("hook-baselines.json");
+    let output_path = test_root
+        .join("out")
+        .join("inference-hook-representative.json");
+
+    fs::create_dir_all(&test_root).expect("create test root");
+    fs::write(
+        &compare_path,
+        serde_json::to_string_pretty(&sample_hook_sensitive_compare_report())
+            .expect("serialize compare"),
+    )
+    .expect("write compare report");
+    fs::write(
+        &knowledge_path,
+        serde_json::to_string_pretty(&sample_knowledge()).expect("serialize knowledge"),
+    )
+    .expect("write knowledge report");
+    fs::write(
+        &baseline_path,
+        serde_json::to_string_pretty(&sample_representative_baseline_set("6.5.0"))
+            .expect("serialize baseline set"),
+    )
+    .expect("write representative baseline set");
+
+    let report = run_infer_fixes_command(&InferFixesArgs {
+        compare_report: compare_path,
+        wwmi_knowledge: knowledge_path,
+        continuity_artifact: None,
+        report_root: None,
+        mod_root: None,
+        mod_dependency_profile: None,
+        representative_mod_baseline_set: Some(baseline_path),
+        output: output_path,
+    })
+    .expect("run hook-sensitive representative inference");
+
+    let projection = report
+        .representative_risk_projections
+        .iter()
+        .find(|projection| {
+            projection.risk_class
+                == whashreonator::inference::RepresentativeModRiskClass::DrawCallFilterHookSensitive
+        })
+        .expect("hook-sensitive representative projection");
+    assert!(projection.review_first);
+    assert!(
+        projection
+            .triggering_compare_signals
+            .iter()
+            .any(|signal| signal == "hook_targeting_context_drift")
     );
 
     let _ = fs::remove_dir_all(&test_root);
@@ -962,6 +1115,90 @@ fn sample_resource_skeleton_compare_report() -> SnapshotCompareReport {
             ],
             runner_up_confidence: None,
             confidence_gap: Some(0.15),
+            ambiguous: false,
+        }],
+    }
+}
+
+fn sample_hook_sensitive_compare_report() -> SnapshotCompareReport {
+    SnapshotCompareReport {
+        schema_version: "whashreonator.snapshot-compare.v1".to_string(),
+        old_snapshot: SnapshotVersionInfo {
+            version_id: "6.5.0".to_string(),
+            source_root: "old".to_string(),
+            asset_count: 1,
+        },
+        new_snapshot: SnapshotVersionInfo {
+            version_id: "6.6.0".to_string(),
+            source_root: "new".to_string(),
+            asset_count: 1,
+        },
+        scope: SnapshotCompareScopeContext::default(),
+        summary: SnapshotCompareSummary {
+            total_old_assets: 1,
+            total_new_assets: 1,
+            unchanged_assets: 0,
+            added_assets: 1,
+            removed_assets: 1,
+            changed_assets: 1,
+            candidate_mapping_changes: 1,
+            identity_changed_assets: 0,
+            layout_changed_assets: 0,
+            structural_changed_assets: 0,
+            naming_only_changed_assets: 0,
+            cosmetic_only_changed_assets: 0,
+            provenance_changed_assets: 1,
+            container_moved_assets: 1,
+            lineage_rename_or_repath_assets: 0,
+            lineage_container_movement_assets: 1,
+            lineage_layout_drift_assets: 0,
+            lineage_replacement_assets: 0,
+            lineage_ambiguous_assets: 0,
+            lineage_insufficient_evidence_assets: 0,
+            ambiguous_candidate_mapping_changes: 0,
+            high_confidence_candidate_mapping_changes: 1,
+        },
+        added_assets: Vec::new(),
+        removed_assets: vec![SnapshotAssetChange {
+            change_type: SnapshotChangeType::Removed,
+            old_asset: Some(asset_summary("Content/Character/HeroA/Hair.mesh")),
+            new_asset: None,
+            changed_fields: vec!["path_presence".to_string()],
+            probable_impact: RiskLevel::Medium,
+            crash_risk: RiskLevel::Medium,
+            suspected_mapping_change: true,
+            lineage: whashreonator::compare::AssetLineageKind::ContainerMovement,
+            reasons: vec![SnapshotCompareReason {
+                code: "asset_removed".to_string(),
+                message: "asset removed".to_string(),
+            }],
+        }],
+        changed_assets: vec![SnapshotAssetChange {
+            change_type: SnapshotChangeType::Changed,
+            old_asset: Some(asset_summary("Content/Character/HeroA/Hair.mesh")),
+            new_asset: Some(asset_summary("Content/Character/HeroA/Hair.mesh")),
+            changed_fields: vec!["container_path".to_string(), "source_kind".to_string()],
+            probable_impact: RiskLevel::High,
+            crash_risk: RiskLevel::High,
+            suspected_mapping_change: true,
+            lineage: whashreonator::compare::AssetLineageKind::ContainerMovement,
+            reasons: vec![SnapshotCompareReason {
+                code: "container_package_movement_detected".to_string(),
+                message: "container changed".to_string(),
+            }],
+        }],
+        candidate_mapping_changes: vec![CandidateMappingChange {
+            old_asset: asset_summary("Content/Character/HeroA/Hair.mesh"),
+            new_asset: asset_summary("Content/Character/HeroA/Hair_LOD0.mesh"),
+            confidence: 0.86,
+            compatibility: RemapCompatibility::CompatibleWithCaution,
+            lineage: whashreonator::compare::AssetLineageKind::ContainerMovement,
+            reasons: vec![SnapshotCompareReason {
+                code: "container_path_mismatch".to_string(),
+                message: "container path changed".to_string(),
+            }],
+            runner_up_confidence: None,
+            confidence_gap: Some(0.14),
             ambiguous: false,
         }],
     }

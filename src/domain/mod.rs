@@ -100,6 +100,7 @@ pub struct PreparedAssetInventoryContext {
     pub extraction_tool: Option<String>,
     pub extraction_kind: Option<String>,
     pub source_root: Option<String>,
+    pub version_id: Option<String>,
     pub tags: Vec<String>,
     pub meaningful_content_coverage: Option<bool>,
     pub meaningful_character_coverage: Option<bool>,

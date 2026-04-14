@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     compare::{
         AssetLineageKind, CandidateMappingChange, RemapCompatibility, RiskLevel,
-        SnapshotAssetChange,
-        SnapshotAssetSummary, SnapshotChangeType, SnapshotCompareReason, SnapshotCompareReport,
+        SnapshotAssetChange, SnapshotAssetSummary, SnapshotChangeType, SnapshotCompareReason,
+        SnapshotCompareReport,
     },
     domain::{AssetInternalStructure, AssetSourceContext},
     inference::{InferenceReport, InferredMappingContinuityContext, RepresentativeModRiskClass},
@@ -1927,8 +1927,34 @@ fn build_scope_notes(old_snapshot: &GameSnapshot, new_snapshot: &GameSnapshot) -
                 .to_string(),
         );
     }
+    notes.push(format!(
+        "compare evidence posture: old={} new={}",
+        report_evidence_tier(&old_scope, &old_quality),
+        report_evidence_tier(&new_scope, &new_quality)
+    ));
 
     notes
+}
+
+fn report_evidence_tier(
+    scope: &crate::snapshot::SnapshotScopeAssessment,
+    quality: &crate::snapshot::SnapshotCaptureQualitySummary,
+) -> &'static str {
+    match scope.acquisition_kind.as_deref() {
+        Some("shallow_filesystem_inventory") => "shallow_support_only",
+        Some("extractor_backed_asset_records")
+            if scope.meaningful_content_coverage
+                && scope.meaningful_character_coverage
+                && scope.meaningful_asset_record_enrichment
+                && quality.extractor_record_count > 0
+                && quality.extractor_inventory_version_matches_snapshot == Some(true) =>
+        {
+            "extractor_backed_rich"
+        }
+        Some("extractor_backed_asset_records") => "extractor_backed_partial",
+        _ if scope.is_low_signal_for_character_analysis() => "mixed_or_low_signal",
+        _ => "mixed_or_partial",
+    }
 }
 
 fn has_shallow_hash_or_manifest_only_support(
@@ -2530,7 +2556,7 @@ mod tests {
         let report =
             VersionDiffReportBuilder.from_compare(&old_snapshot, &new_snapshot, &compare_report);
 
-        assert_eq!(report.scope_notes.len(), 4);
+        assert_eq!(report.scope_notes.len(), 5);
         assert!(
             report
                 .scope_notes
@@ -2538,6 +2564,9 @@ mod tests {
                 .any(|note| note.contains("quality: launcher=missing")
                     && note.contains("manifest_coverage=resources:"))
         );
+        assert!(report.scope_notes.iter().any(|note| note.contains(
+            "compare evidence posture: old=extractor_backed_partial new=extractor_backed_partial"
+        )));
         assert!(
             report
                 .scope_notes

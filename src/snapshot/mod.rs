@@ -106,6 +106,14 @@ pub struct SnapshotScopeContext {
 #[serde(default)]
 pub struct SnapshotExtractorContext {
     pub inventory_path: Option<String>,
+    #[serde(default)]
+    pub inventory_schema_version: Option<String>,
+    #[serde(default)]
+    pub inventory_version_id: Option<String>,
+    #[serde(default)]
+    pub inventory_version_matches_snapshot: Option<bool>,
+    #[serde(default)]
+    pub launcher_version_matches_inventory: Option<bool>,
     pub extraction_tool: Option<String>,
     pub extraction_kind: Option<String>,
     pub inventory_source_root: Option<String>,
@@ -194,6 +202,10 @@ pub struct SnapshotCaptureQualitySummary {
     pub extractor_records_with_hashes: usize,
     pub extractor_records_with_source_context: usize,
     pub extractor_records_with_rich_metadata: usize,
+    pub extractor_inventory_schema_version: Option<String>,
+    pub extractor_inventory_version_id: Option<String>,
+    pub extractor_inventory_version_matches_snapshot: Option<bool>,
+    pub launcher_version_matches_extractor_inventory: Option<bool>,
 }
 
 impl SnapshotCaptureQualitySummary {
@@ -376,11 +388,15 @@ pub fn create_extractor_backed_snapshot_from_inventory(
     source_root: &Path,
     inventory: crate::domain::PreparedAssetInventory,
 ) -> AppResult<GameSnapshot> {
-    create_prepared_snapshot(
-        version_id,
-        source_root,
-        PreparedSnapshotAssetExtractor::from_inventory(inventory)?,
-    )
+    let resolved_version_id = resolve_snapshot_version_id(version_id, source_root)?;
+    validate_extractor_inventory_alignment(&inventory, &resolved_version_id, source_root)?;
+
+    let extractor = PreparedSnapshotAssetExtractor::from_inventory(inventory.clone())?;
+    let mut snapshot = SnapshotBuilder::new(extractor, DefaultFingerprinter)
+        .build(&resolved_version_id, source_root)?;
+    enrich_snapshot_from_game_root(&mut snapshot, source_root)?;
+    annotate_extractor_inventory_alignment(&mut snapshot, &inventory);
+    Ok(snapshot)
 }
 
 pub fn create_prepared_snapshot_from_file(
@@ -396,11 +412,13 @@ pub fn create_extractor_backed_snapshot_from_file(
     source_root: &Path,
     inventory_path: &Path,
 ) -> AppResult<GameSnapshot> {
-    create_prepared_snapshot(
-        version_id,
-        source_root,
-        PreparedSnapshotAssetExtractor::from_json(inventory_path)?,
-    )
+    let inventory = crate::ingest::load_prepared_asset_inventory(inventory_path)?;
+    let mut snapshot =
+        create_extractor_backed_snapshot_from_inventory(version_id, source_root, inventory)?;
+    if let Some(extractor) = snapshot.context.extractor.as_mut() {
+        extractor.inventory_path = Some(inventory_path.to_string_lossy().replace('\\', "/"));
+    }
+    Ok(snapshot)
 }
 
 pub fn detect_game_version(source_root: &Path) -> AppResult<String> {
@@ -486,6 +504,10 @@ fn build_extractor_context(
 ) -> SnapshotExtractorContext {
     SnapshotExtractorContext {
         inventory_path: scope_hint.inventory_path.clone(),
+        inventory_schema_version: scope_hint.inventory_schema_version.clone(),
+        inventory_version_id: scope_hint.inventory_version_id.clone(),
+        inventory_version_matches_snapshot: None,
+        launcher_version_matches_inventory: None,
         extraction_tool: scope_hint.extraction_tool.clone(),
         extraction_kind: scope_hint.extraction_kind.clone(),
         inventory_source_root: scope_hint.inventory_source_root.clone(),
@@ -548,9 +570,7 @@ fn has_snapshot_hash_fields(hash_fields: &SnapshotHashFields) -> bool {
 }
 
 fn is_meaningfully_enriched_snapshot_asset(asset: &SnapshotAsset) -> bool {
-    has_snapshot_hash_fields(&asset.hash_fields)
-        || has_source_context(&asset.source)
-        || has_rich_asset_metadata(&asset.metadata)
+    has_source_context(&asset.source) || has_rich_asset_metadata(&asset.metadata)
 }
 
 fn min_meaningful_enriched_record_count(record_count: usize) -> usize {
@@ -665,6 +685,97 @@ fn annotate_snapshot_scope_from_extractor(
         .notes
         .push("extractor-backed runtime snapshot created from richer asset records".to_string());
     snapshot.context.notes.push(extractor_note);
+}
+
+fn validate_extractor_inventory_alignment(
+    inventory: &crate::domain::PreparedAssetInventory,
+    snapshot_version_id: &str,
+    source_root: &Path,
+) -> AppResult<()> {
+    if let Some(inventory_version_id) = inventory.context.version_id.as_deref()
+        && inventory_version_id != snapshot_version_id
+    {
+        return Err(AppError::InvalidInput(format!(
+            "extractor inventory declares version_id {}, but snapshot version_id resolved to {}; extractor-backed evidence must stay version-aligned",
+            inventory_version_id, snapshot_version_id
+        )));
+    }
+
+    if let Some(launcher) = load_launcher_context(source_root)?
+        && let Some(inventory_version_id) = inventory.context.version_id.as_deref()
+        && inventory_version_id != launcher.detected_version
+    {
+        return Err(AppError::InvalidInput(format!(
+            "extractor inventory declares version_id {}, but launcher-detected version under {} is {}; extractor-backed evidence must stay aligned to the current game version",
+            inventory_version_id,
+            normalize_source_root(source_root),
+            launcher.detected_version
+        )));
+    }
+
+    Ok(())
+}
+
+fn annotate_extractor_inventory_alignment(
+    snapshot: &mut GameSnapshot,
+    inventory: &crate::domain::PreparedAssetInventory,
+) {
+    let inventory_version_id = inventory.context.version_id.clone();
+    let inventory_version_matches_snapshot = inventory_version_id
+        .as_deref()
+        .map(|version_id| version_id == snapshot.version_id);
+    let launcher_version_matches_inventory = match (
+        snapshot.context.launcher.as_ref(),
+        inventory_version_id.as_deref(),
+    ) {
+        (Some(launcher), Some(version_id)) => Some(version_id == launcher.detected_version),
+        _ => None,
+    };
+
+    let mut alignment_note = String::new();
+    if let Some(version_id) = inventory_version_id.as_deref() {
+        alignment_note.push_str(&format!(
+            "extractor inventory version_id={} matches_snapshot={}",
+            version_id,
+            if inventory_version_matches_snapshot == Some(true) {
+                "yes"
+            } else {
+                "no"
+            }
+        ));
+        if let Some(matches_launcher) = launcher_version_matches_inventory {
+            alignment_note.push_str(&format!(
+                " launcher_matches_inventory={}",
+                if matches_launcher { "yes" } else { "no" }
+            ));
+        }
+    } else {
+        alignment_note.push_str(
+            "extractor inventory did not declare version_id; version alignment remains externally selected and should stay review-first",
+        );
+    }
+
+    if let Some(extractor_context) = snapshot.context.extractor.as_mut() {
+        extractor_context.inventory_version_matches_snapshot = inventory_version_matches_snapshot;
+        extractor_context.launcher_version_matches_inventory = launcher_version_matches_inventory;
+        if extractor_context.inventory_schema_version.is_none() {
+            extractor_context.inventory_schema_version = Some(inventory.schema_version.clone());
+        }
+        if extractor_context.inventory_version_id.is_none() {
+            extractor_context.inventory_version_id = inventory_version_id.clone();
+        }
+        let combined_note = match extractor_context.note.take() {
+            Some(note) if !note.trim().is_empty() => format!("{note}; {alignment_note}"),
+            _ => alignment_note.clone(),
+        };
+        extractor_context.note = Some(combined_note);
+    }
+
+    if let Some(scope_note) = snapshot.context.scope.note.as_mut() {
+        scope_note.push_str("; ");
+        scope_note.push_str(&alignment_note);
+    }
+    snapshot.context.notes.push(alignment_note);
 }
 
 fn enrich_snapshot_from_game_root(
@@ -882,6 +993,26 @@ pub fn summarize_snapshot_capture_quality(
             .as_ref()
             .map(|extractor| extractor.records_with_rich_metadata)
             .unwrap_or_default(),
+        extractor_inventory_schema_version: snapshot
+            .context
+            .extractor
+            .as_ref()
+            .and_then(|extractor| extractor.inventory_schema_version.clone()),
+        extractor_inventory_version_id: snapshot
+            .context
+            .extractor
+            .as_ref()
+            .and_then(|extractor| extractor.inventory_version_id.clone()),
+        extractor_inventory_version_matches_snapshot: snapshot
+            .context
+            .extractor
+            .as_ref()
+            .and_then(|extractor| extractor.inventory_version_matches_snapshot),
+        launcher_version_matches_extractor_inventory: snapshot
+            .context
+            .extractor
+            .as_ref()
+            .and_then(|extractor| extractor.launcher_version_matches_inventory),
     }
 }
 
@@ -1111,7 +1242,7 @@ mod tests {
         GameSnapshot, SnapshotAsset, SnapshotContext, SnapshotFingerprint, SnapshotHashFields,
         SnapshotScopeContext, assess_snapshot_scope, create_local_snapshot,
         create_local_snapshot_with_capture_scope, create_prepared_snapshot_from_file,
-        create_snapshot_with_extractor, load_snapshot,
+        create_snapshot_with_extractor, load_snapshot, summarize_snapshot_capture_quality,
     };
 
     #[test]
@@ -1525,6 +1656,36 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[test]
+    fn hash_only_assets_do_not_count_as_meaningful_enrichment() {
+        let snapshot = GameSnapshot {
+            schema_version: "whashreonator.snapshot.v1".to_string(),
+            version_id: "6.3.0".to_string(),
+            created_at_unix_ms: 1,
+            source_root: "fixture".to_string(),
+            asset_count: 1,
+            assets: vec![SnapshotAsset {
+                id: "hash-only".to_string(),
+                path: "Content/Character/Encore/Body.mesh".to_string(),
+                kind: Some("mesh".to_string()),
+                metadata: crate::domain::AssetMetadata::default(),
+                fingerprint: SnapshotFingerprint::default(),
+                hash_fields: SnapshotHashFields {
+                    asset_hash: Some("asset-md5".to_string()),
+                    shader_hash: None,
+                    signature: Some("sig-001".to_string()),
+                },
+                source: crate::domain::AssetSourceContext::default(),
+            }],
+            context: SnapshotContext::default(),
+        };
+
+        let quality = summarize_snapshot_capture_quality(&snapshot);
+
+        assert_eq!(quality.assets_with_any_hash, 1);
+        assert_eq!(quality.meaningfully_enriched_assets, 0);
     }
 
     #[test]

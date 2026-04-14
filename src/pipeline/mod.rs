@@ -456,7 +456,9 @@ fn resolve_inference_representative_mod_baseline_set(
     compare_report: &SnapshotCompareReport,
 ) -> AppResult<Option<WwmiModDependencyBaselineSet>> {
     if let Some(path) = args.representative_mod_baseline_set.as_deref() {
-        return Ok(Some(load_mod_dependency_baseline_set(path)?));
+        let baseline_set = load_mod_dependency_baseline_set(path)?;
+        return validate_representative_mod_baseline_set_version(&baseline_set, compare_report)
+            .map(Some);
     }
 
     let Some(report_root) = args.report_root.as_ref() else {
@@ -467,10 +469,25 @@ fn resolve_inference_representative_mod_baseline_set(
     if let Some(baseline_set) =
         storage.load_latest_mod_dependency_baseline_set(&compare_report.old_snapshot.version_id)?
     {
-        return Ok(Some(baseline_set));
+        return validate_representative_mod_baseline_set_version(&baseline_set, compare_report)
+            .map(Some);
     }
 
-    storage.load_latest_mod_dependency_baseline_set(&compare_report.new_snapshot.version_id)
+    Ok(None)
+}
+
+fn validate_representative_mod_baseline_set_version(
+    baseline_set: &WwmiModDependencyBaselineSet,
+    compare_report: &SnapshotCompareReport,
+) -> AppResult<WwmiModDependencyBaselineSet> {
+    if baseline_set.version_id == compare_report.old_snapshot.version_id {
+        return Ok(baseline_set.clone());
+    }
+
+    Err(AppError::InvalidInput(format!(
+        "representative mod baseline set version {} does not match compare old snapshot version {}; representative risk projection requires a prepatch baseline aligned to the old snapshot",
+        baseline_set.version_id, compare_report.old_snapshot.version_id
+    )))
 }
 
 pub fn run_generate_proposals_command(args: &GenerateProposalsArgs) -> AppResult<ProposalResult> {
