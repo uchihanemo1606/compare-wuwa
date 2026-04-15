@@ -1,6 +1,8 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    thread,
+    time::Duration,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -133,6 +135,38 @@ fn compare_report_scope_notes_state_selected_baseline_and_why() {
     assert!(report.scope_notes.iter().any(|note| {
         note.contains("selected baseline 7.1.0") && note.contains("posture=shallow_support_only")
     }));
+
+    let _ = fs::remove_dir_all(&test_root);
+}
+
+#[test]
+fn baseline_tie_break_prefers_fresher_artifact_over_lexical_path_order() {
+    let test_root = unique_test_dir();
+    let storage = ReportStorage::new(test_root.join("out").join("report"));
+    let version_id = "7.2.0";
+
+    let lexically_later_older_path = alternate_snapshot_path(&storage, version_id, "zzz-older");
+    write_snapshot(
+        &lexically_later_older_path,
+        &rich_extractor_snapshot(version_id, 140),
+    )
+    .expect("write older rich baseline");
+
+    thread::sleep(Duration::from_millis(1200));
+
+    let lexically_earlier_newer_path = alternate_snapshot_path(&storage, version_id, "aaa-newer");
+    write_snapshot(
+        &lexically_earlier_newer_path,
+        &rich_extractor_snapshot(version_id, 140),
+    )
+    .expect("write newer rich baseline");
+
+    let selected = storage
+        .select_snapshot_baseline_for_version(version_id)
+        .expect("select baseline")
+        .expect("baseline exists");
+
+    assert_eq!(selected.path, lexically_earlier_newer_path);
 
     let _ = fs::remove_dir_all(&test_root);
 }

@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
+    time::UNIX_EPOCH,
 };
 
 use crate::{
@@ -405,7 +406,7 @@ impl ReportStorage {
         Ok(Some(self.save_version_continuity_artifact(&artifact)?))
     }
 
-    pub fn find_snapshot_by_version(&self, version_id: &str) -> AppResult<Option<PathBuf>> {
+    pub fn find_stored_snapshot_by_version(&self, version_id: &str) -> AppResult<Option<PathBuf>> {
         let path = self.snapshot_path_for_version(version_id);
         if path.exists() {
             return Ok(Some(path));
@@ -418,6 +419,20 @@ impl ReportStorage {
         }
 
         Ok(None)
+    }
+
+    pub fn find_snapshot_by_version(&self, version_id: &str) -> AppResult<Option<PathBuf>> {
+        self.find_stored_snapshot_by_version(version_id)
+    }
+
+    pub fn load_stored_snapshot_by_version(
+        &self,
+        version_id: &str,
+    ) -> AppResult<Option<GameSnapshot>> {
+        let Some(path) = self.find_stored_snapshot_by_version(version_id)? else {
+            return Ok(None);
+        };
+        Ok(Some(load_snapshot(&path)?))
     }
 
     pub fn load_snapshot_by_version(&self, version_id: &str) -> AppResult<Option<GameSnapshot>> {
@@ -1065,6 +1080,7 @@ impl ReportStorage {
             }
             let (posture, scope, quality) = snapshot_evidence_posture(&snapshot);
             let rank = baseline_preference_rank(posture, &scope, &quality);
+            let canonical_path = self.snapshot_path_for_version(version_id);
             candidates.push(SnapshotBaselineCandidate {
                 sort_key: (
                     rank,
@@ -1074,8 +1090,10 @@ impl ReportStorage {
                     quality.assets_with_source_context,
                     quality.assets_with_rich_metadata,
                     snapshot.asset_count,
-                    artifact.path == self.snapshot_path_for_version(version_id),
+                    artifact_baseline_trust_rank(&artifact, &canonical_path),
+                    artifact.path == canonical_path,
                     snapshot.created_at_unix_ms,
+                    artifact_last_modified_unix_ms(&artifact.path),
                     artifact.path.clone(),
                 ),
                 selected: SelectedSnapshotBaseline {
@@ -1109,6 +1127,11 @@ impl ReportStorage {
             }
             let (posture, scope, quality) = snapshot_evidence_posture(&snapshot);
             let rank = baseline_preference_rank(posture, &scope, &quality);
+            let artifact = VersionArtifactEntry {
+                kind: VersionArtifactKind::LegacySnapshot,
+                path: legacy_path.clone(),
+                label: format!("legacy snapshot | {}", legacy_path.display()),
+            };
             candidates.push(SnapshotBaselineCandidate {
                 sort_key: (
                     rank,
@@ -1118,26 +1141,24 @@ impl ReportStorage {
                     quality.assets_with_source_context,
                     quality.assets_with_rich_metadata,
                     snapshot.asset_count,
+                    artifact_baseline_trust_rank(
+                        &artifact,
+                        &self.snapshot_path_for_version(version_id),
+                    ),
                     false,
                     snapshot.created_at_unix_ms,
+                    artifact_last_modified_unix_ms(&legacy_path),
                     legacy_path.clone(),
                 ),
                 selected: SelectedSnapshotBaseline {
                     version_id: version_id.to_string(),
                     path: legacy_path.clone(),
                     artifact_kind: VersionArtifactKind::LegacySnapshot,
-                    artifact_label: format!("legacy snapshot | {}", legacy_path.display()),
+                    artifact_label: artifact.label.clone(),
                     evidence_posture: posture.machine_label().to_string(),
                     inventory_alignment: quality.extractor_inventory_alignment_status().to_string(),
                     selection_reason: baseline_preference_reason(
-                        posture,
-                        &scope,
-                        &quality,
-                        &VersionArtifactEntry {
-                            kind: VersionArtifactKind::LegacySnapshot,
-                            path: legacy_path.clone(),
-                            label: format!("legacy snapshot | {}", legacy_path.display()),
-                        },
+                        posture, &scope, &quality, &artifact,
                     ),
                     snapshot,
                 },
@@ -1150,8 +1171,42 @@ impl ReportStorage {
 
 #[derive(Debug, Clone)]
 struct SnapshotBaselineCandidate {
-    sort_key: (u8, bool, usize, usize, usize, usize, usize, bool, u128, PathBuf),
+    sort_key: (
+        u8,
+        bool,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        u8,
+        bool,
+        u128,
+        u128,
+        PathBuf,
+    ),
     selected: SelectedSnapshotBaseline,
+}
+
+fn artifact_baseline_trust_rank(artifact: &VersionArtifactEntry, canonical_path: &Path) -> u8 {
+    if artifact.path == canonical_path {
+        return 3;
+    }
+
+    match artifact.kind {
+        VersionArtifactKind::Snapshot => 2,
+        VersionArtifactKind::LegacySnapshot => 1,
+        _ => 0,
+    }
+}
+
+fn artifact_last_modified_unix_ms(path: &Path) -> u128 {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0)
 }
 
 fn baseline_preference_rank(

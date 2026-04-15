@@ -97,7 +97,7 @@ where
         version_override: Option<&str>,
     ) -> AppResult<PrepareVersionScanResult> {
         let version_id = self.detect_version(source_root, version_override)?;
-        let existing_snapshot_path = self.storage.find_snapshot_by_version(&version_id)?;
+        let existing_snapshot_path = self.storage.find_stored_snapshot_by_version(&version_id)?;
         let prepared = PreparedVersionScan {
             source_root: source_root.to_path_buf(),
             version_id,
@@ -130,7 +130,7 @@ where
 
         if let Some(existing) = self
             .storage
-            .load_snapshot_by_version(&prepared.version_id)?
+            .load_stored_snapshot_by_version(&prepared.version_id)?
         {
             if snapshots_equivalent(&existing, &snapshot) {
                 return Ok(ExecuteVersionScanResult::NoChangesDetected {
@@ -383,6 +383,7 @@ mod tests {
         let test_root = unique_test_dir();
         let storage = crate::report_storage::ReportStorage::new(test_root.join("reports"));
         let version_id = "6.6.0";
+        let alternate_snapshot = sample_snapshot(version_id, "alt-root", 5);
         let alternate_path = storage
             .build_version_directory(version_id)
             .join("report_bundle")
@@ -393,7 +394,7 @@ mod tests {
         }
         fs::write(
             &alternate_path,
-            serde_json::to_string_pretty(&sample_snapshot(version_id, "alt-root", 2))
+            serde_json::to_string_pretty(&alternate_snapshot)
                 .expect("serialize alternate snapshot"),
         )
         .expect("write alternate snapshot");
