@@ -148,6 +148,29 @@ fn compare_snapshots_command_keeps_sparse_extractor_pairs_low_signal() {
     assert!(!parsed.scope.old_snapshot.meaningful_asset_record_enrichment);
     assert!(!parsed.scope.new_snapshot.meaningful_asset_record_enrichment);
     assert_eq!(parsed.scope.old_snapshot.extractor_record_count, 12);
+    assert_eq!(parsed.scope.old_snapshot.extractor_records_with_hashes, 1);
+    assert_eq!(
+        parsed
+            .scope
+            .old_snapshot
+            .extractor_records_with_source_context,
+        1
+    );
+    assert_eq!(
+        parsed
+            .scope
+            .old_snapshot
+            .extractor_records_with_rich_metadata,
+        1
+    );
+    assert_eq!(
+        parsed
+            .scope
+            .old_snapshot
+            .extractor_inventory_schema_version
+            .as_deref(),
+        Some("whashreonator.prepared-assets.v1")
+    );
     assert_eq!(parsed.scope.old_snapshot.assets_with_asset_hash, 1);
     assert_eq!(parsed.scope.old_snapshot.assets_with_source_context, 1);
     assert!(
@@ -164,6 +187,14 @@ fn compare_snapshots_command_keeps_sparse_extractor_pairs_low_signal() {
             .iter()
             .any(|note| note.contains("low-coverage/low-enrichment extractor snapshots"))
     );
+    assert!(parsed.scope.notes.iter().any(|note| {
+        note.contains("extractor alignment caution") && note.contains("did not declare version_id")
+    }));
+    assert!(parsed.scope.notes.iter().any(|note| {
+        note.contains(
+            "compare evidence posture: old=extractor_backed_alignment_unverified new=extractor_backed_alignment_unverified",
+        )
+    }));
 
     let _ = fs::remove_dir_all(&test_root);
 }

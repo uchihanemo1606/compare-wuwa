@@ -78,6 +78,15 @@ Codex should treat the following as always-on repository rules:
 - Do not drift into mod-authoring, mod packaging, or generic mod-management features. Stay focused on version diff, evidence gathering, continuity, repair-assist, and reviewer-facing outputs.
 - Prefer additive changes, conservative review-first decisions, and backward-compatible schema evolution.
 
+## Backend Phase Defaults
+When Codex is asked to implement a backend phase, these defaults apply unless the user explicitly overrides them:
+
+- Keep the phase backend-only. Do not expand into GUI work unless the user explicitly asks for it.
+- Prefer the smallest high-leverage slice that fits the named phase instead of broad speculative architecture work.
+- Reuse existing backend modules where possible, especially `snapshot/`, `compare/`, `report/`, `report_storage/`, `inference/`, `proposal/`, `human_summary/`, and `wwmi/dependency.rs`.
+- Keep larger user-facing behavior tests in `tests/*.rs`.
+- If an optional real-data branch is unavailable (for example a real extractor inventory or a real changed compare pair), do not block the whole phase. Implement the backend hardening that can be done now, verify with fixtures or currently available artifacts, and report the limitation explicitly instead of faking success.
+
 ## Real Game Root Verification
 After each implementation phase and automated test pass, Codex must run a real-data verification pass against the real game root:
 
@@ -99,3 +108,10 @@ Every final implementation report should include:
 - which output path(s) were produced
 - what happened on real data
 - explicit confirmation that nothing was written into the game root
+
+## Real Mod Directories
+If a phase uses real mod directories such as `D:\mod\WWMI\Mods`, Codex must treat them as read-only input only.
+
+- Do not modify, rename, delete, or write any file inside real mod directories.
+- Any outputs derived from real mod directories must go only to approved artifact locations such as repo-local `out/` or report storage roots.
+- Final implementation reports should explicitly confirm that nothing was written into the real mod directories when they were used.

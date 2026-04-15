@@ -342,6 +342,89 @@ mod tests {
         let _ = fs::remove_dir_all(test_root);
     }
 
+    #[test]
+    fn alternate_snapshot_only_does_not_block_prepare_scan_as_officially_stored() {
+        let test_root = unique_test_dir();
+        let storage = crate::report_storage::ReportStorage::new(test_root.join("reports"));
+        let version_id = "6.5.0";
+        let alternate_path = storage
+            .build_version_directory(version_id)
+            .join("report_bundle")
+            .join("fixture")
+            .join("old.snapshot.json");
+        if let Some(parent) = alternate_path.parent() {
+            fs::create_dir_all(parent).expect("create alternate snapshot parent");
+        }
+        fs::write(
+            &alternate_path,
+            serde_json::to_string_pretty(&sample_snapshot(version_id, "alt-root", 2))
+                .expect("serialize alternate snapshot"),
+        )
+        .expect("write alternate snapshot");
+
+        let service = VersionScanService::new(storage, FixedSnapshotFactory::default());
+        let prepared = service
+            .prepare_scan(Path::new("D:/fake-game"), Some(version_id))
+            .expect("prepare scan");
+
+        match prepared {
+            PrepareVersionScanResult::Ready(prepared) => {
+                assert_eq!(prepared.version_id, version_id);
+                assert!(prepared.existing_snapshot_path.is_none());
+            }
+            other => panic!("expected ready result, got {other:?}"),
+        }
+
+        let _ = fs::remove_dir_all(test_root);
+    }
+
+    #[test]
+    fn execute_scan_without_force_does_not_return_missing_canonical_path() {
+        let test_root = unique_test_dir();
+        let storage = crate::report_storage::ReportStorage::new(test_root.join("reports"));
+        let version_id = "6.6.0";
+        let alternate_path = storage
+            .build_version_directory(version_id)
+            .join("report_bundle")
+            .join("fixture")
+            .join("old.snapshot.json");
+        if let Some(parent) = alternate_path.parent() {
+            fs::create_dir_all(parent).expect("create alternate snapshot parent");
+        }
+        fs::write(
+            &alternate_path,
+            serde_json::to_string_pretty(&sample_snapshot(version_id, "alt-root", 2))
+                .expect("serialize alternate snapshot"),
+        )
+        .expect("write alternate snapshot");
+
+        let service = VersionScanService::new(
+            storage.clone(),
+            FixedSnapshotFactory::from_snapshots(vec![sample_snapshot(version_id, "new-root", 5)]),
+        );
+        let prepared = match service
+            .prepare_scan(Path::new("D:/fake-game"), Some(version_id))
+            .expect("prepare scan")
+        {
+            PrepareVersionScanResult::Ready(prepared) => prepared,
+            other => panic!("expected ready result, got {other:?}"),
+        };
+
+        let result = service
+            .execute_scan(&prepared, false)
+            .expect("execute scan");
+
+        match result {
+            ExecuteVersionScanResult::Created { snapshot_path, .. } => {
+                assert_eq!(snapshot_path, storage.snapshot_path_for_version(version_id));
+                assert!(snapshot_path.exists());
+            }
+            other => panic!("expected created result, got {other:?}"),
+        }
+
+        let _ = fs::remove_dir_all(test_root);
+    }
+
     #[derive(Default, Clone)]
     struct FixedSnapshotFactory {
         snapshots: Rc<RefCell<VecDeque<GameSnapshot>>>,

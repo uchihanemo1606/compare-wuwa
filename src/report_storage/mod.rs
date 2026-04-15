@@ -22,7 +22,7 @@ use crate::{
         VersionDiffReportV2, VersionLineageSection, load_version_continuity_artifact,
         load_version_diff_report_v2,
     },
-    snapshot::{GameSnapshot, load_snapshot},
+    snapshot::{GameSnapshot, SnapshotEvidencePosture, load_snapshot, snapshot_evidence_posture},
     wwmi::dependency::{
         WwmiModDependencyBaselineSet, WwmiModDependencyProfile, load_mod_dependency_baseline_set,
     },
@@ -83,6 +83,18 @@ pub struct StoredVersionEntry {
     pub has_human_summary: bool,
     pub has_buffer_data: bool,
     pub has_hash_data: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectedSnapshotBaseline {
+    pub version_id: String,
+    pub path: PathBuf,
+    pub artifact_kind: VersionArtifactKind,
+    pub artifact_label: String,
+    pub evidence_posture: String,
+    pub inventory_alignment: String,
+    pub selection_reason: String,
+    pub snapshot: GameSnapshot,
 }
 
 #[derive(Debug, Clone)]
@@ -409,11 +421,21 @@ impl ReportStorage {
     }
 
     pub fn load_snapshot_by_version(&self, version_id: &str) -> AppResult<Option<GameSnapshot>> {
-        let Some(path) = self.find_snapshot_by_version(version_id)? else {
-            return Ok(None);
-        };
+        Ok(self
+            .select_snapshot_baseline_for_version(version_id)?
+            .map(|baseline| baseline.snapshot))
+    }
 
-        Ok(Some(load_snapshot(&path)?))
+    pub fn select_snapshot_baseline_for_version(
+        &self,
+        version_id: &str,
+    ) -> AppResult<Option<SelectedSnapshotBaseline>> {
+        let mut candidates = self.snapshot_baseline_candidates_for_version(version_id)?;
+        candidates.sort_by(|left, right| right.sort_key.cmp(&left.sort_key));
+        Ok(candidates
+            .into_iter()
+            .next()
+            .map(|candidate| candidate.selected))
     }
 
     pub fn list_versions(&self) -> AppResult<Vec<StoredVersionEntry>> {
@@ -912,14 +934,40 @@ impl ReportStorage {
         old_version: &str,
         new_version: &str,
     ) -> AppResult<VersionDiffReportV2> {
-        let old_snapshot = self.load_snapshot_by_version(old_version)?.ok_or_else(|| {
-            AppError::InvalidInput(format!("snapshot for version {old_version} not found"))
-        })?;
-        let new_snapshot = self.load_snapshot_by_version(new_version)?.ok_or_else(|| {
-            AppError::InvalidInput(format!("snapshot for version {new_version} not found"))
-        })?;
+        let old_baseline = self
+            .select_snapshot_baseline_for_version(old_version)?
+            .ok_or_else(|| {
+                AppError::InvalidInput(format!("snapshot for version {old_version} not found"))
+            })?;
+        let new_baseline = self
+            .select_snapshot_baseline_for_version(new_version)?
+            .ok_or_else(|| {
+                AppError::InvalidInput(format!("snapshot for version {new_version} not found"))
+            })?;
+        let old_snapshot = old_baseline.snapshot.clone();
+        let new_snapshot = new_baseline.snapshot.clone();
         let compare = SnapshotComparer.compare(&old_snapshot, &new_snapshot);
-        Ok(VersionDiffReportBuilder.from_compare(&old_snapshot, &new_snapshot, &compare))
+        let mut report =
+            VersionDiffReportBuilder.from_compare(&old_snapshot, &new_snapshot, &compare);
+        report.scope_notes.push(format!(
+            "selected baseline {}: posture={} alignment={} source={} artifact_kind={:?}; {}",
+            old_version,
+            old_baseline.evidence_posture,
+            old_baseline.inventory_alignment,
+            old_baseline.path.display(),
+            old_baseline.artifact_kind,
+            old_baseline.selection_reason
+        ));
+        report.scope_notes.push(format!(
+            "selected baseline {}: posture={} alignment={} source={} artifact_kind={:?}; {}",
+            new_version,
+            new_baseline.evidence_posture,
+            new_baseline.inventory_alignment,
+            new_baseline.path.display(),
+            new_baseline.artifact_kind,
+            new_baseline.selection_reason
+        ));
+        Ok(report)
     }
 
     pub fn list_reports(&self) -> AppResult<Vec<ReportListEntry>> {
@@ -986,6 +1034,201 @@ impl ReportStorage {
         }
 
         paths
+    }
+
+    fn snapshot_baseline_candidates_for_version(
+        &self,
+        version_id: &str,
+    ) -> AppResult<Vec<SnapshotBaselineCandidate>> {
+        let mut candidates = Vec::new();
+        let mut artifacts = self
+            .list_version_artifacts(version_id)?
+            .into_iter()
+            .filter(|artifact| match artifact.kind {
+                VersionArtifactKind::Snapshot | VersionArtifactKind::LegacySnapshot => true,
+                VersionArtifactKind::ReportBundle => artifact
+                    .path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(".snapshot.json")),
+                _ => false,
+            })
+            .collect::<Vec<_>>();
+        artifacts.sort_by(|left, right| left.path.cmp(&right.path));
+
+        for artifact in artifacts {
+            let Ok(snapshot) = load_snapshot(&artifact.path) else {
+                continue;
+            };
+            if snapshot.version_id != version_id {
+                continue;
+            }
+            let (posture, scope, quality) = snapshot_evidence_posture(&snapshot);
+            let rank = baseline_preference_rank(posture, &scope, &quality);
+            candidates.push(SnapshotBaselineCandidate {
+                sort_key: (
+                    rank,
+                    quality.launcher_version_matches_snapshot == Some(true),
+                    quality.manifest_matched_assets,
+                    quality.meaningfully_enriched_assets,
+                    quality.assets_with_source_context,
+                    quality.assets_with_rich_metadata,
+                    snapshot.asset_count,
+                    artifact.path == self.snapshot_path_for_version(version_id),
+                    snapshot.created_at_unix_ms,
+                    artifact.path.clone(),
+                ),
+                selected: SelectedSnapshotBaseline {
+                    version_id: version_id.to_string(),
+                    path: artifact.path.clone(),
+                    artifact_kind: artifact.kind,
+                    artifact_label: artifact.label.clone(),
+                    evidence_posture: posture.machine_label().to_string(),
+                    inventory_alignment: quality.extractor_inventory_alignment_status().to_string(),
+                    selection_reason: baseline_preference_reason(
+                        posture, &scope, &quality, &artifact,
+                    ),
+                    snapshot,
+                },
+            });
+        }
+
+        for legacy_path in self.legacy_snapshot_paths_for_version(version_id) {
+            if !legacy_path.exists()
+                || candidates
+                    .iter()
+                    .any(|candidate| candidate.selected.path == legacy_path)
+            {
+                continue;
+            }
+            let Ok(snapshot) = load_snapshot(&legacy_path) else {
+                continue;
+            };
+            if snapshot.version_id != version_id {
+                continue;
+            }
+            let (posture, scope, quality) = snapshot_evidence_posture(&snapshot);
+            let rank = baseline_preference_rank(posture, &scope, &quality);
+            candidates.push(SnapshotBaselineCandidate {
+                sort_key: (
+                    rank,
+                    quality.launcher_version_matches_snapshot == Some(true),
+                    quality.manifest_matched_assets,
+                    quality.meaningfully_enriched_assets,
+                    quality.assets_with_source_context,
+                    quality.assets_with_rich_metadata,
+                    snapshot.asset_count,
+                    false,
+                    snapshot.created_at_unix_ms,
+                    legacy_path.clone(),
+                ),
+                selected: SelectedSnapshotBaseline {
+                    version_id: version_id.to_string(),
+                    path: legacy_path.clone(),
+                    artifact_kind: VersionArtifactKind::LegacySnapshot,
+                    artifact_label: format!("legacy snapshot | {}", legacy_path.display()),
+                    evidence_posture: posture.machine_label().to_string(),
+                    inventory_alignment: quality.extractor_inventory_alignment_status().to_string(),
+                    selection_reason: baseline_preference_reason(
+                        posture,
+                        &scope,
+                        &quality,
+                        &VersionArtifactEntry {
+                            kind: VersionArtifactKind::LegacySnapshot,
+                            path: legacy_path.clone(),
+                            label: format!("legacy snapshot | {}", legacy_path.display()),
+                        },
+                    ),
+                    snapshot,
+                },
+            });
+        }
+
+        Ok(candidates)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SnapshotBaselineCandidate {
+    sort_key: (u8, bool, usize, usize, usize, usize, usize, bool, u128, PathBuf),
+    selected: SelectedSnapshotBaseline,
+}
+
+fn baseline_preference_rank(
+    posture: SnapshotEvidencePosture,
+    scope: &crate::snapshot::SnapshotScopeAssessment,
+    quality: &crate::snapshot::SnapshotCaptureQualitySummary,
+) -> u8 {
+    match posture {
+        SnapshotEvidencePosture::ExtractorBackedRich => 6,
+        SnapshotEvidencePosture::ShallowSupportOnly
+            if quality.launcher_version_matches_snapshot == Some(true)
+                || quality.manifest_matched_assets > 0 =>
+        {
+            5
+        }
+        SnapshotEvidencePosture::MixedOrPartial => 4,
+        SnapshotEvidencePosture::ShallowSupportOnly => 3,
+        SnapshotEvidencePosture::ExtractorBackedPartial
+            if scope.meaningful_content_coverage
+                && scope.meaningful_character_coverage
+                && quality.has_version_aligned_extractor_inventory() =>
+        {
+            3
+        }
+        SnapshotEvidencePosture::ExtractorBackedAlignmentUnverified => 2,
+        SnapshotEvidencePosture::ExtractorBackedPartial => 2,
+        SnapshotEvidencePosture::MixedOrLowSignal => 1,
+        SnapshotEvidencePosture::ExtractorBackedMisaligned => 0,
+    }
+}
+
+fn baseline_preference_reason(
+    posture: SnapshotEvidencePosture,
+    scope: &crate::snapshot::SnapshotScopeAssessment,
+    quality: &crate::snapshot::SnapshotCaptureQualitySummary,
+    artifact: &VersionArtifactEntry,
+) -> String {
+    match posture {
+        SnapshotEvidencePosture::ExtractorBackedRich => format!(
+            "preferred this baseline because it is extractor-backed, version-aligned, and meaningfully enriched; artifact={}",
+            artifact.label
+        ),
+        SnapshotEvidencePosture::ShallowSupportOnly
+            if quality.launcher_version_matches_snapshot == Some(true)
+                || quality.manifest_matched_assets > 0 =>
+        {
+            format!(
+                "preferred this baseline as the safer stored fallback because launcher/manifest evidence is present and no stronger trustworthy extractor-backed baseline outranked it; artifact={}",
+                artifact.label
+            )
+        }
+        SnapshotEvidencePosture::ExtractorBackedMisaligned => format!(
+            "this baseline remains available only as a last resort because extractor version evidence is mismatched; artifact={}",
+            artifact.label
+        ),
+        SnapshotEvidencePosture::ExtractorBackedAlignmentUnverified => format!(
+            "kept this extractor-backed baseline review-first because version alignment is {}; artifact={}",
+            quality.extractor_inventory_alignment_status(),
+            artifact.label
+        ),
+        SnapshotEvidencePosture::ExtractorBackedPartial => format!(
+            "kept this extractor-backed baseline below stronger safer candidates because asset-level enrichment remains partial (content={} character={} enrichment={}); artifact={}",
+            scope.meaningful_content_coverage,
+            scope.meaningful_character_coverage,
+            scope.meaningful_asset_record_enrichment,
+            artifact.label
+        ),
+        SnapshotEvidencePosture::MixedOrPartial | SnapshotEvidencePosture::MixedOrLowSignal => {
+            format!(
+                "selected the best remaining baseline from stored candidates with conservative review-first posture; artifact={}",
+                artifact.label
+            )
+        }
+        SnapshotEvidencePosture::ShallowSupportOnly => format!(
+            "selected a shallow baseline because it was the best remaining stored candidate, but it still stays low-signal for deeper analysis; artifact={}",
+            artifact.label
+        ),
     }
 }
 

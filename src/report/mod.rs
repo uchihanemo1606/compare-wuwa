@@ -11,7 +11,10 @@ use crate::{
     domain::{AssetInternalStructure, AssetSourceContext},
     inference::{InferenceReport, InferredMappingContinuityContext, RepresentativeModRiskClass},
     proposal::{MappingProposalEntry, MappingProposalOutput, ProposalStatus},
-    snapshot::{GameSnapshot, assess_snapshot_scope, summarize_snapshot_capture_quality},
+    snapshot::{
+        GameSnapshot, assess_snapshot_scope, snapshot_evidence_posture_from_parts,
+        summarize_snapshot_capture_quality,
+    },
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1852,7 +1855,7 @@ fn build_scope_notes(old_snapshot: &GameSnapshot, new_snapshot: &GameSnapshot) -
             new_scope.coverage.non_content_path_count
         ),
         format!(
-            "old snapshot {} quality: launcher={} reuse={} matches_snapshot={} manifest_coverage=resources:{} matched:{} unmatched_snapshot_assets:{} hash_coverage=asset_hashes:{}/{} any_hashes:{}/{} signatures:{}/{} asset_enrichment=source_context:{}/{} rich_metadata:{}/{} enriched_assets:{}/{} extractor_records={}",
+            "old snapshot {} quality: launcher={} reuse={} matches_snapshot={} manifest_coverage=resources:{} matched:{} unmatched_snapshot_assets:{} hash_coverage=asset_hashes:{}/{} any_hashes:{}/{} signatures:{}/{} asset_enrichment=source_context:{}/{} rich_metadata:{}/{} enriched_assets:{}/{} extractor_records={} extractor_support=hashes:{} source_context:{} rich_metadata:{} schema={} inventory_version={} alignment={} launcher_matches_inventory={}",
             old_snapshot.version_id,
             old_quality
                 .launcher_detected_version
@@ -1878,10 +1881,26 @@ fn build_scope_notes(old_snapshot: &GameSnapshot, new_snapshot: &GameSnapshot) -
             old_quality.asset_count,
             old_quality.meaningfully_enriched_assets,
             old_quality.asset_count,
-            old_quality.extractor_record_count
+            old_quality.extractor_record_count,
+            old_quality.extractor_records_with_hashes,
+            old_quality.extractor_records_with_source_context,
+            old_quality.extractor_records_with_rich_metadata,
+            old_quality
+                .extractor_inventory_schema_version
+                .as_deref()
+                .unwrap_or("-"),
+            old_quality
+                .extractor_inventory_version_id
+                .as_deref()
+                .unwrap_or("-"),
+            old_quality.extractor_inventory_alignment_status(),
+            old_quality
+                .launcher_version_matches_extractor_inventory
+                .map(|value| if value { "yes" } else { "no" })
+                .unwrap_or("unknown")
         ),
         format!(
-            "new snapshot {} quality: launcher={} reuse={} matches_snapshot={} manifest_coverage=resources:{} matched:{} unmatched_snapshot_assets:{} hash_coverage=asset_hashes:{}/{} any_hashes:{}/{} signatures:{}/{} asset_enrichment=source_context:{}/{} rich_metadata:{}/{} enriched_assets:{}/{} extractor_records={}",
+            "new snapshot {} quality: launcher={} reuse={} matches_snapshot={} manifest_coverage=resources:{} matched:{} unmatched_snapshot_assets:{} hash_coverage=asset_hashes:{}/{} any_hashes:{}/{} signatures:{}/{} asset_enrichment=source_context:{}/{} rich_metadata:{}/{} enriched_assets:{}/{} extractor_records={} extractor_support=hashes:{} source_context:{} rich_metadata:{} schema={} inventory_version={} alignment={} launcher_matches_inventory={}",
             new_snapshot.version_id,
             new_quality
                 .launcher_detected_version
@@ -1907,7 +1926,23 @@ fn build_scope_notes(old_snapshot: &GameSnapshot, new_snapshot: &GameSnapshot) -
             new_quality.asset_count,
             new_quality.meaningfully_enriched_assets,
             new_quality.asset_count,
-            new_quality.extractor_record_count
+            new_quality.extractor_record_count,
+            new_quality.extractor_records_with_hashes,
+            new_quality.extractor_records_with_source_context,
+            new_quality.extractor_records_with_rich_metadata,
+            new_quality
+                .extractor_inventory_schema_version
+                .as_deref()
+                .unwrap_or("-"),
+            new_quality
+                .extractor_inventory_version_id
+                .as_deref()
+                .unwrap_or("-"),
+            new_quality.extractor_inventory_alignment_status(),
+            new_quality
+                .launcher_version_matches_extractor_inventory
+                .map(|value| if value { "yes" } else { "no" })
+                .unwrap_or("unknown")
         ),
     ];
 
@@ -1927,6 +1962,28 @@ fn build_scope_notes(old_snapshot: &GameSnapshot, new_snapshot: &GameSnapshot) -
                 .to_string(),
         );
     }
+    if old_quality.has_extractor_alignment_caution()
+        || new_quality.has_extractor_alignment_caution()
+    {
+        let mut cautions = Vec::new();
+        if let Some(reason) = old_quality.extractor_alignment_reason() {
+            cautions.push(format!("old={reason}"));
+        }
+        if let Some(reason) = new_quality.extractor_alignment_reason() {
+            cautions.push(format!("new={reason}"));
+        }
+        notes.push(format!(
+            "scope warning: extractor alignment caution: {}",
+            cautions.join(" | ")
+        ));
+    } else if report_evidence_tier(&old_scope, &old_quality) == "extractor_backed_rich"
+        && report_evidence_tier(&new_scope, &new_quality) == "extractor_backed_rich"
+    {
+        notes.push(
+            "scope note: both snapshots are extractor-backed, version-aligned, and asset-enriched enough to support higher-signal structural review than shallow manifest/hash support alone."
+                .to_string(),
+        );
+    }
     notes.push(format!(
         "compare evidence posture: old={} new={}",
         report_evidence_tier(&old_scope, &old_quality),
@@ -1940,21 +1997,7 @@ fn report_evidence_tier(
     scope: &crate::snapshot::SnapshotScopeAssessment,
     quality: &crate::snapshot::SnapshotCaptureQualitySummary,
 ) -> &'static str {
-    match scope.acquisition_kind.as_deref() {
-        Some("shallow_filesystem_inventory") => "shallow_support_only",
-        Some("extractor_backed_asset_records")
-            if scope.meaningful_content_coverage
-                && scope.meaningful_character_coverage
-                && scope.meaningful_asset_record_enrichment
-                && quality.extractor_record_count > 0
-                && quality.extractor_inventory_version_matches_snapshot == Some(true) =>
-        {
-            "extractor_backed_rich"
-        }
-        Some("extractor_backed_asset_records") => "extractor_backed_partial",
-        _ if scope.is_low_signal_for_character_analysis() => "mixed_or_low_signal",
-        _ => "mixed_or_partial",
-    }
+    snapshot_evidence_posture_from_parts(scope, quality).machine_label()
 }
 
 fn has_shallow_hash_or_manifest_only_support(

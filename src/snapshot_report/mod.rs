@@ -8,7 +8,8 @@ use crate::{
     error::{AppError, AppResult},
     snapshot::{
         GameSnapshot, SnapshotCaptureQualitySummary, SnapshotScopeAssessment,
-        assess_snapshot_scope, load_snapshot, summarize_snapshot_capture_quality,
+        assess_snapshot_scope, load_snapshot, snapshot_evidence_posture_from_parts,
+        summarize_snapshot_capture_quality,
     },
 };
 
@@ -187,6 +188,12 @@ fn render_markdown(
                 quality.low_signal_reasons(scope).join("; ")
             ));
         }
+        if let Some(reason) = quality.extractor_alignment_reason() {
+            low_signal_lines.push(format!(
+                "- {}: extractor-backed alignment caution: {}.",
+                snapshot.version_id, reason
+            ));
+        }
         if has_shallow_hash_or_manifest_only_support(scope, quality) {
             low_signal_lines.push(format!(
                 "- {}: manifest/hash coverage exists, but it remains shallow support and should not be read as rich asset-level enrichment.",
@@ -311,6 +318,11 @@ fn render_markdown(
         lines.push(format!(
             "| Added assets | {} |",
             compare_report.summary.added_assets
+        ));
+        lines.push(format!(
+            "| Evidence posture | old={} new={} |",
+            evidence_tier(old_scope, &capture_quality[index - 1]),
+            evidence_tier(new_scope, &capture_quality[index])
         ));
         lines.push(format!(
             "| Removed assets | {} |",
@@ -471,7 +483,7 @@ fn extractor_evidence(quality: &SnapshotCaptureQualitySummary) -> String {
     }
 
     format!(
-        "records={} hashes={} source_context={} rich_metadata={} schema={} inventory_version={} matches_snapshot={} launcher_matches_inventory={}",
+        "records={} hashes={} source_context={} rich_metadata={} schema={} inventory_version={} alignment={} matches_snapshot={} launcher_matches_inventory={}",
         quality.extractor_record_count,
         quality.extractor_records_with_hashes,
         quality.extractor_records_with_source_context,
@@ -484,6 +496,7 @@ fn extractor_evidence(quality: &SnapshotCaptureQualitySummary) -> String {
             .extractor_inventory_version_id
             .as_deref()
             .unwrap_or("-"),
+        quality.extractor_inventory_alignment_status(),
         quality
             .extractor_inventory_version_matches_snapshot
             .map(|value| if value { "yes" } else { "no" })
@@ -499,17 +512,7 @@ fn evidence_tier(
     scope: &SnapshotScopeAssessment,
     quality: &SnapshotCaptureQualitySummary,
 ) -> &'static str {
-    match scope.acquisition_kind.as_deref() {
-        Some("shallow_filesystem_inventory") => "shallow support only",
-        Some("extractor_backed_asset_records")
-            if is_version_aligned_rich_extractor_snapshot(scope, quality) =>
-        {
-            "extractor-backed rich evidence"
-        }
-        Some("extractor_backed_asset_records") => "extractor-backed partial",
-        _ if scope.is_low_signal_for_character_analysis() => "mixed or partial",
-        _ => "mixed or partial",
-    }
+    snapshot_evidence_posture_from_parts(scope, quality).human_label()
 }
 
 fn is_version_aligned_rich_extractor_snapshot(
@@ -521,7 +524,7 @@ fn is_version_aligned_rich_extractor_snapshot(
         && scope.meaningful_character_coverage
         && scope.meaningful_asset_record_enrichment
         && quality.extractor_record_count > 0
-        && quality.extractor_inventory_version_matches_snapshot == Some(true)
+        && quality.has_version_aligned_extractor_inventory()
 }
 
 fn scope_label(scope: &SnapshotScopeAssessment) -> &'static str {

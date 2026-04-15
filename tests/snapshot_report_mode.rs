@@ -185,12 +185,14 @@ fn snapshot_report_marks_sparse_extractor_snapshots_as_partial_and_low_signal() 
         "| 7.0.0 | extractor_backed_asset_records | extractor_backed_asset_records | mixed or partial coverage |"
     ));
     assert!(output.contains(
-        "| 7.0.0 | extractor_backed_asset_records | extractor_backed_asset_records | extractor-backed partial | yes | missing | missing | asset_hashes=1/12 any_hashes=1/12 signatures=1/12 | source_context=1/12 rich_metadata=1/12 enriched_assets=1/12 |"
+        "| 7.0.0 | extractor_backed_asset_records | extractor_backed_asset_records | extractor-backed alignment-unverified | yes | missing | missing | asset_hashes=1/12 any_hashes=1/12 signatures=1/12 | source_context=1/12 rich_metadata=1/12 enriched_assets=1/12 |"
     ));
     assert!(output.contains(
         "manifest/hash coverage exists, but it remains shallow support and should not be read as rich asset-level enrichment."
     ));
     assert!(output.contains("enriched_records=1/12 threshold=5"));
+    assert!(output.contains("extractor-backed alignment caution"));
+    assert!(output.contains("alignment=undeclared"));
     assert!(
         output.contains(
             "The following snapshots are low-signal for deep character/resonator analysis:"
@@ -279,6 +281,7 @@ fn snapshot_report_highlights_version_aligned_rich_extractor_evidence() {
     assert!(output.contains(
         "| 8.0.0 | extractor_backed_asset_records | extractor_backed_asset_records | extractor-backed rich evidence | no |"
     ));
+    assert!(output.contains("| Evidence posture | old=extractor-backed rich evidence new=extractor-backed rich evidence |"));
     assert!(output.contains("matches_snapshot=yes"));
     assert!(output.contains(
         "All analyzed snapshots are extractor-backed, version-aligned, and content/character-rich enough"

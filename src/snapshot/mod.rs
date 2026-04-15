@@ -146,6 +146,47 @@ pub struct SnapshotScopeAssessment {
     pub observed_fallback_used: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SnapshotEvidencePosture {
+    ExtractorBackedRich,
+    ShallowSupportOnly,
+    MixedOrPartial,
+    ExtractorBackedAlignmentUnverified,
+    ExtractorBackedPartial,
+    ExtractorBackedMisaligned,
+    MixedOrLowSignal,
+}
+
+impl SnapshotEvidencePosture {
+    pub fn machine_label(self) -> &'static str {
+        match self {
+            SnapshotEvidencePosture::ExtractorBackedRich => "extractor_backed_rich",
+            SnapshotEvidencePosture::ShallowSupportOnly => "shallow_support_only",
+            SnapshotEvidencePosture::MixedOrPartial => "mixed_or_partial",
+            SnapshotEvidencePosture::ExtractorBackedAlignmentUnverified => {
+                "extractor_backed_alignment_unverified"
+            }
+            SnapshotEvidencePosture::ExtractorBackedPartial => "extractor_backed_partial",
+            SnapshotEvidencePosture::ExtractorBackedMisaligned => "extractor_backed_misaligned",
+            SnapshotEvidencePosture::MixedOrLowSignal => "mixed_or_low_signal",
+        }
+    }
+
+    pub fn human_label(self) -> &'static str {
+        match self {
+            SnapshotEvidencePosture::ExtractorBackedRich => "extractor-backed rich evidence",
+            SnapshotEvidencePosture::ShallowSupportOnly => "shallow support only",
+            SnapshotEvidencePosture::MixedOrPartial => "mixed or partial",
+            SnapshotEvidencePosture::ExtractorBackedAlignmentUnverified => {
+                "extractor-backed alignment-unverified"
+            }
+            SnapshotEvidencePosture::ExtractorBackedPartial => "extractor-backed partial",
+            SnapshotEvidencePosture::ExtractorBackedMisaligned => "extractor-backed misaligned",
+            SnapshotEvidencePosture::MixedOrLowSignal => "mixed or low-signal",
+        }
+    }
+}
+
 impl SnapshotScopeAssessment {
     pub fn is_low_signal_for_character_analysis(&self) -> bool {
         match self.acquisition_kind.as_deref() {
@@ -209,6 +250,54 @@ pub struct SnapshotCaptureQualitySummary {
 }
 
 impl SnapshotCaptureQualitySummary {
+    pub fn extractor_inventory_alignment_status(&self) -> &'static str {
+        if self.extractor_record_count == 0 {
+            return "not_applicable";
+        }
+
+        if self.extractor_inventory_version_matches_snapshot == Some(false)
+            || self.launcher_version_matches_extractor_inventory == Some(false)
+        {
+            return "mismatched";
+        }
+
+        if self.extractor_inventory_version_matches_snapshot == Some(true) {
+            return "aligned";
+        }
+
+        if self.extractor_inventory_version_id.is_some() {
+            return "declared_but_unverified";
+        }
+
+        "undeclared"
+    }
+
+    pub fn has_version_aligned_extractor_inventory(&self) -> bool {
+        self.extractor_inventory_alignment_status() == "aligned"
+    }
+
+    pub fn has_extractor_alignment_caution(&self) -> bool {
+        matches!(
+            self.extractor_inventory_alignment_status(),
+            "mismatched" | "declared_but_unverified" | "undeclared"
+        )
+    }
+
+    pub fn extractor_alignment_reason(&self) -> Option<&'static str> {
+        match self.extractor_inventory_alignment_status() {
+            "mismatched" => Some(
+                "extractor inventory version evidence does not line up with the runtime snapshot and should stay review-first",
+            ),
+            "declared_but_unverified" => Some(
+                "extractor inventory declared a version, but the snapshot lacks enough preserved alignment flags to verify it end-to-end",
+            ),
+            "undeclared" => Some(
+                "extractor inventory did not declare version_id, so version alignment remains externally selected and review-first",
+            ),
+            _ => None,
+        }
+    }
+
     pub fn low_signal_reasons(&self, scope: &SnapshotScopeAssessment) -> Vec<String> {
         let mut reasons = Vec::new();
         if scope.mostly_install_or_package_level {
@@ -732,10 +821,23 @@ fn annotate_extractor_inventory_alignment(
         _ => None,
     };
 
-    let mut alignment_note = String::new();
+    let mut alignment_note = format!(
+        "extractor inventory alignment={}",
+        if inventory_version_matches_snapshot == Some(false)
+            || launcher_version_matches_inventory == Some(false)
+        {
+            "mismatched"
+        } else if inventory_version_matches_snapshot == Some(true) {
+            "aligned"
+        } else if inventory_version_id.is_some() {
+            "declared_but_unverified"
+        } else {
+            "undeclared"
+        }
+    );
     if let Some(version_id) = inventory_version_id.as_deref() {
         alignment_note.push_str(&format!(
-            "extractor inventory version_id={} matches_snapshot={}",
+            " version_id={} matches_snapshot={}",
             version_id,
             if inventory_version_matches_snapshot == Some(true) {
                 "yes"
@@ -751,7 +853,7 @@ fn annotate_extractor_inventory_alignment(
         }
     } else {
         alignment_note.push_str(
-            "extractor inventory did not declare version_id; version alignment remains externally selected and should stay review-first",
+            "; extractor inventory did not declare version_id, so runtime version alignment remains externally selected",
         );
     }
 
@@ -1013,6 +1115,55 @@ pub fn summarize_snapshot_capture_quality(
             .extractor
             .as_ref()
             .and_then(|extractor| extractor.launcher_version_matches_inventory),
+    }
+}
+
+pub fn snapshot_evidence_posture(
+    snapshot: &GameSnapshot,
+) -> (
+    SnapshotEvidencePosture,
+    SnapshotScopeAssessment,
+    SnapshotCaptureQualitySummary,
+) {
+    let scope = assess_snapshot_scope(snapshot);
+    let quality = summarize_snapshot_capture_quality(snapshot);
+    let posture = snapshot_evidence_posture_from_parts(&scope, &quality);
+    (posture, scope, quality)
+}
+
+pub fn snapshot_evidence_posture_from_parts(
+    scope: &SnapshotScopeAssessment,
+    quality: &SnapshotCaptureQualitySummary,
+) -> SnapshotEvidencePosture {
+    match scope.acquisition_kind.as_deref() {
+        Some("shallow_filesystem_inventory") => SnapshotEvidencePosture::ShallowSupportOnly,
+        Some("extractor_backed_asset_records")
+            if quality.extractor_inventory_alignment_status() == "mismatched" =>
+        {
+            SnapshotEvidencePosture::ExtractorBackedMisaligned
+        }
+        Some("extractor_backed_asset_records")
+            if scope.meaningful_content_coverage
+                && scope.meaningful_character_coverage
+                && scope.meaningful_asset_record_enrichment
+                && quality.extractor_record_count > 0
+                && quality.has_version_aligned_extractor_inventory() =>
+        {
+            SnapshotEvidencePosture::ExtractorBackedRich
+        }
+        Some("extractor_backed_asset_records")
+            if matches!(
+                quality.extractor_inventory_alignment_status(),
+                "undeclared" | "declared_but_unverified"
+            ) =>
+        {
+            SnapshotEvidencePosture::ExtractorBackedAlignmentUnverified
+        }
+        Some("extractor_backed_asset_records") => SnapshotEvidencePosture::ExtractorBackedPartial,
+        _ if scope.is_low_signal_for_character_analysis() => {
+            SnapshotEvidencePosture::MixedOrLowSignal
+        }
+        _ => SnapshotEvidencePosture::MixedOrPartial,
     }
 }
 

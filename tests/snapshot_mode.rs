@@ -606,14 +606,12 @@ fn prepared_snapshot_command_is_runtime_facing_and_stored_as_official_artifacts(
     assert_eq!(compare_report.old_version.version_id, "6.0.0");
     assert_eq!(compare_report.new_version.version_id, "6.1.0");
     assert!(compare_report.summary.changed_items > 0);
-    assert_eq!(compare_report.scope_notes.len(), 7);
-    assert!(
-        compare_report
-            .scope_notes
-            .iter()
-            .any(|note| note.contains("quality: launcher=missing")
-                && note.contains("manifest_coverage=resources:"))
-    );
+    assert_eq!(compare_report.scope_notes.len(), 10);
+    assert!(compare_report.scope_notes.iter().any(
+        |note| note.contains("quality: launcher=missing")
+            && note.contains("manifest_coverage=resources:")
+            && note.contains("alignment=undeclared")
+    ));
     assert!(
         compare_report
             .scope_notes
@@ -625,8 +623,20 @@ fn prepared_snapshot_command_is_runtime_facing_and_stored_as_official_artifacts(
     }));
     assert!(compare_report.scope_notes.iter().any(|note| {
         note.contains(
-            "compare evidence posture: old=extractor_backed_partial new=extractor_backed_partial",
+            "compare evidence posture: old=extractor_backed_alignment_unverified new=extractor_backed_alignment_unverified",
         )
+    }));
+    assert!(compare_report.scope_notes.iter().any(|note| {
+        note.contains("extractor alignment caution")
+            && note.contains("version alignment remains externally selected")
+    }));
+    assert!(compare_report.scope_notes.iter().any(|note| {
+        note.contains("selected baseline 6.0.0")
+            && note.contains("posture=extractor_backed_alignment_unverified")
+    }));
+    assert!(compare_report.scope_notes.iter().any(|note| {
+        note.contains("selected baseline 6.1.0")
+            && note.contains("posture=extractor_backed_alignment_unverified")
     }));
     let stored_inventory = storage
         .load_latest_extractor_inventory_input("6.0.0")
