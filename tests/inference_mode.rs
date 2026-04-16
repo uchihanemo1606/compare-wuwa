@@ -246,12 +246,23 @@ filename = SwordDiffuse.dds
         mod_report.surface_intersection.overlapping_surface_classes,
         vec![WwmiModDependencySurfaceClass::MappingHash]
     );
+    assert_eq!(
+        mod_report.surface_intersection.overlap_posture,
+        whashreonator::inference::InferenceSurfaceOverlapPosture::Partial
+    );
     assert!(
         mod_report
             .scope
             .notes
             .iter()
             .any(|note| { note.contains("mod-side dependency surfaces: mapping_hash") })
+    );
+    assert!(
+        mod_report
+            .scope
+            .notes
+            .iter()
+            .any(|note| note.contains("surface overlap posture: partial"))
     );
     assert!(
         mod_report
@@ -363,11 +374,22 @@ filename = SwordDiffuse.dds
             .overlapping_surface_classes
             .is_empty()
     );
+    assert_eq!(
+        mod_report.surface_intersection.overlap_posture,
+        whashreonator::inference::InferenceSurfaceOverlapPosture::None
+    );
     assert!(mod_report.surface_intersection.weak_or_absent_overlap);
     assert!(mod_report.scope.notes.iter().any(|note| {
         note.contains("no explicit mod/game surface overlap")
             || note.contains("review-only context")
     }));
+    assert!(
+        mod_report
+            .scope
+            .notes
+            .iter()
+            .any(|note| note.contains("surface overlap posture: none"))
+    );
     assert!(
         mod_fix
             .reasons
@@ -468,6 +490,10 @@ fn infer_fixes_command_uses_mod_dependency_profile_to_keep_buffer_sensitive_rema
         mod_report.surface_intersection.overlapping_surface_classes,
         vec![WwmiModDependencySurfaceClass::BufferLayout]
     );
+    assert_eq!(
+        mod_report.surface_intersection.overlap_posture,
+        whashreonator::inference::InferenceSurfaceOverlapPosture::Strong
+    );
     assert!(
         mod_report
             .scope
@@ -484,6 +510,13 @@ fn infer_fixes_command_uses_mod_dependency_profile_to_keep_buffer_sensitive_rema
             .notes
             .iter()
             .any(|note| note.contains("surface intersection overlap: buffer_layout"))
+    );
+    assert!(
+        mod_report
+            .scope
+            .notes
+            .iter()
+            .any(|note| note.contains("surface overlap posture: strong"))
     );
     assert!(
         mod_hint
@@ -969,6 +1002,78 @@ fn infer_fixes_command_keeps_representative_projection_review_first_in_low_signa
             .representative_risk_projections
             .iter()
             .all(|projection| projection.review_first)
+    );
+
+    let _ = fs::remove_dir_all(&test_root);
+}
+
+#[test]
+fn infer_fixes_command_does_not_promote_scope_induced_removals_into_crash_causes() {
+    let test_root = unique_test_dir();
+    let compare_path = test_root.join("compare-scope-induced.json");
+    let knowledge_path = test_root.join("knowledge.json");
+    let output_path = test_root.join("out").join("inference-scope-induced.json");
+
+    let mut compare = sample_compare_report();
+    compare.new_snapshot.version_id = "2.4.0".to_string();
+    compare.new_snapshot.asset_count = 0;
+    compare.summary.total_new_assets = 0;
+    compare.summary.added_assets = 0;
+    compare.summary.removed_assets = 1;
+    compare.summary.changed_assets = 0;
+    compare.summary.candidate_mapping_changes = 0;
+    compare.added_assets.clear();
+    compare.changed_assets.clear();
+    compare.candidate_mapping_changes.clear();
+    compare.scope.low_signal_compare = true;
+    compare.scope.old_snapshot.capture_mode = Some("local_filesystem_inventory".to_string());
+    compare.scope.new_snapshot.capture_mode =
+        Some("local_filesystem_inventory_character_focused".to_string());
+    compare.scope.old_snapshot.low_signal_for_character_analysis = true;
+    compare.scope.new_snapshot.low_signal_for_character_analysis = true;
+    compare.scope.scope_narrowing_detected = true;
+    compare.scope.scope_induced_removals_likely = true;
+    compare.scope.notes.push(
+        "scope-induced removal caution: new snapshot capture mode 'local_filesystem_inventory_character_focused' is narrower than old 'local_filesystem_inventory'; 1 removed assets likely reflect scope filtering rather than true game-version drift, and the narrower scope yielded 0 visible assets"
+            .to_string(),
+    );
+
+    fs::create_dir_all(&test_root).expect("create test root");
+    fs::write(
+        &compare_path,
+        serde_json::to_string_pretty(&compare).expect("serialize compare"),
+    )
+    .expect("write compare report");
+    fs::write(
+        &knowledge_path,
+        serde_json::to_string_pretty(&sample_knowledge()).expect("serialize knowledge"),
+    )
+    .expect("write knowledge report");
+
+    let report = run_infer_fixes_command(&InferFixesArgs {
+        compare_report: compare_path,
+        wwmi_knowledge: knowledge_path,
+        continuity_artifact: None,
+        report_root: None,
+        mod_root: None,
+        mod_dependency_profile: None,
+        representative_mod_baseline_set: None,
+        output: output_path,
+    })
+    .expect("run scope-induced inference");
+
+    assert!(
+        report
+            .probable_crash_causes
+            .iter()
+            .all(|cause| cause.code != "asset_removed_without_clear_replacement")
+    );
+    assert!(
+        report
+            .scope
+            .notes
+            .iter()
+            .any(|note| { note.contains("scope-induced were kept out of crash-cause promotion") })
     );
 
     let _ = fs::remove_dir_all(&test_root);

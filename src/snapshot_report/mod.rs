@@ -313,6 +313,11 @@ fn render_markdown(
                     .to_string(),
             );
         }
+        if let Some(scope_note) = compare_report.scope.notes.iter().find(|note| {
+            note.contains("scope-induced removal caution") || note.contains("scope-narrowing note")
+        }) {
+            lines.push(format!("Scope interpretation: {scope_note}"));
+        }
         lines.push("| Metric | Value |".to_string());
         lines.push("| --- | --- |".to_string());
         lines.push(format!(

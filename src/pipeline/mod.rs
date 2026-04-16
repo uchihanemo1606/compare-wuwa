@@ -231,6 +231,7 @@ pub fn run_snapshot_command(args: &SnapshotArgs) -> AppResult<SnapshotCommandRes
     let mut stored_snapshot_path = None;
     let mut stored_extractor_inventory_path = None;
     if args.store_in_report {
+        validate_snapshot_storage_alignment(&snapshot, args.source_root.as_path())?;
         let storage = match args.report_root.as_ref() {
             Some(root) => ReportStorage::new(root.clone()),
             None => ReportStorage::default(),
@@ -257,6 +258,25 @@ pub fn run_snapshot_command(args: &SnapshotArgs) -> AppResult<SnapshotCommandRes
         stored_snapshot_path,
         stored_extractor_inventory_path,
     })
+}
+
+fn validate_snapshot_storage_alignment(
+    snapshot: &GameSnapshot,
+    source_root: &Path,
+) -> AppResult<()> {
+    let Some(launcher) = snapshot.context.launcher.as_ref() else {
+        return Ok(());
+    };
+    if launcher.detected_version == snapshot.version_id {
+        return Ok(());
+    }
+
+    Err(AppError::InvalidInput(format!(
+        "refusing to store snapshot version {} under report root because launcher detected version {} under {}; use --version-id auto or an aligned explicit version before freezing a canonical baseline",
+        snapshot.version_id,
+        launcher.detected_version,
+        source_root.display()
+    )))
 }
 
 fn to_local_capture_scope(value: SnapshotCaptureScopeArg) -> AppResult<LocalSnapshotCaptureScope> {

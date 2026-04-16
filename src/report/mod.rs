@@ -487,7 +487,7 @@ impl VersionDiffReportBuilder {
             resonators,
             lineage,
             summary,
-            scope_notes: build_scope_notes(old_snapshot, new_snapshot),
+            scope_notes: build_scope_notes(old_snapshot, new_snapshot, compare_report),
             review: VersionReviewSection::default(),
         }
     }
@@ -1821,7 +1821,11 @@ fn infer_resonator_name(path: &str) -> Option<String> {
         .map(|window| window[2].to_string())
 }
 
-fn build_scope_notes(old_snapshot: &GameSnapshot, new_snapshot: &GameSnapshot) -> Vec<String> {
+fn build_scope_notes(
+    old_snapshot: &GameSnapshot,
+    new_snapshot: &GameSnapshot,
+    compare_report: &SnapshotCompareReport,
+) -> Vec<String> {
     let old_scope = assess_snapshot_scope(old_snapshot);
     let new_scope = assess_snapshot_scope(new_snapshot);
     let old_quality = summarize_snapshot_capture_quality(old_snapshot);
@@ -1989,6 +1993,11 @@ fn build_scope_notes(old_snapshot: &GameSnapshot, new_snapshot: &GameSnapshot) -
         report_evidence_tier(&old_scope, &old_quality),
         report_evidence_tier(&new_scope, &new_quality)
     ));
+    if let Some(scope_narrowing_note) = compare_report.scope.notes.iter().find(|note| {
+        note.contains("scope-induced removal caution") || note.contains("scope-narrowing note")
+    }) {
+        notes.push(format!("scope warning: {scope_narrowing_note}"));
+    }
 
     notes
 }

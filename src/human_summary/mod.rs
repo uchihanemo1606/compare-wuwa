@@ -1,8 +1,8 @@
 use crate::{
     compare::{RemapCompatibility, RiskLevel},
     inference::{
-        InferenceReport, ProbableCrashCause, RepresentativeModRiskClass,
-        RepresentativeModRiskProjection, SuggestedFix,
+        InferenceReport, InferenceSurfaceOverlapPosture, ProbableCrashCause,
+        RepresentativeModRiskClass, RepresentativeModRiskProjection, SuggestedFix,
     },
     proposal::{MappingProposalEntry, ProposalArtifacts, ProposalStatus},
     report::{VersionDiffReportV2, VersionReviewCause, VersionReviewFix, VersionReviewMapping},
@@ -174,16 +174,40 @@ impl HumanSummaryRenderer {
                     .to_string(),
             );
         }
+        if !inference.surface_intersection.mod_side_surfaces.is_empty()
+            || !inference.surface_intersection.game_side_surfaces.is_empty()
+        {
+            lines.push(format!(
+                "- Surface overlap posture: {}",
+                inference.surface_intersection.overlap_posture.label()
+            ));
+        }
         if inference.surface_intersection.weak_or_absent_overlap {
-            let caution = inference
-                .surface_intersection
-                .notes
-                .first()
-                .cloned()
-                .unwrap_or_else(|| {
-                    "surface overlap is weak or absent, so mod-aware prioritization stays conservative"
-                        .to_string()
-                });
+            let caution = match inference.surface_intersection.overlap_posture {
+                InferenceSurfaceOverlapPosture::None => inference
+                    .surface_intersection
+                    .notes
+                    .iter()
+                    .find(|note| note.contains("no explicit mod/game surface overlap"))
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        "surface overlap posture is none, so mod-aware prioritization stays conservative and review-first"
+                            .to_string()
+                    }),
+                InferenceSurfaceOverlapPosture::Partial => inference
+                    .surface_intersection
+                    .notes
+                    .iter()
+                    .find(|note| note.contains("surface overlap is partial"))
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        "surface overlap posture is partial, so overlap-aware prioritization stays review-first until stronger game-side evidence is available"
+                            .to_string()
+                    }),
+                InferenceSurfaceOverlapPosture::Strong => {
+                    "surface overlap posture is strong".to_string()
+                }
+            };
             lines.push(format!("- Surface overlap caution: {caution}"));
         }
         if !continuity_causes.is_empty()
@@ -1170,6 +1194,7 @@ mod tests {
                     },
                 ],
                 overlapping_surface_classes: vec![WwmiModDependencySurfaceClass::BufferLayout],
+                overlap_posture: crate::inference::InferenceSurfaceOverlapPosture::Partial,
                 weak_or_absent_overlap: true,
                 notes: vec!["surface overlap is partial: overlap=buffer_layout while mod-side surfaces=buffer_layout, resource_skeleton".to_string()],
             },
@@ -1206,6 +1231,7 @@ mod tests {
         assert!(markdown.contains("Mod-side surfaces: buffer_layout, resource_skeleton"));
         assert!(markdown.contains("Game-side surfaces: mapping_hash, buffer_layout"));
         assert!(markdown.contains("Surface overlap: buffer_layout"));
+        assert!(markdown.contains("Surface overlap posture: partial"));
         assert!(markdown.contains("Surface overlap caution: surface overlap is partial"));
         assert!(markdown.contains("## Safe To Try Now"));
         assert!(markdown.contains("### Proposed Mappings"));

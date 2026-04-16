@@ -45,7 +45,14 @@ Follow standard Rust formatting with 4-space indentation and `cargo fmt` as the 
 Favor additive, inspectable data models. When changing schemas, preserve backward compatibility with `#[serde(default)]` where appropriate. Prefer conservative classification and review-oriented outcomes over optimistic auto-merging when evidence is weak or ambiguous.
 
 ## Testing Guidelines
-Add or update focused tests when behavior changes in snapshot capture, compare, report, continuity, inference, or storage. Prefer integration tests in `tests/` for user-visible behavior and storage/report flows; use module tests when the logic is narrow and self-contained.
+Add or update focused tests when behavior changes in snapshot capture, compare, report, continuity, inference, or storage.
+
+Hard rule for test placement:
+
+- All new or updated tests must be placed in `tests/*.rs`.
+- Do not add new inline `#[cfg(test)]` blocks in backend logic files under `src/`.
+- Do not expand existing inline test blocks in backend logic files under `src/`.
+- If a change touches logic that already has inline tests, move the touched/added test coverage into `tests/*.rs` as part of the same phase whenever practical.
 
 Good test targets include:
 
@@ -84,7 +91,7 @@ When Codex is asked to implement a backend phase, these defaults apply unless th
 - Keep the phase backend-only. Do not expand into GUI work unless the user explicitly asks for it.
 - Prefer the smallest high-leverage slice that fits the named phase instead of broad speculative architecture work.
 - Reuse existing backend modules where possible, especially `snapshot/`, `compare/`, `report/`, `report_storage/`, `inference/`, `proposal/`, `human_summary/`, and `wwmi/dependency.rs`.
-- Keep larger user-facing behavior tests in `tests/*.rs`.
+- Keep all new or updated tests in `tests/*.rs` (no new inline `#[cfg(test)]` in backend logic modules under `src/`).
 - If an optional real-data branch is unavailable (for example a real extractor inventory or a real changed compare pair), do not block the whole phase. Implement the backend hardening that can be done now, verify with fixtures or currently available artifacts, and report the limitation explicitly instead of faking success.
 
 ## Real Game Root Verification

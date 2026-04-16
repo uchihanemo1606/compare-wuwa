@@ -300,6 +300,21 @@ impl SnapshotCaptureQualitySummary {
 
     pub fn low_signal_reasons(&self, scope: &SnapshotScopeAssessment) -> Vec<String> {
         let mut reasons = Vec::new();
+        if scope.capture_mode.as_deref() == Some("local_filesystem_inventory_character_focused")
+            && scope.coverage.character_path_count == 0
+        {
+            reasons.push(
+                "character-focused path filter found 0 paths matching Content/Character/<Name>/..."
+                    .to_string(),
+            );
+        }
+        if scope.capture_mode.as_deref() == Some("local_filesystem_inventory_content_focused")
+            && scope.coverage.content_like_path_count == 0
+        {
+            reasons.push(
+                "content-focused path filter found 0 paths under a Content/... subtree".to_string(),
+            );
+        }
         if scope.mostly_install_or_package_level {
             reasons.push("install/package-level coverage dominates this snapshot".to_string());
         }
@@ -1202,6 +1217,25 @@ fn annotate_local_snapshot_scope(snapshot: &mut GameSnapshot) {
             "; capture mode '{}' narrows paths with path-based filtering only (not deep semantic extraction)",
             capture_mode
         ));
+    }
+    if capture_mode == "local_filesystem_inventory_character_focused" {
+        if coverage.character_path_count == 0 {
+            note.push_str(
+                "; character-focused path filter found 0 paths matching Content/Character/<Name>/... under this root",
+            );
+        } else {
+            note.push_str(
+                "; character-focused path filter only keeps paths matching Content/Character/<Name>/...",
+            );
+        }
+    } else if capture_mode == "local_filesystem_inventory_content_focused" {
+        if coverage.content_like_path_count == 0 {
+            note.push_str(
+                "; content-focused path filter found 0 paths under a Content/... subtree in this root",
+            );
+        } else {
+            note.push_str("; content-focused path filter only keeps Content/... paths");
+        }
     }
     note.push_str(
         "; this remains shallow filesystem inventory fallback and should be treated conservatively",

@@ -290,6 +290,57 @@ fn snapshot_report_highlights_version_aligned_rich_extractor_evidence() {
     let _ = fs::remove_dir_all(&test_root);
 }
 
+#[test]
+fn snapshot_report_explains_empty_character_scope_and_scope_induced_pair_removals() {
+    let test_root = unique_test_dir();
+    let root = test_root.join("game");
+    let full_snapshot = test_root.join("out").join("full.snapshot.json");
+    let character_snapshot = test_root.join("out").join("character.snapshot.json");
+    let report_output = test_root
+        .join("out")
+        .join("snapshot-report-character-empty.md");
+
+    seed_local_asset(&root, "Client/Content/Paks/pakchunk0-WindowsNoEditor.pak");
+    seed_local_asset(&root, "Client/Config/DefaultGame.ini");
+
+    run_snapshot_command(&SnapshotArgs {
+        source_root: root.clone(),
+        version_id: "9.0.0".to_string(),
+        output: full_snapshot.clone(),
+        capture_scope: SnapshotCaptureScopeArg::Full,
+        extractor_inventory: None,
+        store_in_report: false,
+        report_root: None,
+    })
+    .expect("export full snapshot");
+    run_snapshot_command(&SnapshotArgs {
+        source_root: root,
+        version_id: "9.0.1".to_string(),
+        output: character_snapshot.clone(),
+        capture_scope: SnapshotCaptureScopeArg::Character,
+        extractor_inventory: None,
+        store_in_report: false,
+        report_root: None,
+    })
+    .expect("export character-focused snapshot");
+
+    run_snapshot_report_command(&SnapshotReportArgs {
+        snapshots: vec![full_snapshot, character_snapshot],
+        output: report_output.clone(),
+    })
+    .expect("run character-empty snapshot report");
+
+    let output = fs::read_to_string(&report_output).expect("read output");
+
+    assert!(output.contains(
+        "character-focused path filter found 0 paths matching Content/Character/<Name>/..."
+    ));
+    assert!(output.contains("Scope interpretation: scope-induced removal caution:"));
+    assert!(output.contains("likely reflect scope filtering rather than true game-version drift"));
+
+    let _ = fs::remove_dir_all(&test_root);
+}
+
 fn seed_local_asset(root: &Path, relative_path: &str) {
     let full_path = root.join(relative_path);
     if let Some(parent) = full_path.parent() {

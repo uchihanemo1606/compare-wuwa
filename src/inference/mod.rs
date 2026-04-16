@@ -119,8 +119,29 @@ pub struct InferenceSurfaceIntersection {
     pub mod_side_surfaces: Vec<InferenceModSideSurface>,
     pub game_side_surfaces: Vec<InferenceGameSideSurface>,
     pub overlapping_surface_classes: Vec<WwmiModDependencySurfaceClass>,
+    #[serde(default)]
+    pub overlap_posture: InferenceSurfaceOverlapPosture,
     pub weak_or_absent_overlap: bool,
     pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum InferenceSurfaceOverlapPosture {
+    #[default]
+    None,
+    Partial,
+    Strong,
+}
+
+impl InferenceSurfaceOverlapPosture {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Partial => "partial",
+            Self::Strong => "strong",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -389,6 +410,7 @@ impl FixInferenceEngine {
             &surface_intersection,
         );
         let confidence_scale = if scope.low_signal_compare { 0.85 } else { 1.0 };
+        let scope_induced_removals_likely = compare_report.scope.scope_induced_removals_likely;
         let continuity_context =
             continuity.map(|index| build_inference_continuity_context(compare_report, index));
 
@@ -494,7 +516,9 @@ impl FixInferenceEngine {
                 )
             })
             .collect::<Vec<_>>();
-        if !removed_assets.is_empty() && !plausible_repair_candidates.is_empty() {
+        if scope_induced_removals_likely && !removed_assets.is_empty() {
+            // Scope narrowing can hide paths without representing true version drift.
+        } else if !removed_assets.is_empty() && !plausible_repair_candidates.is_empty() {
             let confidence = (0.55 + 0.25 * mapping_support + 0.10 * shader_support + 0.05)
                 .clamp(0.0, 1.0)
                 * confidence_scale;
@@ -1305,20 +1329,37 @@ fn build_surface_intersection(
         })
         .collect::<Vec<_>>();
 
+    let overlap_posture = if overlapping_surface_classes.is_empty() {
+        InferenceSurfaceOverlapPosture::None
+    } else if overlapping_surface_classes.len() == mod_side.len() {
+        InferenceSurfaceOverlapPosture::Strong
+    } else {
+        InferenceSurfaceOverlapPosture::Partial
+    };
     let weak_or_absent_overlap =
-        !mod_side.is_empty() && overlapping_surface_classes.len() < mod_side.len();
+        !mod_side.is_empty() && overlap_posture != InferenceSurfaceOverlapPosture::Strong;
     let mut notes = Vec::new();
-    if !mod_side.is_empty() && overlapping_surface_classes.is_empty() {
-        notes.push(
-            "no explicit mod/game surface overlap was observed in current compare evidence; keep mod-side dependency signals as reviewer context only"
-                .to_string(),
-        );
-    } else if weak_or_absent_overlap {
+    if !mod_side.is_empty() || !game_side.is_empty() {
         notes.push(format!(
-            "surface overlap is partial: overlap={} while mod-side surfaces={}",
-            join_surface_labels(overlapping_surface_classes.iter()),
-            join_surface_labels(mod_side.keys())
+            "surface overlap posture is {}",
+            overlap_posture.label()
         ));
+    }
+    match overlap_posture {
+        InferenceSurfaceOverlapPosture::None if !mod_side.is_empty() => {
+            notes.push(
+                "no explicit mod/game surface overlap was observed in current compare evidence; keep mod-side dependency signals as reviewer context only"
+                    .to_string(),
+            );
+        }
+        InferenceSurfaceOverlapPosture::Partial => {
+            notes.push(format!(
+                "surface overlap is partial: overlap={} while mod-side surfaces={}; keep overlap-aware prioritization review-first until more game-side evidence is available",
+                join_surface_labels(overlapping_surface_classes.iter()),
+                join_surface_labels(mod_side.keys())
+            ));
+        }
+        _ => {}
     }
 
     InferenceSurfaceIntersection {
@@ -1338,6 +1379,7 @@ fn build_surface_intersection(
             .collect(),
         game_side_surfaces: game_side,
         overlapping_surface_classes,
+        overlap_posture,
         weak_or_absent_overlap,
         notes,
     }
@@ -1677,6 +1719,12 @@ fn build_inference_scope_context(
                 .to_string(),
         );
     }
+    if compare_report.scope.scope_induced_removals_likely {
+        notes.push(
+            "removed-only compare deltas flagged as scope-induced were kept out of crash-cause promotion; review snapshot scope before treating missing paths as real version drift"
+                .to_string(),
+        );
+    }
     append_scope_capture_quality_guardrail(&mut notes, &compare_report.scope.old_snapshot);
     append_scope_capture_quality_guardrail(&mut notes, &compare_report.scope.new_snapshot);
     if let Some(mod_dependency) = mod_dependency {
@@ -1750,6 +1798,14 @@ fn build_inference_scope_context(
             "mod-side dependency surfaces were detected, but compare did not expose overlapping game-side surfaces; keep this as review-only context rather than strong repair evidence"
                 .to_string(),
         );
+    }
+    if !surface_intersection.mod_side_surfaces.is_empty()
+        || !surface_intersection.game_side_surfaces.is_empty()
+    {
+        notes.push(format!(
+            "surface overlap posture: {}",
+            surface_intersection.overlap_posture.label()
+        ));
     }
     notes.extend(surface_intersection.notes.iter().cloned());
 
@@ -3709,6 +3765,8 @@ mod tests {
                     ..Default::default()
                 },
                 low_signal_compare: true,
+                scope_narrowing_detected: false,
+                scope_induced_removals_likely: false,
                 notes: vec!["low-signal compare scope".to_string()],
             },
             summary: SnapshotCompareSummary {
@@ -3880,6 +3938,8 @@ mod tests {
                     ..Default::default()
                 },
                 low_signal_compare: true,
+                scope_narrowing_detected: false,
+                scope_induced_removals_likely: false,
                 notes: vec!["low-signal compare scope".to_string()],
             },
             summary: SnapshotCompareSummary {

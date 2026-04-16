@@ -35,6 +35,10 @@ pub struct SnapshotCompareScopeContext {
     pub old_snapshot: SnapshotCompareScopeInfo,
     pub new_snapshot: SnapshotCompareScopeInfo,
     pub low_signal_compare: bool,
+    #[serde(default)]
+    pub scope_narrowing_detected: bool,
+    #[serde(default)]
+    pub scope_induced_removals_likely: bool,
     pub notes: Vec<String>,
 }
 
@@ -347,7 +351,6 @@ impl SnapshotComparer {
 
         let candidate_mapping_changes =
             build_candidate_mapping_changes(&removed_assets, &added_assets);
-        let scope = build_compare_scope_context(old_snapshot, new_snapshot);
         let changed_breakdowns = changed_assets
             .iter()
             .map(|change| classify_changed_fields(&change.changed_fields))
@@ -418,6 +421,31 @@ impl SnapshotComparer {
             .iter()
             .filter(|breakdown| !breakdown.layout_fields.is_empty())
             .count();
+        let summary = SnapshotCompareSummary {
+            total_old_assets: old_snapshot.asset_count,
+            total_new_assets: new_snapshot.asset_count,
+            unchanged_assets,
+            added_assets: added_assets.len(),
+            removed_assets: removed_assets.len(),
+            changed_assets: changed_assets.len(),
+            candidate_mapping_changes: candidate_mapping_changes.len(),
+            identity_changed_assets,
+            layout_changed_assets,
+            structural_changed_assets,
+            naming_only_changed_assets,
+            cosmetic_only_changed_assets,
+            provenance_changed_assets,
+            container_moved_assets,
+            lineage_rename_or_repath_assets,
+            lineage_container_movement_assets,
+            lineage_layout_drift_assets,
+            lineage_replacement_assets,
+            lineage_ambiguous_assets,
+            lineage_insufficient_evidence_assets,
+            ambiguous_candidate_mapping_changes,
+            high_confidence_candidate_mapping_changes,
+        };
+        let scope = build_compare_scope_context(old_snapshot, new_snapshot, &summary);
 
         SnapshotCompareReport {
             schema_version: "whashreonator.snapshot-compare.v1".to_string(),
@@ -432,30 +460,7 @@ impl SnapshotComparer {
                 asset_count: new_snapshot.asset_count,
             },
             scope,
-            summary: SnapshotCompareSummary {
-                total_old_assets: old_snapshot.asset_count,
-                total_new_assets: new_snapshot.asset_count,
-                unchanged_assets,
-                added_assets: added_assets.len(),
-                removed_assets: removed_assets.len(),
-                changed_assets: changed_assets.len(),
-                candidate_mapping_changes: candidate_mapping_changes.len(),
-                identity_changed_assets,
-                layout_changed_assets,
-                structural_changed_assets,
-                naming_only_changed_assets,
-                cosmetic_only_changed_assets,
-                provenance_changed_assets,
-                container_moved_assets,
-                lineage_rename_or_repath_assets,
-                lineage_container_movement_assets,
-                lineage_layout_drift_assets,
-                lineage_replacement_assets,
-                lineage_ambiguous_assets,
-                lineage_insufficient_evidence_assets,
-                ambiguous_candidate_mapping_changes,
-                high_confidence_candidate_mapping_changes,
-            },
+            summary,
             added_assets,
             removed_assets,
             changed_assets,
@@ -467,6 +472,7 @@ impl SnapshotComparer {
 fn build_compare_scope_context(
     old_snapshot: &GameSnapshot,
     new_snapshot: &GameSnapshot,
+    summary: &SnapshotCompareSummary,
 ) -> SnapshotCompareScopeContext {
     let old_scope = assess_snapshot_scope(old_snapshot);
     let new_scope = assess_snapshot_scope(new_snapshot);
@@ -615,6 +621,10 @@ fn build_compare_scope_context(
         compare_evidence_tier(&old_scope, &old_quality),
         compare_evidence_tier(&new_scope, &new_quality)
     ));
+    let scope_narrowing_note = scope_narrowing_interpretation_note(&old_scope, &new_scope, summary);
+    if let Some(note) = scope_narrowing_note.as_deref() {
+        notes.push(note.to_string());
+    }
 
     SnapshotCompareScopeContext {
         old_snapshot: SnapshotCompareScopeInfo {
@@ -690,7 +700,60 @@ fn build_compare_scope_context(
             note: new_scope.note.clone(),
         },
         low_signal_compare: old_low_signal || new_low_signal,
+        scope_narrowing_detected: scope_narrowing_note.is_some(),
+        scope_induced_removals_likely: scope_narrowing_note
+            .as_deref()
+            .is_some_and(|note| note.contains("scope-induced removal caution")),
         notes,
+    }
+}
+
+fn local_capture_scope_rank(capture_mode: Option<&str>) -> Option<u8> {
+    match capture_mode {
+        Some("local_filesystem_inventory") => Some(3),
+        Some("local_filesystem_inventory_content_focused") => Some(2),
+        Some("local_filesystem_inventory_character_focused") => Some(1),
+        _ => None,
+    }
+}
+
+fn scope_narrowing_interpretation_note(
+    old_scope: &crate::snapshot::SnapshotScopeAssessment,
+    new_scope: &crate::snapshot::SnapshotScopeAssessment,
+    summary: &SnapshotCompareSummary,
+) -> Option<String> {
+    let old_rank = local_capture_scope_rank(old_scope.capture_mode.as_deref())?;
+    let new_rank = local_capture_scope_rank(new_scope.capture_mode.as_deref())?;
+    if new_rank >= old_rank || summary.removed_assets == 0 {
+        return None;
+    }
+
+    let old_mode = old_scope.capture_mode.as_deref().unwrap_or("unknown");
+    let new_mode = new_scope.capture_mode.as_deref().unwrap_or("unknown");
+    let removed_only_delta = summary.added_assets == 0
+        && summary.changed_assets == 0
+        && summary.candidate_mapping_changes == 0;
+    let removal_share = if summary.total_old_assets == 0 {
+        0.0
+    } else {
+        summary.removed_assets as f32 / summary.total_old_assets as f32
+    };
+    let new_zero_visibility = summary.total_new_assets == 0;
+
+    if removed_only_delta || removal_share >= 0.5 || new_zero_visibility {
+        let mut note = format!(
+            "scope-induced removal caution: new snapshot capture mode '{}' is narrower than old '{}'; {} removed assets likely reflect scope filtering rather than true game-version drift",
+            new_mode, old_mode, summary.removed_assets
+        );
+        if new_zero_visibility {
+            note.push_str(", and the narrower scope yielded 0 visible assets");
+        }
+        Some(note)
+    } else {
+        Some(format!(
+            "scope-narrowing note: new snapshot capture mode '{}' is narrower than old '{}'; review removals conservatively because part of the delta may be scope-induced rather than true game-version drift",
+            new_mode, old_mode
+        ))
     }
 }
 

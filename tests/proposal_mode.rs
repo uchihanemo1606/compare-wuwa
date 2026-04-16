@@ -8,9 +8,11 @@ use whashreonator::{
     cli::GenerateProposalsArgs,
     compare::{RemapCompatibility, RiskLevel},
     inference::{
-        InferenceCompareInput, InferenceKnowledgeInput, InferenceModDependencyInput,
-        InferenceReport, InferenceScopeContext, InferenceSummary, InferredMappingContinuityContext,
-        InferredMappingHint, ProbableCrashCause, SuggestedFix,
+        InferenceCompareInput, InferenceGameSideSurface, InferenceKnowledgeInput,
+        InferenceModDependencyInput, InferenceModSideSurface, InferenceReport,
+        InferenceScopeContext, InferenceSummary, InferenceSurfaceIntersection,
+        InferenceSurfaceOverlapPosture, InferredMappingContinuityContext, InferredMappingHint,
+        ProbableCrashCause, SuggestedFix,
     },
     pipeline::run_generate_proposals_command,
     proposal::{MappingProposalOutput, ProposalPatchDraftOutput, ProposalStatus},
@@ -201,6 +203,52 @@ fn generate_proposals_command_surfaces_mod_aware_review_first_context() {
     assert!(summary_output.contains("Mod dependency profile"));
     assert!(summary_output.contains("Mod focus:"));
     assert!(summary_output.contains("hook-targeting-sensitive"));
+
+    let _ = fs::remove_dir_all(&test_root);
+}
+
+#[test]
+fn generate_proposals_command_summary_includes_overlap_posture_and_caution() {
+    let test_root = unique_test_dir();
+    let inference_path = test_root.join("tmp").join("inference-overlap-summary.json");
+    let mapping_output_path = test_root.join("out").join("mapping-overlap-summary.json");
+    let summary_output_path = test_root.join("out").join("summary-overlap-summary.md");
+
+    fs::create_dir_all(test_root.join("tmp")).expect("create temp input root");
+    fs::write(
+        &inference_path,
+        serde_json::to_string_pretty(&partial_overlap_review_first_inference_report())
+            .expect("serialize inference"),
+    )
+    .expect("write inference report");
+
+    run_generate_proposals_command(&GenerateProposalsArgs {
+        inference_report: inference_path,
+        mapping_output: Some(mapping_output_path.clone()),
+        patch_draft_output: None,
+        summary_output: Some(summary_output_path.clone()),
+        min_confidence: 0.85,
+    })
+    .expect("run overlap-summary generate proposals command");
+
+    let mapping_output =
+        fs::read_to_string(&mapping_output_path).expect("read mapping proposal output");
+    let summary_output = fs::read_to_string(&summary_output_path).expect("read summary output");
+
+    let parsed_mapping: MappingProposalOutput =
+        serde_json::from_str(&mapping_output).expect("parse mapping proposal output");
+    let mapping = parsed_mapping
+        .mappings
+        .iter()
+        .find(|entry| entry.old_asset_path == "Content/Character/Encore/Body.mesh")
+        .expect("partial-overlap mapping exists");
+
+    assert_eq!(mapping.status, ProposalStatus::NeedsReview);
+    assert!(summary_output.contains("Mod-side surfaces: buffer_layout, resource_skeleton"));
+    assert!(summary_output.contains("Game-side surfaces: buffer_layout"));
+    assert!(summary_output.contains("Surface overlap: buffer_layout"));
+    assert!(summary_output.contains("Surface overlap posture: partial"));
+    assert!(summary_output.contains("Surface overlap caution: surface overlap is partial"));
 
     let _ = fs::remove_dir_all(&test_root);
 }
@@ -485,6 +533,133 @@ fn mod_aware_hook_targeting_inference_report() -> InferenceReport {
             ],
         }],
         surface_intersection: Default::default(),
+        representative_risk_projections: Vec::new(),
+    }
+}
+
+fn partial_overlap_review_first_inference_report() -> InferenceReport {
+    InferenceReport {
+        schema_version: "whashreonator.inference.v1".to_string(),
+        generated_at_unix_ms: 1,
+        compare_input: InferenceCompareInput {
+            old_version_id: "11.0.0".to_string(),
+            new_version_id: "11.1.0".to_string(),
+            changed_assets: 1,
+            added_assets: 1,
+            removed_assets: 1,
+            candidate_mapping_changes: 1,
+        },
+        knowledge_input: InferenceKnowledgeInput {
+            repo: "repo".to_string(),
+            analyzed_commits: 6,
+            fix_like_commits: 4,
+            discovered_patterns: 3,
+        },
+        mod_dependency_input: Some(InferenceModDependencyInput {
+            mod_name: Some("EncoreBodyMod".to_string()),
+            mod_root: "D:/mod/WWMI/Mods/EncoreBodyMod".to_string(),
+            ini_file_count: 2,
+            signal_count: 5,
+            dependency_kinds: vec![
+                WwmiModDependencyKind::BufferLayoutHint,
+                WwmiModDependencyKind::ResourceFileReference,
+            ],
+        }),
+        representative_mod_baseline_input: None,
+        scope: InferenceScopeContext {
+            low_signal_compare: false,
+            old_snapshot_low_signal: false,
+            new_snapshot_low_signal: false,
+            notes: vec![
+                "mod-side dependency surfaces: buffer_layout, resource_skeleton".to_string(),
+                "game-side change surfaces: buffer_layout".to_string(),
+                "surface intersection overlap: buffer_layout".to_string(),
+                "surface overlap posture: partial".to_string(),
+            ],
+        },
+        summary: InferenceSummary {
+            probable_crash_causes: 1,
+            suggested_fixes: 1,
+            candidate_mapping_hints: 1,
+            highest_confidence: 0.90,
+        },
+        probable_crash_causes: vec![ProbableCrashCause {
+            code: "buffer_layout_changed".to_string(),
+            summary: "body layout drift is repair-relevant for this mod".to_string(),
+            confidence: 0.88,
+            risk: RiskLevel::High,
+            affected_assets: vec!["Content/Character/Encore/Body.mesh".to_string()],
+            related_patterns: vec![WwmiPatternKind::BufferLayoutOrCapacityFix],
+            reasons: vec![
+                "mod_dependency_surface: this mod uses buffer/layout-sensitive surfaces, so structural drift is directly repair-relevant"
+                    .to_string(),
+            ],
+            evidence: vec!["mod-side dependency profile points at buffer/layout-sensitive hooks".to_string()],
+        }],
+        suggested_fixes: vec![SuggestedFix {
+            code: "validate_candidate_remaps_against_layout".to_string(),
+            summary: "validate layout-sensitive remaps before promotion".to_string(),
+            confidence: 0.84,
+            priority: RiskLevel::High,
+            related_patterns: vec![WwmiPatternKind::BufferLayoutOrCapacityFix],
+            actions: vec!["cross-check override stride and resource references".to_string()],
+            reasons: vec![
+                "mod_dependency_surface: this mod uses buffer/layout-sensitive surfaces, so layout-sensitive fixes should be inspected first"
+                    .to_string(),
+            ],
+            evidence: vec!["mod-side dependency profile points at buffer/layout-sensitive hooks".to_string()],
+        }],
+        candidate_mapping_hints: vec![InferredMappingHint {
+            old_asset_path: "Content/Character/Encore/Body.mesh".to_string(),
+            new_asset_path: "Content/Character/Encore/Body_LOD0.mesh".to_string(),
+            confidence: 0.90,
+            compatibility: RemapCompatibility::CompatibleWithCaution,
+            needs_review: true,
+            ambiguous: false,
+            confidence_gap: Some(0.16),
+            continuity: None,
+            reasons: vec![
+                "same_parent_directory: same folder".to_string(),
+                "mod_dependency_review_first: this mod uses buffer/layout-sensitive surfaces, so structurally drifted remaps stay review-first"
+                    .to_string(),
+            ],
+            evidence: vec![
+                "compare candidate confidence 0.900".to_string(),
+                "buffer/layout-sensitive mod hooks raise the cost of a wrong remap".to_string(),
+            ],
+        }],
+        surface_intersection: InferenceSurfaceIntersection {
+            mod_side_surfaces: vec![
+                InferenceModSideSurface {
+                    surface_class: whashreonator::wwmi::dependency::WwmiModDependencySurfaceClass::BufferLayout,
+                    sources: vec!["mod_dependency_profile".to_string()],
+                    dependency_kinds: vec![WwmiModDependencyKind::BufferLayoutHint],
+                    signal_count: 2,
+                    representative_profile_count: 0,
+                },
+                InferenceModSideSurface {
+                    surface_class: whashreonator::wwmi::dependency::WwmiModDependencySurfaceClass::ResourceSkeleton,
+                    sources: vec!["mod_dependency_profile".to_string()],
+                    dependency_kinds: vec![WwmiModDependencyKind::ResourceFileReference],
+                    signal_count: 1,
+                    representative_profile_count: 0,
+                },
+            ],
+            game_side_surfaces: vec![InferenceGameSideSurface {
+                surface_class: whashreonator::wwmi::dependency::WwmiModDependencySurfaceClass::BufferLayout,
+                compare_signals: vec!["structural drift".to_string()],
+                affected_assets: vec!["Content/Character/Encore/Body.mesh".to_string()],
+            }],
+            overlapping_surface_classes: vec![
+                whashreonator::wwmi::dependency::WwmiModDependencySurfaceClass::BufferLayout,
+            ],
+            overlap_posture: InferenceSurfaceOverlapPosture::Partial,
+            weak_or_absent_overlap: true,
+            notes: vec![
+                "surface overlap posture is partial".to_string(),
+                "surface overlap is partial: overlap=buffer_layout while mod-side surfaces=buffer_layout, resource_skeleton; keep overlap-aware prioritization review-first until more game-side evidence is available".to_string(),
+            ],
+        },
         representative_risk_projections: Vec::new(),
     }
 }

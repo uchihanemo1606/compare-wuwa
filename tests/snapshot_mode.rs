@@ -351,6 +351,83 @@ fn snapshot_command_supports_character_focused_capture_scope() {
     let _ = fs::remove_dir_all(&test_root);
 }
 
+#[test]
+fn snapshot_command_character_focus_explains_zero_visible_assets() {
+    let test_root = unique_test_dir();
+    let source_root = test_root.join("game");
+    let output_path = test_root.join("out").join("snapshot-character-empty.json");
+
+    seed_local_asset(
+        &source_root,
+        "Client/Content/Paks/pakchunk0-WindowsNoEditor.pak",
+    );
+    seed_local_asset(&source_root, "Client/Config/DefaultGame.ini");
+
+    let result = run_snapshot_command(&SnapshotArgs {
+        source_root: source_root.clone(),
+        version_id: "2.4.0".to_string(),
+        output: output_path.clone(),
+        capture_scope: SnapshotCaptureScopeArg::Character,
+        extractor_inventory: None,
+        store_in_report: false,
+        report_root: None,
+    })
+    .expect("run empty character-focused snapshot command");
+    let snapshot = result.snapshot;
+
+    let output = fs::read_to_string(&output_path).expect("read snapshot output");
+    let parsed: GameSnapshot = serde_json::from_str(&output).expect("parse snapshot json");
+
+    assert_eq!(snapshot.asset_count, 0);
+    assert_eq!(parsed.asset_count, 0);
+    assert_eq!(parsed.context.scope.coverage.character_path_count, 0);
+    assert!(parsed.context.scope.note.as_deref().is_some_and(|note| {
+        note.contains(
+            "character-focused path filter found 0 paths matching Content/Character/<Name>/...",
+        )
+    }));
+
+    let _ = fs::remove_dir_all(&test_root);
+}
+
+#[test]
+fn snapshot_command_refuses_to_store_misaligned_launcher_version_as_canonical_baseline() {
+    let test_root = unique_test_dir();
+    let source_root = test_root.join("game");
+    let report_root = test_root.join("out").join("report");
+    let output_path = test_root.join("out").join("snapshot-misaligned.json");
+
+    seed_local_asset(
+        &source_root,
+        "Client/Content/Paks/pakchunk0-WindowsNoEditor.pak",
+    );
+    fs::write(
+        source_root.join("launcherDownloadConfig.json"),
+        r#"{"version":"3.2.1","reUseVersion":"","state":"ready","isPreDownload":false,"appId":"50004"}"#,
+    )
+    .expect("write launcher config");
+
+    let error = run_snapshot_command(&SnapshotArgs {
+        source_root: source_root.clone(),
+        version_id: "3.1.0".to_string(),
+        output: output_path,
+        capture_scope: SnapshotCaptureScopeArg::Full,
+        extractor_inventory: None,
+        store_in_report: true,
+        report_root: Some(report_root.clone()),
+    })
+    .expect_err("misaligned canonical baseline should fail");
+
+    assert!(
+        error
+            .to_string()
+            .contains("refusing to store snapshot version 3.1.0")
+    );
+    assert!(!report_root.exists());
+
+    let _ = fs::remove_dir_all(&test_root);
+}
+
 fn seed_local_asset(root: &Path, relative_path: &str) {
     let full_path = root.join(relative_path);
     if let Some(parent) = full_path.parent() {

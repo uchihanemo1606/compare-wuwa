@@ -199,6 +199,63 @@ fn compare_snapshots_command_keeps_sparse_extractor_pairs_low_signal() {
     let _ = fs::remove_dir_all(&test_root);
 }
 
+#[test]
+fn compare_snapshots_command_labels_scope_induced_removals_from_narrower_capture_scope() {
+    let test_root = unique_test_dir();
+    let root = test_root.join("game");
+    let old_snapshot_path = test_root.join("snapshots").join("old.full.json");
+    let new_snapshot_path = test_root.join("snapshots").join("new.character.json");
+    let compare_output_path = test_root.join("out").join("compare-scope-narrowing.json");
+
+    seed_local_asset(&root, "Content/Character/HeroA/Body.mesh");
+    seed_local_asset(&root, "Content/Weapon/Sword.weapon");
+
+    run_snapshot_command(&SnapshotArgs {
+        source_root: root.clone(),
+        version_id: "4.0.0".to_string(),
+        output: old_snapshot_path.clone(),
+        capture_scope: SnapshotCaptureScopeArg::Full,
+        extractor_inventory: None,
+        store_in_report: false,
+        report_root: None,
+    })
+    .expect("create old full snapshot");
+    run_snapshot_command(&SnapshotArgs {
+        source_root: root,
+        version_id: "4.0.1".to_string(),
+        output: new_snapshot_path.clone(),
+        capture_scope: SnapshotCaptureScopeArg::Character,
+        extractor_inventory: None,
+        store_in_report: false,
+        report_root: None,
+    })
+    .expect("create new character-focused snapshot");
+
+    let report = run_compare_snapshots_command(&CompareSnapshotsArgs {
+        old_snapshot: old_snapshot_path,
+        new_snapshot: new_snapshot_path,
+        output: compare_output_path.clone(),
+    })
+    .expect("run scope-narrowing compare command");
+
+    let output = fs::read_to_string(&compare_output_path).expect("read compare output");
+    let parsed: SnapshotCompareReport =
+        serde_json::from_str(&output).expect("parse compare report");
+
+    assert_eq!(report.summary.removed_assets, 1);
+    assert!(report.scope.scope_narrowing_detected);
+    assert!(report.scope.scope_induced_removals_likely);
+    assert!(parsed.scope.scope_narrowing_detected);
+    assert!(parsed.scope.scope_induced_removals_likely);
+    assert!(parsed.scope.notes.iter().any(|note| {
+        note.contains("scope-induced removal caution")
+            && note.contains("local_filesystem_inventory_character_focused")
+            && note.contains("likely reflect scope filtering rather than true game-version drift")
+    }));
+
+    let _ = fs::remove_dir_all(&test_root);
+}
+
 fn seed_local_asset(root: &Path, relative_path: &str) {
     let full_path = root.join(relative_path);
     if let Some(parent) = full_path.parent() {
