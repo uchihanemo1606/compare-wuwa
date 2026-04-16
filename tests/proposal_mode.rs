@@ -304,6 +304,7 @@ fn sample_inference_report() -> InferenceReport {
                 evidence: vec!["compare candidate confidence 0.950".to_string()],
             },
         ],
+        surface_intersection: Default::default(),
         representative_risk_projections: Vec::new(),
     }
 }
@@ -384,6 +385,7 @@ fn continuity_flagged_inference_report() -> InferenceReport {
             ],
             evidence: vec!["compare candidate confidence 0.920".to_string()],
         }],
+        surface_intersection: Default::default(),
         representative_risk_projections: Vec::new(),
     }
 }
@@ -482,6 +484,7 @@ fn mod_aware_hook_targeting_inference_report() -> InferenceReport {
                 "mod dependency files: CarlottaMod.ini".to_string(),
             ],
         }],
+        surface_intersection: Default::default(),
         representative_risk_projections: Vec::new(),
     }
 }

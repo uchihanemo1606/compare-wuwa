@@ -14,7 +14,7 @@ use crate::{
         export_proposal_patch_draft_output, export_snapshot_compare_output, export_snapshot_output,
         export_text_output, export_version_continuity_output, export_version_diff_report_v2,
     },
-    human_summary::ReviewBundleRenderer,
+    human_summary::{ReviewBundleRenderer, render_mod_dependency_baseline_summary},
     inference::InferenceReport,
     output_policy::{resolve_artifact_root, resolve_report_store_root},
     proposal::{MappingProposalOutput, ProposalArtifacts, ProposalPatchDraftOutput},
@@ -56,6 +56,7 @@ pub enum VersionArtifactKind {
     InferenceData,
     ProposalData,
     HumanSummary,
+    ModDependencyBaselineSummary,
     ExtractorInventory,
     BufferData,
     HashData,
@@ -340,6 +341,23 @@ impl ReportStorage {
             sanitize_version_segment(version_id)
         ));
         export_mod_dependency_baseline_set_output(baseline_set, &target_path)?;
+        Ok(target_path)
+    }
+
+    pub fn save_mod_dependency_baseline_summary_for_version(
+        &self,
+        version_id: &str,
+        baseline_set: &WwmiModDependencyBaselineSet,
+    ) -> AppResult<PathBuf> {
+        let layout = self.ensure_version_layout(version_id)?;
+        let target_path = layout.summary_dir.join(format!(
+            "{VERSION_DIR_PREFIX}{}.mod-dependency-baselines.summary.md",
+            sanitize_version_segment(version_id)
+        ));
+        export_text_output(
+            &render_mod_dependency_baseline_summary(baseline_set),
+            &target_path,
+        )?;
         Ok(target_path)
     }
 
@@ -899,6 +917,11 @@ impl ReportStorage {
             .filter(|artifact| {
                 artifact.kind == VersionArtifactKind::HumanSummary
                     && artifact.path.extension().is_some_and(|ext| ext == "md")
+                    && artifact
+                        .path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.ends_with(".human-summary.md"))
             })
             .map(|artifact| artifact.path)
             .collect::<Vec<_>>();
@@ -1317,7 +1340,7 @@ fn collect_artifacts_from_new_layout(version_dir: &Path) -> AppResult<Vec<Versio
                 "continuity" => VersionArtifactKind::ContinuityData,
                 "inference" => VersionArtifactKind::InferenceData,
                 "proposal" => VersionArtifactKind::ProposalData,
-                "summary" => VersionArtifactKind::HumanSummary,
+                "summary" => classify_summary_artifact(&file),
                 "buffer" => VersionArtifactKind::BufferData,
                 "hash" => VersionArtifactKind::HashData,
                 "auxiliary"
@@ -1339,6 +1362,20 @@ fn collect_artifacts_from_new_layout(version_dir: &Path) -> AppResult<Vec<Versio
     }
 
     Ok(artifacts)
+}
+
+fn classify_summary_artifact(path: &Path) -> VersionArtifactKind {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return VersionArtifactKind::Auxiliary;
+    };
+
+    if name.ends_with(".mod-dependency-baselines.summary.md") {
+        VersionArtifactKind::ModDependencyBaselineSummary
+    } else if name.ends_with(".human-summary.md") {
+        VersionArtifactKind::HumanSummary
+    } else {
+        VersionArtifactKind::Auxiliary
+    }
 }
 
 fn collect_files_recursively(root: &Path) -> AppResult<Vec<PathBuf>> {
@@ -1722,6 +1759,111 @@ mod tests {
                 .iter()
                 .any(|artifact| artifact.kind == VersionArtifactKind::ContinuityData)
         );
+
+        let _ = fs::remove_dir_all(test_root);
+    }
+
+    #[test]
+    fn baseline_summary_only_does_not_set_has_human_summary() {
+        let test_root = unique_test_dir();
+        let storage = ReportStorage::new(test_root.join("out").join("report"));
+        let version_dir = storage.build_version_directory("3.2.1");
+        fs::create_dir_all(version_dir.join("summary")).expect("create summary dir");
+        fs::write(
+            version_dir
+                .join("summary")
+                .join("wuwa_3.2.1.mod-dependency-baselines.summary.md"),
+            "# baseline summary",
+        )
+        .expect("write baseline summary");
+
+        let versions = storage.list_versions().expect("list versions");
+        let entry = versions
+            .iter()
+            .find(|entry| entry.version_id == "3.2.1")
+            .expect("3.2.1 exists");
+
+        assert!(!entry.has_human_summary);
+        assert!(entry.artifacts.iter().any(|artifact| {
+            artifact.kind == VersionArtifactKind::ModDependencyBaselineSummary
+                && artifact.path.file_name().and_then(|name| name.to_str())
+                    == Some("wuwa_3.2.1.mod-dependency-baselines.summary.md")
+        }));
+        assert_eq!(
+            storage
+                .load_latest_human_summary("3.2.1")
+                .expect("load human summary"),
+            None
+        );
+
+        let _ = fs::remove_dir_all(test_root);
+    }
+
+    #[test]
+    fn load_latest_human_summary_ignores_baseline_summary_markdown() {
+        let test_root = unique_test_dir();
+        let storage = ReportStorage::new(test_root.join("out").join("report"));
+        let version_dir = storage.build_version_directory("3.3.1");
+        fs::create_dir_all(version_dir.join("summary")).expect("create summary dir");
+        fs::write(
+            version_dir
+                .join("summary")
+                .join("wuwa_3.3.1.mod-dependency-baselines.summary.md"),
+            "# baseline summary",
+        )
+        .expect("write baseline summary");
+        fs::write(
+            version_dir
+                .join("summary")
+                .join("100-3.2.1-to-3.3.1.human-summary.md"),
+            "# older human summary",
+        )
+        .expect("write older human summary");
+        fs::write(
+            version_dir
+                .join("summary")
+                .join("200-3.2.5-to-3.3.1.human-summary.md"),
+            "# latest human summary",
+        )
+        .expect("write latest human summary");
+
+        let loaded = storage
+            .load_latest_human_summary("3.3.1")
+            .expect("load human summary");
+        assert_eq!(loaded.as_deref(), Some("# latest human summary"));
+
+        let versions = storage.list_versions().expect("list versions");
+        let entry = versions
+            .iter()
+            .find(|entry| entry.version_id == "3.3.1")
+            .expect("3.3.1 exists");
+        assert!(entry.has_human_summary);
+
+        let _ = fs::remove_dir_all(test_root);
+    }
+
+    #[test]
+    fn list_version_artifacts_keeps_baseline_summary_under_distinct_kind() {
+        let test_root = unique_test_dir();
+        let storage = ReportStorage::new(test_root.join("out").join("report"));
+        let version_dir = storage.build_version_directory("3.4.0");
+        fs::create_dir_all(version_dir.join("summary")).expect("create summary dir");
+        fs::write(
+            version_dir
+                .join("summary")
+                .join("wuwa_3.4.0.mod-dependency-baselines.summary.md"),
+            "# baseline summary",
+        )
+        .expect("write baseline summary");
+
+        let artifacts = storage
+            .list_version_artifacts("3.4.0")
+            .expect("list version artifacts");
+        assert!(artifacts.iter().any(|artifact| {
+            artifact.kind == VersionArtifactKind::ModDependencyBaselineSummary
+                && artifact.path.file_name().and_then(|name| name.to_str())
+                    == Some("wuwa_3.4.0.mod-dependency-baselines.summary.md")
+        }));
 
         let _ = fs::remove_dir_all(test_root);
     }
@@ -2639,6 +2781,7 @@ mod tests {
                 reasons: vec!["exact path".to_string()],
                 evidence: vec!["compare confidence".to_string()],
             }],
+            surface_intersection: Default::default(),
             representative_risk_projections: Vec::new(),
         }
     }
@@ -2729,6 +2872,7 @@ mod tests {
                     "structured continuity history reaches terminal state removed in 8.2.0".to_string(),
                 ],
             }],
+            surface_intersection: Default::default(),
             representative_risk_projections: Vec::new(),
         }
     }

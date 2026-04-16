@@ -24,8 +24,9 @@ use whashreonator::{
         WwmiEvidenceCommit, WwmiFixPattern, WwmiKeywordStat, WwmiKnowledgeBase,
         WwmiKnowledgeRepoInfo, WwmiKnowledgeSummary, WwmiPatternKind,
         dependency::{
-            WwmiModDependencyBaselineSet, WwmiModDependencyKind, WwmiModDependencyProfile,
-            WwmiModDependencySignal,
+            WwmiModDependencyBaselineSet, WwmiModDependencyBaselineStrength, WwmiModDependencyKind,
+            WwmiModDependencyProfile, WwmiModDependencySignal, WwmiModDependencySurfaceClass,
+            build_mod_dependency_baseline_set,
         },
     },
 };
@@ -241,6 +242,31 @@ filename = SwordDiffuse.dds
 
     assert!(mod_report.mod_dependency_input.is_some());
     assert!(mod_fix.confidence > base_fix.confidence);
+    assert_eq!(
+        mod_report.surface_intersection.overlapping_surface_classes,
+        vec![WwmiModDependencySurfaceClass::MappingHash]
+    );
+    assert!(
+        mod_report
+            .scope
+            .notes
+            .iter()
+            .any(|note| { note.contains("mod-side dependency surfaces: mapping_hash") })
+    );
+    assert!(
+        mod_report
+            .scope
+            .notes
+            .iter()
+            .any(|note| { note.contains("game-side change surfaces: mapping_hash") })
+    );
+    assert!(
+        mod_report
+            .scope
+            .notes
+            .iter()
+            .any(|note| note.contains("surface intersection overlap: mapping_hash"))
+    );
     assert!(
         mod_fix
             .reasons
@@ -322,6 +348,26 @@ filename = SwordDiffuse.dds
 
     assert!(mod_report.mod_dependency_input.is_some());
     assert_eq!(mod_fix.confidence, base_fix.confidence);
+    assert!(
+        mod_report
+            .surface_intersection
+            .mod_side_surfaces
+            .iter()
+            .any(|surface| {
+                surface.surface_class == WwmiModDependencySurfaceClass::ResourceSkeleton
+            })
+    );
+    assert!(
+        mod_report
+            .surface_intersection
+            .overlapping_surface_classes
+            .is_empty()
+    );
+    assert!(mod_report.surface_intersection.weak_or_absent_overlap);
+    assert!(mod_report.scope.notes.iter().any(|note| {
+        note.contains("no explicit mod/game surface overlap")
+            || note.contains("review-only context")
+    }));
     assert!(
         mod_fix
             .reasons
@@ -418,6 +464,27 @@ fn infer_fixes_command_uses_mod_dependency_profile_to_keep_buffer_sensitive_rema
         .expect("layout fix");
 
     assert!(mod_hint.confidence < base_hint.confidence);
+    assert_eq!(
+        mod_report.surface_intersection.overlapping_surface_classes,
+        vec![WwmiModDependencySurfaceClass::BufferLayout]
+    );
+    assert!(
+        mod_report
+            .scope
+            .notes
+            .iter()
+            .any(|note| { note.contains("mod-side dependency surfaces: buffer_layout") })
+    );
+    assert!(mod_report.scope.notes.iter().any(|note| {
+        note.contains("game-side change surfaces:") && note.contains("buffer_layout")
+    }));
+    assert!(
+        mod_report
+            .scope
+            .notes
+            .iter()
+            .any(|note| note.contains("surface intersection overlap: buffer_layout"))
+    );
     assert!(
         mod_hint
             .reasons
@@ -429,6 +496,12 @@ fn infer_fixes_command_uses_mod_dependency_profile_to_keep_buffer_sensitive_rema
             .reasons
             .iter()
             .any(|reason| reason.contains("buffer/layout-sensitive"))
+    );
+    assert!(
+        mod_fix
+            .evidence
+            .iter()
+            .any(|evidence| evidence.contains("mod-side dependency profile"))
     );
 
     let _ = fs::remove_dir_all(&test_root);
@@ -549,6 +622,33 @@ fn infer_fixes_command_loads_representative_baseline_set_from_report_root_and_pr
         .expect("representative baseline input");
     assert_eq!(representative.version_id, "2.4.0");
     assert_eq!(representative.profile_count, 4);
+    assert_eq!(representative.included_mod_count, 4);
+    assert_eq!(
+        representative.strength,
+        WwmiModDependencyBaselineStrength::Partial
+    );
+    assert!(representative.material_for_repair_review);
+    assert_eq!(
+        representative.represented_surface_classes,
+        vec![
+            WwmiModDependencySurfaceClass::MappingHash,
+            WwmiModDependencySurfaceClass::BufferLayout,
+            WwmiModDependencySurfaceClass::ResourceSkeleton,
+            WwmiModDependencySurfaceClass::DrawCallFilterHook,
+        ]
+    );
+    assert!(
+        representative
+            .caution_notes
+            .iter()
+            .any(|note| note.contains("not an exhaustive"))
+    );
+    assert!(report.scope.notes.iter().any(|note| {
+        note.contains("strength=Partial")
+            && note.contains(
+                "surfaces=mapping_hash, buffer_layout, resource_skeleton, draw_call_filter_hook",
+            )
+    }));
 
     assert!(
         report
@@ -1261,12 +1361,9 @@ fn sample_knowledge() -> WwmiKnowledgeBase {
 }
 
 fn sample_representative_baseline_set(version_id: &str) -> WwmiModDependencyBaselineSet {
-    WwmiModDependencyBaselineSet {
-        schema_version: "whashreonator.wwmi-mod-dependency-baselines.v1".to_string(),
-        generated_at_unix_ms: 1,
-        version_id: version_id.to_string(),
-        profile_count: 4,
-        profiles: vec![
+    let mut baseline_set = build_mod_dependency_baseline_set(
+        version_id,
+        vec![
             WwmiModDependencyProfile {
                 mod_name: Some("HashFocusedMod".to_string()),
                 mod_root: "D:/mods/HashFocusedMod".to_string(),
@@ -1328,7 +1425,10 @@ fn sample_representative_baseline_set(version_id: &str) -> WwmiModDependencyBase
                 ],
             },
         ],
-    }
+    )
+    .expect("build representative baseline set");
+    baseline_set.generated_at_unix_ms = 1;
+    baseline_set
 }
 
 fn asset_summary(path: &str) -> SnapshotAssetSummary {

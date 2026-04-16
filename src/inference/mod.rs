@@ -21,7 +21,8 @@ use crate::{
     wwmi::{
         WwmiKnowledgeBase, WwmiPatternKind,
         dependency::{
-            WwmiModDependencyBaselineSet, WwmiModDependencyKind, WwmiModDependencyProfile,
+            WwmiModDependencyBaselineSet, WwmiModDependencyBaselineStrength, WwmiModDependencyKind,
+            WwmiModDependencyProfile, WwmiModDependencySurfaceClass,
         },
         load_wwmi_knowledge,
     },
@@ -43,6 +44,8 @@ pub struct InferenceReport {
     pub probable_crash_causes: Vec<ProbableCrashCause>,
     pub suggested_fixes: Vec<SuggestedFix>,
     pub candidate_mapping_hints: Vec<InferredMappingHint>,
+    #[serde(default)]
+    pub surface_intersection: InferenceSurfaceIntersection,
     #[serde(default)]
     pub representative_risk_projections: Vec<RepresentativeModRiskProjection>,
 }
@@ -89,7 +92,18 @@ pub struct InferenceModDependencyInput {
 pub struct InferenceRepresentativeModBaselineInput {
     pub version_id: String,
     pub profile_count: usize,
+    #[serde(default)]
+    pub included_mod_count: usize,
+    #[serde(default)]
+    pub represented_surface_classes: Vec<WwmiModDependencySurfaceClass>,
+    #[serde(default)]
     pub risk_class_counts: Vec<InferenceRepresentativeRiskClassCount>,
+    #[serde(default)]
+    pub strength: WwmiModDependencyBaselineStrength,
+    #[serde(default)]
+    pub material_for_repair_review: bool,
+    #[serde(default)]
+    pub caution_notes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -97,6 +111,34 @@ pub struct InferenceRepresentativeModBaselineInput {
 pub struct InferenceRepresentativeRiskClassCount {
     pub risk_class: RepresentativeModRiskClass,
     pub profile_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct InferenceSurfaceIntersection {
+    pub mod_side_surfaces: Vec<InferenceModSideSurface>,
+    pub game_side_surfaces: Vec<InferenceGameSideSurface>,
+    pub overlapping_surface_classes: Vec<WwmiModDependencySurfaceClass>,
+    pub weak_or_absent_overlap: bool,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct InferenceModSideSurface {
+    pub surface_class: WwmiModDependencySurfaceClass,
+    pub sources: Vec<String>,
+    pub dependency_kinds: Vec<WwmiModDependencyKind>,
+    pub signal_count: usize,
+    pub representative_profile_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct InferenceGameSideSurface {
+    pub surface_class: WwmiModDependencySurfaceClass,
+    pub compare_signals: Vec<String>,
+    pub affected_assets: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -272,6 +314,14 @@ struct RepresentativeBaselineSurfaceSummary {
     label: &'static str,
 }
 
+#[derive(Debug, Clone, Default)]
+struct SurfaceIntersectionBuildEntry {
+    sources: BTreeSet<String>,
+    dependency_kinds: BTreeSet<WwmiModDependencyKind>,
+    signal_count: usize,
+    representative_profile_count: usize,
+}
+
 impl FixInferenceEngine {
     pub fn infer_files(
         &self,
@@ -327,10 +377,16 @@ impl FixInferenceEngine {
         let mod_dependency = mod_dependency_profile.map(build_mod_dependency_insights);
         let representative_mod_baseline =
             representative_mod_baseline_set.map(build_representative_mod_baseline_insights);
+        let surface_intersection = build_surface_intersection(
+            compare_report,
+            mod_dependency.as_ref(),
+            representative_mod_baseline.as_ref(),
+        );
         let scope = build_inference_scope_context(
             compare_report,
             mod_dependency.as_ref(),
             representative_mod_baseline.as_ref(),
+            &surface_intersection,
         );
         let confidence_scale = if scope.low_signal_compare { 0.85 } else { 1.0 };
         let continuity_context =
@@ -887,6 +943,7 @@ impl FixInferenceEngine {
                 &mut candidate_mapping_hints,
                 compare_report,
                 mod_dependency,
+                &surface_intersection,
                 mapping_support,
                 buffer_support,
                 runtime_support,
@@ -963,6 +1020,7 @@ impl FixInferenceEngine {
             probable_crash_causes,
             suggested_fixes,
             candidate_mapping_hints,
+            surface_intersection,
             representative_risk_projections,
         }
     }
@@ -1075,7 +1133,12 @@ fn build_representative_mod_baseline_insights(
         input: InferenceRepresentativeModBaselineInput {
             version_id: baseline_set.version_id.clone(),
             profile_count: baseline_set.profile_count,
+            included_mod_count: baseline_set.review.included_mod_count,
+            represented_surface_classes: baseline_set.represented_surface_classes(),
             risk_class_counts,
+            strength: baseline_set.review.strength.clone(),
+            material_for_repair_review: baseline_set.review.material_for_repair_review,
+            caution_notes: baseline_set.review.caution_notes.clone(),
         },
         mapping_hash,
         buffer_layout,
@@ -1171,6 +1234,285 @@ fn build_representative_surface_summary(
         dependency_kinds,
         label,
     })
+}
+
+fn build_surface_intersection(
+    compare_report: &SnapshotCompareReport,
+    mod_dependency: Option<&ModDependencyInsights>,
+    representative_mod_baseline: Option<&RepresentativeModBaselineInsights>,
+) -> InferenceSurfaceIntersection {
+    let mut mod_side =
+        BTreeMap::<WwmiModDependencySurfaceClass, SurfaceIntersectionBuildEntry>::new();
+
+    if let Some(mod_dependency) = mod_dependency {
+        register_mod_surface(
+            &mut mod_side,
+            WwmiModDependencySurfaceClass::MappingHash,
+            mod_dependency.mapping_hash.as_ref(),
+            "mod_dependency_profile",
+        );
+        register_mod_surface(
+            &mut mod_side,
+            WwmiModDependencySurfaceClass::BufferLayout,
+            mod_dependency.buffer_layout.as_ref(),
+            "mod_dependency_profile",
+        );
+        register_mod_surface(
+            &mut mod_side,
+            WwmiModDependencySurfaceClass::ResourceSkeleton,
+            mod_dependency.resource_or_skeleton.as_ref(),
+            "mod_dependency_profile",
+        );
+        register_mod_surface(
+            &mut mod_side,
+            WwmiModDependencySurfaceClass::DrawCallFilterHook,
+            mod_dependency.hook_targeting.as_ref(),
+            "mod_dependency_profile",
+        );
+    }
+
+    if let Some(baseline) = representative_mod_baseline {
+        register_representative_surface(
+            &mut mod_side,
+            WwmiModDependencySurfaceClass::MappingHash,
+            baseline.mapping_hash.as_ref(),
+        );
+        register_representative_surface(
+            &mut mod_side,
+            WwmiModDependencySurfaceClass::BufferLayout,
+            baseline.buffer_layout.as_ref(),
+        );
+        register_representative_surface(
+            &mut mod_side,
+            WwmiModDependencySurfaceClass::ResourceSkeleton,
+            baseline.resource_or_skeleton.as_ref(),
+        );
+        register_representative_surface(
+            &mut mod_side,
+            WwmiModDependencySurfaceClass::DrawCallFilterHook,
+            baseline.draw_call_filter_hook.as_ref(),
+        );
+    }
+
+    let game_side = collect_game_side_surfaces(compare_report);
+    let overlapping_surface_classes = ordered_surface_classes()
+        .into_iter()
+        .filter(|surface_class| mod_side.contains_key(surface_class))
+        .filter(|surface_class| {
+            game_side
+                .iter()
+                .any(|surface| surface.surface_class == *surface_class)
+        })
+        .collect::<Vec<_>>();
+
+    let weak_or_absent_overlap =
+        !mod_side.is_empty() && overlapping_surface_classes.len() < mod_side.len();
+    let mut notes = Vec::new();
+    if !mod_side.is_empty() && overlapping_surface_classes.is_empty() {
+        notes.push(
+            "no explicit mod/game surface overlap was observed in current compare evidence; keep mod-side dependency signals as reviewer context only"
+                .to_string(),
+        );
+    } else if weak_or_absent_overlap {
+        notes.push(format!(
+            "surface overlap is partial: overlap={} while mod-side surfaces={}",
+            join_surface_labels(overlapping_surface_classes.iter()),
+            join_surface_labels(mod_side.keys())
+        ));
+    }
+
+    InferenceSurfaceIntersection {
+        mod_side_surfaces: ordered_surface_classes()
+            .into_iter()
+            .filter_map(|surface_class| {
+                mod_side
+                    .remove(&surface_class)
+                    .map(|entry| InferenceModSideSurface {
+                        surface_class,
+                        sources: entry.sources.into_iter().collect(),
+                        dependency_kinds: entry.dependency_kinds.into_iter().collect(),
+                        signal_count: entry.signal_count,
+                        representative_profile_count: entry.representative_profile_count,
+                    })
+            })
+            .collect(),
+        game_side_surfaces: game_side,
+        overlapping_surface_classes,
+        weak_or_absent_overlap,
+        notes,
+    }
+}
+
+fn register_mod_surface(
+    mod_side: &mut BTreeMap<WwmiModDependencySurfaceClass, SurfaceIntersectionBuildEntry>,
+    surface_class: WwmiModDependencySurfaceClass,
+    surface: Option<&ModDependencySurfaceSummary>,
+    source: &str,
+) {
+    let Some(surface) = surface else {
+        return;
+    };
+
+    let entry = mod_side.entry(surface_class).or_default();
+    entry.sources.insert(source.to_string());
+    entry.signal_count += surface.signal_count;
+    entry
+        .dependency_kinds
+        .extend(surface.dependency_kinds.iter().cloned());
+}
+
+fn register_representative_surface(
+    mod_side: &mut BTreeMap<WwmiModDependencySurfaceClass, SurfaceIntersectionBuildEntry>,
+    surface_class: WwmiModDependencySurfaceClass,
+    surface: Option<&RepresentativeBaselineSurfaceSummary>,
+) {
+    let Some(surface) = surface else {
+        return;
+    };
+
+    let entry = mod_side.entry(surface_class).or_default();
+    entry
+        .sources
+        .insert("representative_mod_baseline".to_string());
+    entry.representative_profile_count += surface.profile_count;
+    entry
+        .dependency_kinds
+        .extend(surface.dependency_kinds.iter().cloned());
+}
+
+fn collect_game_side_surfaces(
+    compare_report: &SnapshotCompareReport,
+) -> Vec<InferenceGameSideSurface> {
+    let mut surfaces = Vec::new();
+    for surface_class in ordered_surface_classes() {
+        let compare_signals = match surface_class {
+            WwmiModDependencySurfaceClass::MappingHash => {
+                mapping_hash_projection_signals(compare_report)
+            }
+            WwmiModDependencySurfaceClass::BufferLayout => {
+                buffer_layout_projection_signals(compare_report)
+            }
+            WwmiModDependencySurfaceClass::ResourceSkeleton => {
+                resource_skeleton_projection_signals(compare_report)
+            }
+            WwmiModDependencySurfaceClass::DrawCallFilterHook => {
+                draw_call_filter_hook_projection_signals(compare_report)
+            }
+        };
+        if compare_signals.is_empty() {
+            continue;
+        }
+
+        surfaces.push(InferenceGameSideSurface {
+            surface_class: surface_class.clone(),
+            compare_signals,
+            affected_assets: game_side_surface_affected_assets(compare_report, &surface_class),
+        });
+    }
+    surfaces
+}
+
+fn game_side_surface_affected_assets(
+    compare_report: &SnapshotCompareReport,
+    surface_class: &WwmiModDependencySurfaceClass,
+) -> Vec<String> {
+    let mut assets = BTreeSet::new();
+    match surface_class {
+        WwmiModDependencySurfaceClass::MappingHash => {
+            for change in &compare_report.removed_assets {
+                if let Some(asset) = change.old_asset.as_ref() {
+                    assets.insert(asset.path.clone());
+                }
+            }
+            for candidate in &compare_report.candidate_mapping_changes {
+                assets.insert(candidate.old_asset.path.clone());
+                assets.insert(candidate.new_asset.path.clone());
+            }
+            for change in &compare_report.changed_assets {
+                if change.changed_fields.iter().any(|field| {
+                    matches!(
+                        field.as_str(),
+                        "asset_hash" | "shader_hash" | "signature" | "path_presence"
+                    )
+                }) {
+                    if let Some(asset) = change.new_asset.as_ref().or(change.old_asset.as_ref()) {
+                        assets.insert(asset.path.clone());
+                    }
+                }
+            }
+        }
+        WwmiModDependencySurfaceClass::BufferLayout => {
+            for change in &compare_report.changed_assets {
+                if is_structural_change(change) {
+                    if let Some(asset) = change.new_asset.as_ref().or(change.old_asset.as_ref()) {
+                        assets.insert(asset.path.clone());
+                    }
+                }
+            }
+            for candidate in &compare_report.candidate_mapping_changes {
+                if candidate.compatibility == RemapCompatibility::StructurallyRisky {
+                    assets.insert(candidate.old_asset.path.clone());
+                    assets.insert(candidate.new_asset.path.clone());
+                }
+            }
+        }
+        WwmiModDependencySurfaceClass::ResourceSkeleton => {
+            assets.extend(resource_or_skeleton_affected_assets(compare_report));
+        }
+        WwmiModDependencySurfaceClass::DrawCallFilterHook => {
+            if has_hook_targeting_review_surface(compare_report) {
+                for candidate in &compare_report.candidate_mapping_changes {
+                    assets.insert(candidate.old_asset.path.clone());
+                    assets.insert(candidate.new_asset.path.clone());
+                }
+                for change in &compare_report.changed_assets {
+                    if change.changed_fields.iter().any(|field| {
+                        matches!(
+                            field.as_str(),
+                            "container_path" | "source_kind" | "asset_hash" | "signature"
+                        )
+                    }) && let Some(asset) =
+                        change.new_asset.as_ref().or(change.old_asset.as_ref())
+                    {
+                        assets.insert(asset.path.clone());
+                    }
+                }
+            }
+        }
+    }
+    assets.into_iter().collect()
+}
+
+fn ordered_surface_classes() -> Vec<WwmiModDependencySurfaceClass> {
+    vec![
+        WwmiModDependencySurfaceClass::MappingHash,
+        WwmiModDependencySurfaceClass::BufferLayout,
+        WwmiModDependencySurfaceClass::ResourceSkeleton,
+        WwmiModDependencySurfaceClass::DrawCallFilterHook,
+    ]
+}
+
+fn join_surface_labels<'a>(
+    surfaces: impl IntoIterator<Item = &'a WwmiModDependencySurfaceClass>,
+) -> String {
+    let labels = surfaces
+        .into_iter()
+        .map(WwmiModDependencySurfaceClass::label)
+        .collect::<Vec<_>>();
+    if labels.is_empty() {
+        "none".to_string()
+    } else {
+        labels.join(", ")
+    }
+}
+
+fn surface_intersection_has_overlap(
+    surface_intersection: &InferenceSurfaceIntersection,
+    surface_class: WwmiModDependencySurfaceClass,
+) -> bool {
+    surface_intersection
+        .overlapping_surface_classes
+        .contains(&surface_class)
 }
 
 fn is_structural_change(change: &SnapshotAssetChange) -> bool {
@@ -1326,6 +1668,7 @@ fn build_inference_scope_context(
     compare_report: &SnapshotCompareReport,
     mod_dependency: Option<&ModDependencyInsights>,
     representative_mod_baseline: Option<&RepresentativeModBaselineInsights>,
+    surface_intersection: &InferenceSurfaceIntersection,
 ) -> InferenceScopeContext {
     let mut notes = compare_report.scope.notes.clone();
     if compare_report.scope.low_signal_compare {
@@ -1350,12 +1693,65 @@ fn build_inference_scope_context(
         ));
     }
     if let Some(representative_mod_baseline) = representative_mod_baseline {
+        let surface_labels = representative_mod_baseline
+            .input
+            .represented_surface_classes
+            .iter()
+            .map(|surface| surface.label())
+            .collect::<Vec<_>>();
         notes.push(format!(
-            "representative mod baseline set {} loaded with {} profile(s)",
+            "representative mod baseline set {} loaded with {} profile(s), {} included mod root(s), strength={:?}, surfaces={}",
             representative_mod_baseline.input.version_id,
-            representative_mod_baseline.input.profile_count
+            representative_mod_baseline.input.profile_count,
+            representative_mod_baseline.input.included_mod_count,
+            representative_mod_baseline.input.strength,
+            if surface_labels.is_empty() {
+                "none".to_string()
+            } else {
+                surface_labels.join(", ")
+            }
+        ));
+        if !representative_mod_baseline.input.material_for_repair_review {
+            notes.push(
+                "representative mod baseline remains limited and should stay review-only support rather than strong repair evidence"
+                    .to_string(),
+            );
+        }
+    }
+    if !surface_intersection.mod_side_surfaces.is_empty() {
+        notes.push(format!(
+            "mod-side dependency surfaces: {}",
+            join_surface_labels(
+                surface_intersection
+                    .mod_side_surfaces
+                    .iter()
+                    .map(|surface| &surface.surface_class)
+            )
         ));
     }
+    if !surface_intersection.game_side_surfaces.is_empty() {
+        notes.push(format!(
+            "game-side change surfaces: {}",
+            join_surface_labels(
+                surface_intersection
+                    .game_side_surfaces
+                    .iter()
+                    .map(|surface| &surface.surface_class)
+            )
+        ));
+    }
+    if !surface_intersection.overlapping_surface_classes.is_empty() {
+        notes.push(format!(
+            "surface intersection overlap: {}",
+            join_surface_labels(surface_intersection.overlapping_surface_classes.iter())
+        ));
+    } else if !surface_intersection.mod_side_surfaces.is_empty() {
+        notes.push(
+            "mod-side dependency surfaces were detected, but compare did not expose overlapping game-side surfaces; keep this as review-only context rather than strong repair evidence"
+                .to_string(),
+        );
+    }
+    notes.extend(surface_intersection.notes.iter().cloned());
 
     InferenceScopeContext {
         low_signal_compare: compare_report.scope.low_signal_compare,
@@ -1393,12 +1789,18 @@ fn apply_mod_dependency_inference_adjustments(
     candidate_mapping_hints: &mut Vec<InferredMappingHint>,
     compare_report: &SnapshotCompareReport,
     mod_dependency: &ModDependencyInsights,
+    surface_intersection: &InferenceSurfaceIntersection,
     mapping_support: f32,
     buffer_support: f32,
     runtime_support: f32,
     confidence_scale: f32,
 ) {
-    if let Some(surface) = mod_dependency.mapping_hash.as_ref() {
+    if let Some(surface) = mod_dependency.mapping_hash.as_ref()
+        && surface_intersection_has_overlap(
+            surface_intersection,
+            WwmiModDependencySurfaceClass::MappingHash,
+        )
+    {
         for code in [
             "asset_paths_or_mapping_shifted",
             "asset_removed_without_clear_replacement",
@@ -1455,7 +1857,12 @@ fn apply_mod_dependency_inference_adjustments(
         }
     }
 
-    if let Some(surface) = mod_dependency.buffer_layout.as_ref() {
+    if let Some(surface) = mod_dependency.buffer_layout.as_ref()
+        && surface_intersection_has_overlap(
+            surface_intersection,
+            WwmiModDependencySurfaceClass::BufferLayout,
+        )
+    {
         for code in [
             "buffer_layout_changed",
             "candidate_remap_structural_drift",
@@ -1507,7 +1914,12 @@ fn apply_mod_dependency_inference_adjustments(
         }
     }
 
-    if let Some(surface) = mod_dependency.resource_or_skeleton.as_ref() {
+    if let Some(surface) = mod_dependency.resource_or_skeleton.as_ref()
+        && surface_intersection_has_overlap(
+            surface_intersection,
+            WwmiModDependencySurfaceClass::ResourceSkeleton,
+        )
+    {
         let affected_assets = resource_or_skeleton_affected_assets(compare_report);
         if !affected_assets.is_empty() {
             probable_crash_causes.push(ProbableCrashCause {
@@ -1563,6 +1975,10 @@ fn apply_mod_dependency_inference_adjustments(
     }
 
     if let Some(surface) = mod_dependency.hook_targeting.as_ref()
+        && surface_intersection_has_overlap(
+            surface_intersection,
+            WwmiModDependencySurfaceClass::DrawCallFilterHook,
+        )
         && has_hook_targeting_review_surface(compare_report)
     {
         probable_crash_causes.push(ProbableCrashCause {
@@ -1611,7 +2027,12 @@ fn apply_mod_dependency_inference_adjustments(
     }
 
     for hint in candidate_mapping_hints {
-        if let Some(surface) = mod_dependency.mapping_hash.as_ref() {
+        if let Some(surface) = mod_dependency.mapping_hash.as_ref()
+            && surface_intersection_has_overlap(
+                surface_intersection,
+                WwmiModDependencySurfaceClass::MappingHash,
+            )
+        {
             if has_reason_code(&hint.reasons, "asset_hash_exact")
                 || has_reason_code(&hint.reasons, "signature_exact")
             {
@@ -1632,6 +2053,10 @@ fn apply_mod_dependency_inference_adjustments(
         }
 
         if let Some(surface) = mod_dependency.buffer_layout.as_ref()
+            && surface_intersection_has_overlap(
+                surface_intersection,
+                WwmiModDependencySurfaceClass::BufferLayout,
+            )
             && (hint.compatibility == RemapCompatibility::StructurallyRisky
                 || has_reason_code(&hint.reasons, "same_asset_but_structural_drift")
                 || has_reason_code(&hint.reasons, "buffer_layout_validation_needed"))
@@ -1652,6 +2077,10 @@ fn apply_mod_dependency_inference_adjustments(
         }
 
         if let Some(surface) = mod_dependency.resource_or_skeleton.as_ref()
+            && surface_intersection_has_overlap(
+                surface_intersection,
+                WwmiModDependencySurfaceClass::ResourceSkeleton,
+            )
             && is_resource_or_skeleton_hint(hint)
         {
             hint.confidence = (hint.confidence - 0.03).clamp(0.0, 1.0);
@@ -1669,7 +2098,12 @@ fn apply_mod_dependency_inference_adjustments(
             );
         }
 
-        if let Some(surface) = mod_dependency.hook_targeting.as_ref() {
+        if let Some(surface) = mod_dependency.hook_targeting.as_ref()
+            && surface_intersection_has_overlap(
+                surface_intersection,
+                WwmiModDependencySurfaceClass::DrawCallFilterHook,
+            )
+        {
             hint.confidence = (hint.confidence - 0.07).clamp(0.0, 1.0);
             hint.compatibility = downgrade_hook_targeting_compatibility(hint.compatibility.clone());
             push_unique(

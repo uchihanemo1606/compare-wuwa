@@ -93,6 +93,7 @@ pub struct SnapshotCommandResult {
 pub struct ScanModDependenciesResult {
     pub baseline_set: WwmiModDependencyBaselineSet,
     pub stored_baseline_set_path: Option<PathBuf>,
+    pub stored_baseline_summary_path: Option<PathBuf>,
     pub stored_profile_paths: Vec<PathBuf>,
 }
 
@@ -319,6 +320,7 @@ pub fn run_scan_mod_dependencies_command(
     export_mod_dependency_baseline_set_output(&baseline_set, args.output.as_path())?;
 
     let mut stored_baseline_set_path = None;
+    let mut stored_baseline_summary_path = None;
     let mut stored_profile_paths = Vec::new();
     if args.store_in_report {
         let storage = match args.report_root.as_ref() {
@@ -329,6 +331,11 @@ pub fn run_scan_mod_dependencies_command(
             &baseline_set.version_id,
             &baseline_set,
         )?);
+        stored_baseline_summary_path =
+            Some(storage.save_mod_dependency_baseline_summary_for_version(
+                &baseline_set.version_id,
+                &baseline_set,
+            )?);
         stored_profile_paths = baseline_set
             .profiles
             .iter()
@@ -348,6 +355,7 @@ pub fn run_scan_mod_dependencies_command(
     Ok(ScanModDependenciesResult {
         baseline_set,
         stored_baseline_set_path,
+        stored_baseline_summary_path,
         stored_profile_paths,
     })
 }

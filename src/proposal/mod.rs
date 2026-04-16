@@ -796,6 +796,7 @@ mod tests {
                     evidence: vec!["compare candidate confidence 0.950".to_string()],
                 },
             ],
+            surface_intersection: Default::default(),
             representative_risk_projections: Vec::new(),
         };
 
@@ -904,6 +905,7 @@ mod tests {
                     evidence: vec!["compare candidate confidence 0.960".to_string()],
                 },
             ],
+            surface_intersection: Default::default(),
             representative_risk_projections: Vec::new(),
         };
 
@@ -998,6 +1000,7 @@ mod tests {
                 ],
                 evidence: vec!["compare candidate confidence 0.940".to_string()],
             }],
+            surface_intersection: Default::default(),
             representative_risk_projections: Vec::new(),
         };
 
@@ -1079,6 +1082,7 @@ mod tests {
                     evidence: vec!["compare candidate confidence 0.970".to_string()],
                 },
             ],
+            surface_intersection: Default::default(),
             representative_risk_projections: Vec::new(),
         };
 
@@ -1185,6 +1189,7 @@ mod tests {
                 ],
                 evidence: vec!["compare candidate confidence 0.950".to_string()],
             }],
+            surface_intersection: Default::default(),
             representative_risk_projections: Vec::new(),
         };
 
@@ -1275,6 +1280,7 @@ mod tests {
                 ],
                 evidence: vec!["compare candidate confidence 0.940".to_string()],
             }],
+            surface_intersection: Default::default(),
             representative_risk_projections: Vec::new(),
         };
 

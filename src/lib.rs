@@ -68,16 +68,36 @@ pub fn run(cli: Cli) -> AppResult<()> {
         }
         Command::ScanModDependencies(args) => {
             let result = pipeline::run_scan_mod_dependencies_command(&args)?;
+            let surfaces = result.baseline_set.represented_surface_labels().join(", ");
             println!(
-                "mod dependency baselines exported: version={} profiles={}",
-                result.baseline_set.version_id, result.baseline_set.profile_count
+                "mod dependency baselines exported: version={} profiles={} mods={} surfaces={} strength={:?} material_for_review={}",
+                result.baseline_set.version_id,
+                result.baseline_set.profile_count,
+                result.baseline_set.review.included_mod_count,
+                if surfaces.is_empty() {
+                    "none"
+                } else {
+                    surfaces.as_str()
+                },
+                result.baseline_set.review.strength,
+                if result.baseline_set.review.material_for_repair_review {
+                    "yes"
+                } else {
+                    "no"
+                }
             );
             println!("wrote mod-dependency-baselines: {}", args.output.display());
             if let Some(path) = result.stored_baseline_set_path.as_deref() {
                 println!("stored mod-dependency-baselines: {}", path.display());
             }
+            if let Some(path) = result.stored_baseline_summary_path.as_deref() {
+                println!("stored mod-dependency-baseline-summary: {}", path.display());
+            }
             for path in &result.stored_profile_paths {
                 println!("stored mod-dependency-profile: {}", path.display());
+            }
+            for note in &result.baseline_set.review.caution_notes {
+                println!("mod-dependency-baseline-caution: {note}");
             }
         }
         Command::ExtractWwmiKnowledge(args) => {

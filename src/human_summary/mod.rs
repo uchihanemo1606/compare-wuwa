@@ -6,6 +6,7 @@ use crate::{
     },
     proposal::{MappingProposalEntry, ProposalArtifacts, ProposalStatus},
     report::{VersionDiffReportV2, VersionReviewCause, VersionReviewFix, VersionReviewMapping},
+    wwmi::dependency::WwmiModDependencyBaselineSet,
 };
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -106,12 +107,84 @@ impl HumanSummaryRenderer {
             ));
         }
         if let Some(representative) = inference.representative_mod_baseline_input.as_ref() {
+            let surfaces = representative
+                .represented_surface_classes
+                .iter()
+                .map(|surface| surface.label())
+                .collect::<Vec<_>>();
             lines.push(format!(
-                "- Representative mod baseline set: version `{}` profiles={} risk_classes={}",
+                "- Representative mod baseline set: version `{}` profiles={} mods={} surfaces={} strength={:?} material_for_review={}",
                 representative.version_id,
                 representative.profile_count,
-                representative.risk_class_counts.len()
+                representative.included_mod_count,
+                if surfaces.is_empty() {
+                    "none".to_string()
+                } else {
+                    surfaces.join(", ")
+                },
+                representative.strength,
+                yes_no(representative.material_for_repair_review)
             ));
+            if let Some(note) = representative.caution_notes.first() {
+                lines.push(format!("- Representative baseline caution: {note}"));
+            }
+        }
+        if !inference.surface_intersection.mod_side_surfaces.is_empty() {
+            lines.push(format!(
+                "- Mod-side surfaces: {}",
+                inference
+                    .surface_intersection
+                    .mod_side_surfaces
+                    .iter()
+                    .map(|surface| surface.surface_class.label())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if !inference.surface_intersection.game_side_surfaces.is_empty() {
+            lines.push(format!(
+                "- Game-side surfaces: {}",
+                inference
+                    .surface_intersection
+                    .game_side_surfaces
+                    .iter()
+                    .map(|surface| surface.surface_class.label())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if !inference
+            .surface_intersection
+            .overlapping_surface_classes
+            .is_empty()
+        {
+            lines.push(format!(
+                "- Surface overlap: {}",
+                inference
+                    .surface_intersection
+                    .overlapping_surface_classes
+                    .iter()
+                    .map(|surface| surface.label())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        } else if !inference.surface_intersection.mod_side_surfaces.is_empty() {
+            lines.push(
+                "- Surface overlap: none observed in current compare evidence; keep mod-side signals review-only."
+                    .to_string(),
+            );
+        }
+        if inference.surface_intersection.weak_or_absent_overlap {
+            let caution = inference
+                .surface_intersection
+                .notes
+                .first()
+                .cloned()
+                .unwrap_or_else(|| {
+                    "surface overlap is weak or absent, so mod-aware prioritization stays conservative"
+                        .to_string()
+                });
+            lines.push(format!("- Surface overlap caution: {caution}"));
         }
         if !continuity_causes.is_empty()
             || !continuity_fixes.is_empty()
@@ -238,6 +311,75 @@ impl HumanSummaryRenderer {
 
         lines.join("\n")
     }
+}
+
+pub fn render_mod_dependency_baseline_summary(
+    baseline_set: &WwmiModDependencyBaselineSet,
+) -> String {
+    let mut lines = Vec::new();
+    let surfaces = baseline_set.represented_surface_labels();
+
+    lines.push("# Representative Mod Baseline Summary".to_string());
+    lines.push(String::new());
+    lines.push(format!("- Target version: `{}`", baseline_set.version_id));
+    lines.push(format!(
+        "- Included profiles/mod roots: {} / {}",
+        baseline_set.profile_count, baseline_set.review.included_mod_count
+    ));
+    lines.push(format!(
+        "- Represented dependency surface classes: {}",
+        if surfaces.is_empty() {
+            "none".to_string()
+        } else {
+            surfaces.join(", ")
+        }
+    ));
+    lines.push(format!(
+        "- Representative strength: `{:?}` | Material for repair review: {}",
+        baseline_set.review.strength,
+        yes_no(baseline_set.review.material_for_repair_review)
+    ));
+    lines.push(String::new());
+
+    lines.push("## Included Mods".to_string());
+    if baseline_set.profiles.is_empty() {
+        lines.push("- No mod profiles were included.".to_string());
+    } else {
+        for profile in &baseline_set.profiles {
+            let surface_labels = profile
+                .surface_classes()
+                .into_iter()
+                .map(|surface| surface.label().to_string())
+                .collect::<Vec<_>>();
+            lines.push(format!(
+                "- `{}` ini_files={} surfaces={}",
+                profile
+                    .mod_name
+                    .as_deref()
+                    .unwrap_or(profile.mod_root.as_str()),
+                profile.ini_file_count,
+                if surface_labels.is_empty() {
+                    "none".to_string()
+                } else {
+                    surface_labels.join(", ")
+                }
+            ));
+        }
+    }
+    lines.push(String::new());
+
+    lines.push("## Reviewer Caution".to_string());
+    for note in &baseline_set.review.caution_notes {
+        lines.push(format!("- {note}"));
+    }
+    lines.push(String::new());
+
+    lines.push("## Source Roots".to_string());
+    for root in &baseline_set.review.source_roots {
+        lines.push(format!("- `{root}`"));
+    }
+
+    lines.join("\n")
 }
 
 impl ReviewBundleRenderer {
@@ -857,9 +999,17 @@ mod tests {
             VersionReviewMapping, VersionReviewSection, VersionReviewSummary, VersionSide,
         },
         wwmi::WwmiPatternKind,
+        wwmi::dependency::{
+            WwmiModDependencyBaselineReview, WwmiModDependencyBaselineSet,
+            WwmiModDependencyBaselineStrength, WwmiModDependencyKind, WwmiModDependencyProfile,
+            WwmiModDependencySignal, WwmiModDependencySurfaceClass,
+            WwmiModDependencySurfaceClassCount,
+        },
     };
 
-    use super::{HumanSummaryRenderer, ReviewBundleRenderer};
+    use super::{
+        HumanSummaryRenderer, ReviewBundleRenderer, render_mod_dependency_baseline_summary,
+    };
 
     #[test]
     fn renderer_outputs_human_readable_sections() {
@@ -884,10 +1034,20 @@ mod tests {
             representative_mod_baseline_input: Some(InferenceRepresentativeModBaselineInput {
                 version_id: "2.4.0".to_string(),
                 profile_count: 3,
+                included_mod_count: 3,
+                represented_surface_classes: vec![
+                    WwmiModDependencySurfaceClass::BufferLayout,
+                    WwmiModDependencySurfaceClass::ResourceSkeleton,
+                ],
                 risk_class_counts: vec![InferenceRepresentativeRiskClassCount {
                     risk_class: RepresentativeModRiskClass::BufferLayoutSensitive,
                     profile_count: 2,
                 }],
+                strength: WwmiModDependencyBaselineStrength::Sparse,
+                material_for_repair_review: false,
+                caution_notes: vec![
+                    "curated representative baseline from sampled mod roots only".to_string(),
+                ],
             }),
             scope: InferenceScopeContext::default(),
             summary: InferenceSummary {
@@ -980,6 +1140,39 @@ mod tests {
                     ],
                 },
             ],
+            surface_intersection: crate::inference::InferenceSurfaceIntersection {
+                mod_side_surfaces: vec![
+                    crate::inference::InferenceModSideSurface {
+                        surface_class: WwmiModDependencySurfaceClass::BufferLayout,
+                        sources: vec!["mod_dependency_profile".to_string()],
+                        dependency_kinds: vec![WwmiModDependencyKind::BufferLayoutHint],
+                        signal_count: 2,
+                        representative_profile_count: 0,
+                    },
+                    crate::inference::InferenceModSideSurface {
+                        surface_class: WwmiModDependencySurfaceClass::ResourceSkeleton,
+                        sources: vec!["representative_mod_baseline".to_string()],
+                        dependency_kinds: vec![WwmiModDependencyKind::ResourceFileReference],
+                        signal_count: 0,
+                        representative_profile_count: 2,
+                    },
+                ],
+                game_side_surfaces: vec![
+                    crate::inference::InferenceGameSideSurface {
+                        surface_class: WwmiModDependencySurfaceClass::MappingHash,
+                        compare_signals: vec!["candidate_mapping_changes".to_string()],
+                        affected_assets: vec!["Content/Weapon/Old.weapon".to_string()],
+                    },
+                    crate::inference::InferenceGameSideSurface {
+                        surface_class: WwmiModDependencySurfaceClass::BufferLayout,
+                        compare_signals: vec!["structural_changed_assets".to_string()],
+                        affected_assets: vec!["Content/Character/Encore/Body.mesh".to_string()],
+                    },
+                ],
+                overlapping_surface_classes: vec![WwmiModDependencySurfaceClass::BufferLayout],
+                weak_or_absent_overlap: true,
+                notes: vec!["surface overlap is partial: overlap=buffer_layout while mod-side surfaces=buffer_layout, resource_skeleton".to_string()],
+            },
             representative_risk_projections: vec![RepresentativeModRiskProjection {
                 risk_class: RepresentativeModRiskClass::BufferLayoutSensitive,
                 summary:
@@ -1004,6 +1197,16 @@ mod tests {
         assert!(markdown.contains("### Likely Crash Causes"));
         assert!(markdown.contains("### Suggested Fixes"));
         assert!(markdown.contains("### Representative Mod Risk Projection"));
+        assert!(markdown.contains(
+            "Representative mod baseline set: version `2.4.0` profiles=3 mods=3 surfaces=buffer_layout, resource_skeleton strength=Sparse material_for_review=No"
+        ));
+        assert!(
+            markdown.contains("Representative baseline caution: curated representative baseline")
+        );
+        assert!(markdown.contains("Mod-side surfaces: buffer_layout, resource_skeleton"));
+        assert!(markdown.contains("Game-side surfaces: mapping_hash, buffer_layout"));
+        assert!(markdown.contains("Surface overlap: buffer_layout"));
+        assert!(markdown.contains("Surface overlap caution: surface overlap is partial"));
         assert!(markdown.contains("## Safe To Try Now"));
         assert!(markdown.contains("### Proposed Mappings"));
         assert!(markdown.contains("Hair.mesh"));
@@ -1100,6 +1303,7 @@ mod tests {
                 reasons: vec!["same_parent_directory: same folder".to_string()],
                 evidence: vec!["compare candidate confidence 0.920".to_string()],
             }],
+            surface_intersection: Default::default(),
             representative_risk_projections: Vec::new(),
         };
         let proposals: ProposalArtifacts = ProposalEngine.generate(&inference, 0.85);
@@ -1142,6 +1346,75 @@ mod tests {
                 "No mapping stays in `NeedsReview` because of broader continuity history."
             )
         );
+    }
+
+    #[test]
+    fn baseline_summary_renderer_marks_sparse_curated_baselines_as_limited() {
+        let markdown = render_mod_dependency_baseline_summary(&WwmiModDependencyBaselineSet {
+            schema_version: "whashreonator.wwmi-mod-dependency-baselines.v1".to_string(),
+            generated_at_unix_ms: 1,
+            version_id: "6.5.0".to_string(),
+            profile_count: 2,
+            profiles: vec![
+                WwmiModDependencyProfile {
+                    mod_name: Some("HashFocusedMod".to_string()),
+                    mod_root: "D:/mods/HashFocusedMod".to_string(),
+                    ini_file_count: 1,
+                    signals: vec![WwmiModDependencySignal {
+                        kind: WwmiModDependencyKind::TextureOverrideHash,
+                        value: "0xDEADBEEF".to_string(),
+                        source_file: "mod.ini".to_string(),
+                        section: Some("TextureOverrideBody".to_string()),
+                    }],
+                },
+                WwmiModDependencyProfile {
+                    mod_name: Some("ResourceOnlyMod".to_string()),
+                    mod_root: "D:/mods/ResourceOnlyMod".to_string(),
+                    ini_file_count: 1,
+                    signals: vec![WwmiModDependencySignal {
+                        kind: WwmiModDependencyKind::ResourceFileReference,
+                        value: "BodyDiffuse.dds".to_string(),
+                        source_file: "mod.ini".to_string(),
+                        section: Some("ResourceBody".to_string()),
+                    }],
+                },
+            ],
+            review: WwmiModDependencyBaselineReview {
+                source_roots: vec![
+                    "D:/mods/HashFocusedMod".to_string(),
+                    "D:/mods/ResourceOnlyMod".to_string(),
+                ],
+                included_mod_count: 2,
+                surface_class_counts: vec![
+                    WwmiModDependencySurfaceClassCount {
+                        surface_class: WwmiModDependencySurfaceClass::MappingHash,
+                        profile_count: 1,
+                    },
+                    WwmiModDependencySurfaceClassCount {
+                        surface_class: WwmiModDependencySurfaceClass::ResourceSkeleton,
+                        profile_count: 1,
+                    },
+                ],
+                strength: WwmiModDependencyBaselineStrength::Sparse,
+                material_for_repair_review: false,
+                caution_notes: vec![
+                    "sample stays sparse with only 2 included profile(s)/mod root(s)".to_string(),
+                    "baseline exists but remains too limited to materially steer repair review on its own".to_string(),
+                ],
+            },
+        });
+
+        assert!(markdown.contains("Target version: `6.5.0`"));
+        assert!(markdown.contains("Included profiles/mod roots: 2 / 2"));
+        assert!(
+            markdown.contains(
+                "Represented dependency surface classes: mapping_hash, resource_skeleton"
+            )
+        );
+        assert!(
+            markdown.contains("Representative strength: `Sparse` | Material for repair review: No")
+        );
+        assert!(markdown.contains("too limited to materially steer repair review"));
     }
 
     fn sample_review_report(with_caution: bool) -> VersionDiffReportV2 {

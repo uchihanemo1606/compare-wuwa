@@ -647,6 +647,7 @@ fn artifact_kind_label(kind: VersionArtifactKind) -> &'static str {
         VersionArtifactKind::InferenceData => "inference",
         VersionArtifactKind::ProposalData => "proposal",
         VersionArtifactKind::HumanSummary => "human_summary",
+        VersionArtifactKind::ModDependencyBaselineSummary => "mod_dependency_baseline_summary",
         VersionArtifactKind::ExtractorInventory => "extractor_inventory",
         VersionArtifactKind::BufferData => "buffer",
         VersionArtifactKind::HashData => "hash",
@@ -1382,6 +1383,7 @@ mod tests {
                 reasons: vec!["same_parent_directory: same folder".to_string()],
                 evidence: vec!["compare candidate confidence 0.900".to_string()],
             }],
+            surface_intersection: Default::default(),
             representative_risk_projections: Vec::new(),
         }
     }

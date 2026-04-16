@@ -2335,6 +2335,7 @@ mod tests {
                 reasons: vec!["strong evidence".to_string()],
                 evidence: Vec::new(),
             }],
+            surface_intersection: Default::default(),
             representative_risk_projections: Vec::new(),
         };
 
@@ -2457,6 +2458,7 @@ mod tests {
                     "structured continuity history reaches terminal state removed in 8.2.0".to_string(),
                 ],
             }],
+            surface_intersection: Default::default(),
             representative_risk_projections: Vec::new(),
         };
         let proposals = ProposalEngine.generate(&inference, 0.85);
