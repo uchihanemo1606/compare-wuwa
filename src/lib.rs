@@ -66,6 +66,54 @@ pub fn run(cli: Cli) -> AppResult<()> {
             );
             println!("wrote compare-report: {}", args.output.display());
         }
+        Command::OrchestrateVersionPair(args) => {
+            let result = pipeline::run_orchestrate_version_pair_command(&args)?;
+            println!(
+                "version-pair orchestration exported: old={} new={} changed={} added={} removed={} causes={} fixes={} mapping_hints={} proposed={} needs_review={}",
+                result.manifest.old_version_id,
+                result.manifest.new_version_id,
+                result.manifest.summary.changed_assets,
+                result.manifest.summary.added_assets,
+                result.manifest.summary.removed_assets,
+                result.manifest.summary.probable_crash_causes,
+                result.manifest.summary.suggested_fixes,
+                result.manifest.summary.candidate_mapping_hints,
+                result.manifest.summary.proposed_mappings,
+                result.manifest.summary.needs_review_mappings,
+            );
+            println!(
+                "wrote compare-report: {}",
+                result.manifest.produced_artifacts.compare_report.display()
+            );
+            println!(
+                "wrote inference-report: {}",
+                result
+                    .manifest
+                    .produced_artifacts
+                    .inference_report
+                    .display()
+            );
+            println!(
+                "wrote mapping-proposal: {}",
+                result
+                    .manifest
+                    .produced_artifacts
+                    .mapping_proposal
+                    .display()
+            );
+            println!(
+                "wrote proposal-patch-draft: {}",
+                result.manifest.produced_artifacts.patch_draft.display()
+            );
+            println!(
+                "wrote summary: {}",
+                result.manifest.produced_artifacts.human_summary.display()
+            );
+            println!(
+                "wrote manifest: {}",
+                result.manifest.produced_artifacts.manifest.display()
+            );
+        }
         Command::ScanModDependencies(args) => {
             let result = pipeline::run_scan_mod_dependencies_command(&args)?;
             let surfaces = result.baseline_set.represented_surface_labels().join(", ");

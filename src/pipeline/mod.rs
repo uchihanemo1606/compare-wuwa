@@ -1,5 +1,9 @@
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
+use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use crate::wwmi::dependency::{
@@ -9,8 +13,8 @@ use crate::wwmi::dependency::{
 use crate::{
     cli::{
         CompareSnapshotsArgs, ExtractWwmiKnowledgeArgs, GenerateProposalsArgs, InferFixesArgs,
-        MapArgs, MapLocalArgs, ScanModDependenciesArgs, SnapshotArgs, SnapshotCaptureScopeArg,
-        SnapshotReportArgs,
+        MapArgs, MapLocalArgs, OrchestrateVersionPairArgs, ScanModDependenciesArgs, SnapshotArgs,
+        SnapshotCaptureScopeArg, SnapshotReportArgs,
     },
     compare::{SnapshotCompareReport, SnapshotComparer, load_snapshot_compare_report},
     config::AppConfig,
@@ -36,7 +40,7 @@ use crate::{
         VersionContinuityIndex, VersionDiffReportBuilder, VersionDiffReportV2,
         load_version_continuity_artifact,
     },
-    report_storage::ReportStorage,
+    report_storage::{ComparedVersionPair, ReportStorage},
     snapshot::{
         GameSnapshot, create_extractor_backed_snapshot_from_file,
         create_local_snapshot_with_capture_scope,
@@ -95,6 +99,99 @@ pub struct ScanModDependenciesResult {
     pub stored_baseline_set_path: Option<PathBuf>,
     pub stored_baseline_summary_path: Option<PathBuf>,
     pub stored_profile_paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct VersionPairRunSelectedBaselineManifest {
+    pub version_id: String,
+    pub path: PathBuf,
+    pub artifact_kind: String,
+    pub artifact_label: String,
+    pub evidence_posture: String,
+    pub inventory_alignment: String,
+    pub selection_reason: String,
+    pub low_signal_for_character_analysis: bool,
+    pub readiness_reasons: Vec<String>,
+    pub scope_note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct VersionPairRunReadinessSideManifest {
+    pub version_id: String,
+    pub baseline_evidence_posture: String,
+    pub low_signal_for_character_analysis: bool,
+    pub missing_or_weak_signals: Vec<String>,
+    pub scope_note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct VersionPairRunReadinessManifest {
+    pub compare_low_signal: bool,
+    pub scope_narrowing_detected: bool,
+    pub scope_induced_removals_likely: bool,
+    pub reasons: Vec<String>,
+    pub downstream_guardrails: Vec<String>,
+    pub old_snapshot: VersionPairRunReadinessSideManifest,
+    pub new_snapshot: VersionPairRunReadinessSideManifest,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VersionPairRunProducedArtifactsManifest {
+    pub run_directory: PathBuf,
+    pub compare_report: PathBuf,
+    pub inference_report: PathBuf,
+    pub mapping_proposal: PathBuf,
+    pub patch_draft: PathBuf,
+    pub human_summary: PathBuf,
+    pub manifest: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VersionPairRunSummaryManifest {
+    pub changed_assets: usize,
+    pub added_assets: usize,
+    pub removed_assets: usize,
+    pub candidate_mapping_changes: usize,
+    pub probable_crash_causes: usize,
+    pub suggested_fixes: usize,
+    pub candidate_mapping_hints: usize,
+    pub proposed_mappings: usize,
+    pub needs_review_mappings: usize,
+    pub suggested_fix_actions: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VersionPairRunManifest {
+    pub schema_version: String,
+    pub generated_at_unix_ms: u128,
+    pub old_version_id: String,
+    pub new_version_id: String,
+    pub report_root: PathBuf,
+    pub selected_old_baseline: VersionPairRunSelectedBaselineManifest,
+    pub selected_new_baseline: VersionPairRunSelectedBaselineManifest,
+    #[serde(default)]
+    pub readiness: VersionPairRunReadinessManifest,
+    pub produced_artifacts: VersionPairRunProducedArtifactsManifest,
+    pub summary: VersionPairRunSummaryManifest,
+}
+
+#[derive(Debug, Clone)]
+pub struct VersionPairRunResult {
+    pub manifest: VersionPairRunManifest,
+}
+
+#[derive(Debug, Clone)]
+struct VersionPairRunOutputPaths {
+    run_directory: PathBuf,
+    compare_output: PathBuf,
+    inference_output: PathBuf,
+    mapping_output: PathBuf,
+    patch_draft_output: PathBuf,
+    summary_output: PathBuf,
+    manifest_output: PathBuf,
 }
 
 impl SourceMapOutputs {
@@ -326,6 +423,60 @@ pub fn run_compare_snapshots_command(
     );
 
     Ok(report)
+}
+
+pub fn run_orchestrate_version_pair_command(
+    args: &OrchestrateVersionPairArgs,
+) -> AppResult<VersionPairRunResult> {
+    let storage = match args.report_root.as_ref() {
+        Some(root) => ReportStorage::new(root.clone()),
+        None => ReportStorage::default(),
+    };
+    let outputs = resolve_version_pair_run_output_paths(args)?;
+    let compared = storage
+        .compare_versions_with_selected_baselines(&args.old_version_id, &args.new_version_id)?;
+    export_snapshot_compare_output(&compared.compare, &outputs.compare_output)?;
+    info!(
+        output = %outputs.compare_output.display(),
+        old_version = %compared.compare.old_snapshot.version_id,
+        new_version = %compared.compare.new_snapshot.version_id,
+        changed = compared.compare.summary.changed_assets,
+        added = compared.compare.summary.added_assets,
+        removed = compared.compare.summary.removed_assets,
+        "version-pair compare output exported"
+    );
+
+    let inference = run_infer_fixes_command(&InferFixesArgs {
+        compare_report: outputs.compare_output.clone(),
+        wwmi_knowledge: args.wwmi_knowledge.clone(),
+        continuity_artifact: None,
+        report_root: Some(storage.reports_root()),
+        mod_root: None,
+        mod_dependency_profile: None,
+        representative_mod_baseline_set: None,
+        output: outputs.inference_output.clone(),
+    })?;
+    let proposals = run_generate_proposals_command(&GenerateProposalsArgs {
+        inference_report: outputs.inference_output.clone(),
+        mapping_output: Some(outputs.mapping_output.clone()),
+        patch_draft_output: Some(outputs.patch_draft_output.clone()),
+        summary_output: Some(outputs.summary_output.clone()),
+        min_confidence: args.min_confidence,
+    })?;
+    let manifest =
+        build_version_pair_run_manifest(&storage, &compared, &inference, &proposals, &outputs)?;
+    export_text_output(
+        &serde_json::to_string_pretty(&manifest)?,
+        &outputs.manifest_output,
+    )?;
+    info!(
+        output = %outputs.manifest_output.display(),
+        old_version = %manifest.old_version_id,
+        new_version = %manifest.new_version_id,
+        "version-pair run manifest exported"
+    );
+
+    Ok(VersionPairRunResult { manifest })
 }
 
 pub fn run_scan_mod_dependencies_command(
@@ -692,4 +843,289 @@ fn summarize(decisions: &[MatchDecision]) -> PipelineSummary {
         needs_review,
         rejected,
     }
+}
+
+fn resolve_version_pair_run_output_paths(
+    args: &OrchestrateVersionPairArgs,
+) -> AppResult<VersionPairRunOutputPaths> {
+    let run_directory = args.output_dir.clone();
+    let compare_output = resolve_run_output_path(
+        &run_directory,
+        args.compare_output.as_deref(),
+        "compare.v1.json",
+    )?;
+    let inference_output = resolve_run_output_path(
+        &run_directory,
+        args.inference_output.as_deref(),
+        "inference.v1.json",
+    )?;
+    let mapping_output = resolve_run_output_path(
+        &run_directory,
+        args.mapping_output.as_deref(),
+        "mapping-proposal.v1.json",
+    )?;
+    let patch_draft_output = resolve_run_output_path(
+        &run_directory,
+        args.patch_draft_output.as_deref(),
+        "proposal-patch-draft.v1.json",
+    )?;
+    let summary_output = resolve_run_output_path(
+        &run_directory,
+        args.summary_output.as_deref(),
+        "human-summary.md",
+    )?;
+    let manifest_output = resolve_run_output_path(
+        &run_directory,
+        args.manifest_output.as_deref(),
+        "run-manifest.v1.json",
+    )?;
+
+    Ok(VersionPairRunOutputPaths {
+        run_directory,
+        compare_output,
+        inference_output,
+        mapping_output,
+        patch_draft_output,
+        summary_output,
+        manifest_output,
+    })
+}
+
+fn resolve_run_output_path(
+    run_directory: &Path,
+    explicit: Option<&Path>,
+    default_file_name: &str,
+) -> AppResult<PathBuf> {
+    let path = explicit
+        .map(PathBuf::from)
+        .unwrap_or_else(|| run_directory.join(default_file_name));
+    let parent = path.parent().ok_or_else(|| {
+        AppError::InvalidInput(format!(
+            "version-pair orchestration output {} must have a parent directory",
+            path.display()
+        ))
+    })?;
+    if normalize_path(parent)? != normalize_path(run_directory)? {
+        return Err(AppError::InvalidInput(format!(
+            "version-pair orchestration output {} must stay under run directory {}",
+            path.display(),
+            run_directory.display()
+        )));
+    }
+    Ok(path)
+}
+
+fn normalize_path(path: &Path) -> AppResult<PathBuf> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+
+    Ok(std::env::current_dir()?.join(path))
+}
+
+fn build_version_pair_run_manifest(
+    storage: &ReportStorage,
+    compared: &ComparedVersionPair,
+    inference: &InferenceReport,
+    proposals: &ProposalResult,
+    outputs: &VersionPairRunOutputPaths,
+) -> AppResult<VersionPairRunManifest> {
+    Ok(VersionPairRunManifest {
+        schema_version: "whashreonator.version-pair-run.v1".to_string(),
+        generated_at_unix_ms: current_unix_ms()?,
+        old_version_id: compared.old_baseline.version_id.clone(),
+        new_version_id: compared.new_baseline.version_id.clone(),
+        report_root: storage.reports_root(),
+        selected_old_baseline: baseline_manifest_entry(&compared.old_baseline),
+        selected_new_baseline: baseline_manifest_entry(&compared.new_baseline),
+        readiness: build_version_pair_readiness_manifest(compared, inference, proposals),
+        produced_artifacts: VersionPairRunProducedArtifactsManifest {
+            run_directory: outputs.run_directory.clone(),
+            compare_report: outputs.compare_output.clone(),
+            inference_report: outputs.inference_output.clone(),
+            mapping_proposal: outputs.mapping_output.clone(),
+            patch_draft: outputs.patch_draft_output.clone(),
+            human_summary: outputs.summary_output.clone(),
+            manifest: outputs.manifest_output.clone(),
+        },
+        summary: VersionPairRunSummaryManifest {
+            changed_assets: compared.compare.summary.changed_assets,
+            added_assets: compared.compare.summary.added_assets,
+            removed_assets: compared.compare.summary.removed_assets,
+            candidate_mapping_changes: compared.compare.summary.candidate_mapping_changes,
+            probable_crash_causes: inference.summary.probable_crash_causes,
+            suggested_fixes: inference.summary.suggested_fixes,
+            candidate_mapping_hints: inference.summary.candidate_mapping_hints,
+            proposed_mappings: proposals
+                .artifacts
+                .mapping_proposal
+                .summary
+                .proposed_mappings,
+            needs_review_mappings: proposals
+                .artifacts
+                .mapping_proposal
+                .summary
+                .needs_review_mappings,
+            suggested_fix_actions: proposals
+                .artifacts
+                .mapping_proposal
+                .summary
+                .suggested_fix_actions,
+        },
+    })
+}
+
+fn baseline_manifest_entry(
+    baseline: &crate::report_storage::SelectedSnapshotBaseline,
+) -> VersionPairRunSelectedBaselineManifest {
+    let scope = crate::snapshot::assess_snapshot_scope(&baseline.snapshot);
+    let quality = crate::snapshot::summarize_snapshot_capture_quality(&baseline.snapshot);
+
+    VersionPairRunSelectedBaselineManifest {
+        version_id: baseline.version_id.clone(),
+        path: baseline.path.clone(),
+        artifact_kind: format!("{:?}", baseline.artifact_kind),
+        artifact_label: baseline.artifact_label.clone(),
+        evidence_posture: baseline.evidence_posture.clone(),
+        inventory_alignment: baseline.inventory_alignment.clone(),
+        selection_reason: baseline.selection_reason.clone(),
+        low_signal_for_character_analysis: scope.is_low_signal_for_character_analysis(),
+        readiness_reasons: build_snapshot_readiness_reasons(&scope, &quality),
+        scope_note: scope.note,
+    }
+}
+
+fn build_version_pair_readiness_manifest(
+    compared: &ComparedVersionPair,
+    inference: &InferenceReport,
+    proposals: &ProposalResult,
+) -> VersionPairRunReadinessManifest {
+    let old_scope = crate::snapshot::assess_snapshot_scope(&compared.old_baseline.snapshot);
+    let new_scope = crate::snapshot::assess_snapshot_scope(&compared.new_baseline.snapshot);
+    let old_quality =
+        crate::snapshot::summarize_snapshot_capture_quality(&compared.old_baseline.snapshot);
+    let new_quality =
+        crate::snapshot::summarize_snapshot_capture_quality(&compared.new_baseline.snapshot);
+    let old_reasons = build_snapshot_readiness_reasons(&old_scope, &old_quality);
+    let new_reasons = build_snapshot_readiness_reasons(&new_scope, &new_quality);
+
+    let mut reasons = Vec::new();
+    if compared.compare.scope.low_signal_compare {
+        reasons.push(
+            "compare readiness is low-signal because one or both selected baselines remain shallow, sparse, or only weakly enriched for character/content analysis"
+                .to_string(),
+        );
+    }
+    reasons.extend(old_reasons.iter().map(|reason| {
+        format!(
+            "old snapshot {} readiness: {reason}",
+            compared.old_baseline.version_id
+        )
+    }));
+    reasons.extend(new_reasons.iter().map(|reason| {
+        format!(
+            "new snapshot {} readiness: {reason}",
+            compared.new_baseline.version_id
+        )
+    }));
+    if compared.compare.scope.scope_narrowing_detected {
+        reasons.push(
+            "snapshot scope narrowing was detected across the selected version pair, so missing paths may reflect capture scope rather than real removal"
+                .to_string(),
+        );
+    }
+    if compared.compare.scope.scope_induced_removals_likely {
+        reasons.push(
+            "removed-only deltas include scope-induced risk, so removal-heavy interpretation should stay audit-first"
+                .to_string(),
+        );
+    }
+    reasons.extend(compared.compare.scope.notes.iter().cloned());
+
+    let mut downstream_guardrails = Vec::new();
+    if inference.scope.low_signal_compare {
+        downstream_guardrails.push(
+            "inference remains conservative under low-signal compare scope and does not treat shallow evidence as strong semantic certainty"
+                .to_string(),
+        );
+        downstream_guardrails.push(
+            "proposal generation keeps low-signal mapping candidates review-first unless strong-evidence checks still pass"
+                .to_string(),
+        );
+    }
+    if compared.compare.scope.scope_induced_removals_likely {
+        downstream_guardrails.push(
+            "scope-induced removals were kept out of crash-cause promotion until reviewer validation confirms true version drift"
+                .to_string(),
+        );
+    }
+    if inference
+        .representative_mod_baseline_input
+        .as_ref()
+        .is_some_and(|baseline| !baseline.material_for_repair_review)
+    {
+        downstream_guardrails.push(
+            "representative mod baseline support stays review-only because the sampled baseline set is limited"
+                .to_string(),
+        );
+    }
+    if inference.scope.low_signal_compare
+        && proposals
+            .artifacts
+            .mapping_proposal
+            .summary
+            .proposed_mappings
+            == 0
+        && proposals
+            .artifacts
+            .mapping_proposal
+            .summary
+            .needs_review_mappings
+            > 0
+    {
+        downstream_guardrails.push(
+            "all current mapping outputs stayed in NeedsReview, which is expected while readiness remains low-signal"
+                .to_string(),
+        );
+    }
+
+    VersionPairRunReadinessManifest {
+        compare_low_signal: compared.compare.scope.low_signal_compare,
+        scope_narrowing_detected: compared.compare.scope.scope_narrowing_detected,
+        scope_induced_removals_likely: compared.compare.scope.scope_induced_removals_likely,
+        reasons,
+        downstream_guardrails,
+        old_snapshot: VersionPairRunReadinessSideManifest {
+            version_id: compared.old_baseline.version_id.clone(),
+            baseline_evidence_posture: compared.old_baseline.evidence_posture.clone(),
+            low_signal_for_character_analysis: old_scope.is_low_signal_for_character_analysis(),
+            missing_or_weak_signals: old_reasons,
+            scope_note: old_scope.note,
+        },
+        new_snapshot: VersionPairRunReadinessSideManifest {
+            version_id: compared.new_baseline.version_id.clone(),
+            baseline_evidence_posture: compared.new_baseline.evidence_posture.clone(),
+            low_signal_for_character_analysis: new_scope.is_low_signal_for_character_analysis(),
+            missing_or_weak_signals: new_reasons,
+            scope_note: new_scope.note,
+        },
+    }
+}
+
+fn build_snapshot_readiness_reasons(
+    scope: &crate::snapshot::SnapshotScopeAssessment,
+    quality: &crate::snapshot::SnapshotCaptureQualitySummary,
+) -> Vec<String> {
+    let mut reasons = quality.low_signal_reasons(scope);
+    if let Some(reason) = quality.extractor_alignment_reason() {
+        reasons.push(reason.to_string());
+    }
+    reasons
+}
+
+fn current_unix_ms() -> AppResult<u128> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| AppError::InvalidInput(format!("system clock error: {error}")))?
+        .as_millis())
 }

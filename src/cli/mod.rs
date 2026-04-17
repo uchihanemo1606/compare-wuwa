@@ -22,6 +22,7 @@ pub enum Command {
     Snapshot(SnapshotArgs),
     SnapshotReport(SnapshotReportArgs),
     CompareSnapshots(CompareSnapshotsArgs),
+    OrchestrateVersionPair(OrchestrateVersionPairArgs),
     ScanModDependencies(ScanModDependenciesArgs),
     ExtractWwmiKnowledge(ExtractWwmiKnowledgeArgs),
     InferFixes(InferFixesArgs),
@@ -103,6 +104,34 @@ pub struct CompareSnapshotsArgs {
     pub new_snapshot: PathBuf,
     #[arg(long)]
     pub output: PathBuf,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct OrchestrateVersionPairArgs {
+    #[arg(long)]
+    pub old_version_id: String,
+    #[arg(long)]
+    pub new_version_id: String,
+    #[arg(long)]
+    pub wwmi_knowledge: PathBuf,
+    #[arg(long)]
+    pub output_dir: PathBuf,
+    #[arg(long)]
+    pub report_root: Option<PathBuf>,
+    #[arg(long)]
+    pub compare_output: Option<PathBuf>,
+    #[arg(long)]
+    pub inference_output: Option<PathBuf>,
+    #[arg(long)]
+    pub mapping_output: Option<PathBuf>,
+    #[arg(long)]
+    pub patch_draft_output: Option<PathBuf>,
+    #[arg(long)]
+    pub summary_output: Option<PathBuf>,
+    #[arg(long)]
+    pub manifest_output: Option<PathBuf>,
+    #[arg(long, default_value_t = 0.85)]
+    pub min_confidence: f32,
 }
 
 #[derive(Debug, Clone, Args)]

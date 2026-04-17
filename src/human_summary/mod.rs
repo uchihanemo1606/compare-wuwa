@@ -89,6 +89,23 @@ impl HumanSummaryRenderer {
             proposals.mapping_proposal.summary.needs_review_mappings,
             proposals.mapping_proposal.summary.total_mapping_candidates
         ));
+        if inference.scope.low_signal_compare {
+            lines.push(
+                "- Readiness: low-signal compare scope; keep crash/fix/remap interpretation conservative and review-first."
+                    .to_string(),
+            );
+            for reason in low_signal_scope_notes(&inference.scope.notes)
+                .into_iter()
+                .take(3)
+            {
+                lines.push(format!("- Low-signal reason: {reason}"));
+            }
+        } else {
+            lines.push(
+                "- Readiness: compare scope is not flagged low-signal by the current snapshot evidence."
+                    .to_string(),
+            );
+        }
         if let Some(mod_dependency) = inference.mod_dependency_input.as_ref() {
             lines.push(format!(
                 "- Mod dependency profile: `{}` ini_files={} signals={} kinds={}",
@@ -610,6 +627,20 @@ fn render_mapping(entry: &MappingProposalEntry) -> Vec<String> {
         lines.push(format!("  Mod evidence: {evidence}"));
     }
     lines
+}
+
+fn low_signal_scope_notes(notes: &[String]) -> Vec<String> {
+    notes
+        .iter()
+        .filter(|note| {
+            note.contains("low-signal")
+                || note.contains("shallow")
+                || note.contains("scope-induced")
+                || note.contains("install/package-level")
+                || note.contains("manifest/hash coverage")
+        })
+        .cloned()
+        .collect()
 }
 
 fn render_representative_projection(projection: &RepresentativeModRiskProjection) -> Vec<String> {

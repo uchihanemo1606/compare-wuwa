@@ -100,6 +100,14 @@ pub struct SelectedSnapshotBaseline {
 }
 
 #[derive(Debug, Clone)]
+pub struct ComparedVersionPair {
+    pub old_baseline: SelectedSnapshotBaseline,
+    pub new_baseline: SelectedSnapshotBaseline,
+    pub compare: SnapshotCompareReport,
+    pub report: VersionDiffReportV2,
+}
+
+#[derive(Debug, Clone)]
 pub struct VersionLayoutPaths {
     pub version_dir: PathBuf,
     pub snapshot_dir: PathBuf,
@@ -972,6 +980,16 @@ impl ReportStorage {
         old_version: &str,
         new_version: &str,
     ) -> AppResult<VersionDiffReportV2> {
+        Ok(self
+            .compare_versions_with_selected_baselines(old_version, new_version)?
+            .report)
+    }
+
+    pub fn compare_versions_with_selected_baselines(
+        &self,
+        old_version: &str,
+        new_version: &str,
+    ) -> AppResult<ComparedVersionPair> {
         let old_baseline = self
             .select_snapshot_baseline_for_version(old_version)?
             .ok_or_else(|| {
@@ -1005,7 +1023,12 @@ impl ReportStorage {
             new_baseline.artifact_kind,
             new_baseline.selection_reason
         ));
-        Ok(report)
+        Ok(ComparedVersionPair {
+            old_baseline,
+            new_baseline,
+            compare,
+            report,
+        })
     }
 
     pub fn list_reports(&self) -> AppResult<Vec<ReportListEntry>> {
