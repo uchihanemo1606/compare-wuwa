@@ -1079,6 +1079,270 @@ fn infer_fixes_command_does_not_promote_scope_induced_removals_into_crash_causes
     let _ = fs::remove_dir_all(&test_root);
 }
 
+#[test]
+fn infer_fixes_command_does_not_create_false_mapping_hash_surface_overlap_from_scope_induced_removals()
+ {
+    let test_root = unique_test_dir();
+    let compare_path = test_root.join("compare-scope-induced-overlap.json");
+    let knowledge_path = test_root.join("knowledge.json");
+    let output_path = test_root
+        .join("out")
+        .join("inference-scope-induced-overlap.json");
+    let mod_root = test_root.join("mods").join("HashFocusedMod");
+
+    let mut compare = sample_compare_report();
+    compare.new_snapshot.version_id = "2.4.0".to_string();
+    compare.new_snapshot.asset_count = 0;
+    compare.summary.total_new_assets = 0;
+    compare.summary.added_assets = 0;
+    compare.summary.removed_assets = 1;
+    compare.summary.changed_assets = 0;
+    compare.summary.candidate_mapping_changes = 0;
+    compare.added_assets.clear();
+    compare.changed_assets.clear();
+    compare.candidate_mapping_changes.clear();
+    compare.scope.low_signal_compare = true;
+    compare.scope.old_snapshot.capture_mode = Some("local_filesystem_inventory".to_string());
+    compare.scope.new_snapshot.capture_mode =
+        Some("local_filesystem_inventory_character_focused".to_string());
+    compare.scope.old_snapshot.low_signal_for_character_analysis = true;
+    compare.scope.new_snapshot.low_signal_for_character_analysis = true;
+    compare.scope.scope_narrowing_detected = true;
+    compare.scope.scope_induced_removals_likely = true;
+    compare.scope.notes.push(
+        "scope-induced removal caution: new snapshot capture mode 'local_filesystem_inventory_character_focused' is narrower than old 'local_filesystem_inventory'; 1 removed assets likely reflect scope filtering rather than true game-version drift, and the narrower scope yielded 0 visible assets"
+            .to_string(),
+    );
+
+    fs::create_dir_all(&test_root).expect("create test root");
+    fs::write(
+        &compare_path,
+        serde_json::to_string_pretty(&compare).expect("serialize compare"),
+    )
+    .expect("write compare report");
+    fs::write(
+        &knowledge_path,
+        serde_json::to_string_pretty(&sample_knowledge()).expect("serialize knowledge"),
+    )
+    .expect("write knowledge report");
+    write_mod_ini(
+        &mod_root,
+        "mod.ini",
+        r#"
+[TextureOverrideSword]
+hash = 0xDEADBEEF
+"#,
+    );
+
+    let report = run_infer_fixes_command(&InferFixesArgs {
+        compare_report: compare_path,
+        wwmi_knowledge: knowledge_path,
+        continuity_artifact: None,
+        report_root: None,
+        mod_root: Some(mod_root),
+        mod_dependency_profile: None,
+        representative_mod_baseline_set: None,
+        output: output_path,
+    })
+    .expect("run scope-induced overlap inference");
+
+    assert!(
+        report
+            .surface_intersection
+            .game_side_surfaces
+            .iter()
+            .all(|surface| surface.surface_class != WwmiModDependencySurfaceClass::MappingHash)
+    );
+    assert!(
+        report
+            .surface_intersection
+            .overlapping_surface_classes
+            .is_empty()
+    );
+    assert_eq!(
+        report.surface_intersection.overlap_posture,
+        whashreonator::inference::InferenceSurfaceOverlapPosture::None
+    );
+    assert!(report.surface_intersection.weak_or_absent_overlap);
+
+    let _ = fs::remove_dir_all(&test_root);
+}
+
+#[test]
+fn infer_fixes_command_does_not_project_mapping_hash_risk_from_scope_induced_removals() {
+    let test_root = unique_test_dir();
+    let compare_path = test_root.join("compare-scope-induced-representative.json");
+    let knowledge_path = test_root.join("knowledge.json");
+    let baseline_path = test_root.join("representative-baseline.json");
+    let output_path = test_root
+        .join("out")
+        .join("inference-scope-induced-representative.json");
+
+    let mut compare = sample_compare_report();
+    compare.new_snapshot.version_id = "2.4.0".to_string();
+    compare.new_snapshot.asset_count = 0;
+    compare.summary.total_new_assets = 0;
+    compare.summary.added_assets = 0;
+    compare.summary.removed_assets = 1;
+    compare.summary.changed_assets = 0;
+    compare.summary.candidate_mapping_changes = 0;
+    compare.added_assets.clear();
+    compare.changed_assets.clear();
+    compare.candidate_mapping_changes.clear();
+    compare.scope.low_signal_compare = true;
+    compare.scope.old_snapshot.capture_mode = Some("local_filesystem_inventory".to_string());
+    compare.scope.new_snapshot.capture_mode =
+        Some("local_filesystem_inventory_character_focused".to_string());
+    compare.scope.old_snapshot.low_signal_for_character_analysis = true;
+    compare.scope.new_snapshot.low_signal_for_character_analysis = true;
+    compare.scope.scope_narrowing_detected = true;
+    compare.scope.scope_induced_removals_likely = true;
+    compare.scope.notes.push(
+        "scope-induced removal caution: new snapshot capture mode 'local_filesystem_inventory_character_focused' is narrower than old 'local_filesystem_inventory'; 1 removed assets likely reflect scope filtering rather than true game-version drift, and the narrower scope yielded 0 visible assets"
+            .to_string(),
+    );
+
+    fs::create_dir_all(&test_root).expect("create test root");
+    fs::write(
+        &compare_path,
+        serde_json::to_string_pretty(&compare).expect("serialize compare"),
+    )
+    .expect("write compare report");
+    fs::write(
+        &knowledge_path,
+        serde_json::to_string_pretty(&sample_knowledge()).expect("serialize knowledge"),
+    )
+    .expect("write knowledge report");
+    fs::write(
+        &baseline_path,
+        serde_json::to_string_pretty(&sample_representative_baseline_set("2.4.0"))
+            .expect("serialize baseline set"),
+    )
+    .expect("write representative baseline set");
+
+    let report = run_infer_fixes_command(&InferFixesArgs {
+        compare_report: compare_path,
+        wwmi_knowledge: knowledge_path,
+        continuity_artifact: None,
+        report_root: None,
+        mod_root: None,
+        mod_dependency_profile: None,
+        representative_mod_baseline_set: Some(baseline_path),
+        output: output_path,
+    })
+    .expect("run scope-induced representative inference");
+
+    assert!(
+        report
+            .representative_risk_projections
+            .iter()
+            .all(|projection| {
+                projection.risk_class
+                    != whashreonator::inference::RepresentativeModRiskClass::MappingHashSensitive
+            })
+    );
+
+    let _ = fs::remove_dir_all(&test_root);
+}
+
+#[test]
+fn infer_fixes_command_keeps_mapping_hash_projection_for_non_scope_induced_removals() {
+    let test_root = unique_test_dir();
+    let compare_path = test_root.join("compare-non-scope-induced-removal.json");
+    let knowledge_path = test_root.join("knowledge.json");
+    let baseline_path = test_root.join("representative-baseline.json");
+    let output_path = test_root
+        .join("out")
+        .join("inference-non-scope-induced-removal.json");
+    let mod_root = test_root.join("mods").join("HashFocusedMod");
+
+    let mut compare = sample_compare_report();
+    compare.new_snapshot.version_id = "2.4.0".to_string();
+    compare.summary.total_new_assets = 1;
+    compare.summary.added_assets = 0;
+    compare.summary.removed_assets = 1;
+    compare.summary.changed_assets = 0;
+    compare.summary.candidate_mapping_changes = 0;
+    compare.added_assets.clear();
+    compare.changed_assets.clear();
+    compare.candidate_mapping_changes.clear();
+    compare.scope.low_signal_compare = false;
+    compare.scope.scope_narrowing_detected = false;
+    compare.scope.scope_induced_removals_likely = false;
+
+    fs::create_dir_all(&test_root).expect("create test root");
+    fs::write(
+        &compare_path,
+        serde_json::to_string_pretty(&compare).expect("serialize compare"),
+    )
+    .expect("write compare report");
+    fs::write(
+        &knowledge_path,
+        serde_json::to_string_pretty(&sample_knowledge()).expect("serialize knowledge"),
+    )
+    .expect("write knowledge report");
+    fs::write(
+        &baseline_path,
+        serde_json::to_string_pretty(&sample_representative_baseline_set("2.4.0"))
+            .expect("serialize baseline set"),
+    )
+    .expect("write representative baseline set");
+    write_mod_ini(
+        &mod_root,
+        "mod.ini",
+        r#"
+[TextureOverrideSword]
+hash = 0xDEADBEEF
+"#,
+    );
+
+    let report = run_infer_fixes_command(&InferFixesArgs {
+        compare_report: compare_path,
+        wwmi_knowledge: knowledge_path,
+        continuity_artifact: None,
+        report_root: None,
+        mod_root: Some(mod_root),
+        mod_dependency_profile: None,
+        representative_mod_baseline_set: Some(baseline_path),
+        output: output_path,
+    })
+    .expect("run non-scope-induced removal inference");
+
+    let mapping_surface = report
+        .surface_intersection
+        .game_side_surfaces
+        .iter()
+        .find(|surface| surface.surface_class == WwmiModDependencySurfaceClass::MappingHash)
+        .expect("mapping-hash game-side surface");
+    let projection = report
+        .representative_risk_projections
+        .iter()
+        .find(|projection| {
+            projection.risk_class
+                == whashreonator::inference::RepresentativeModRiskClass::MappingHashSensitive
+        })
+        .expect("mapping-hash representative projection");
+
+    assert_eq!(
+        report.surface_intersection.overlapping_surface_classes,
+        vec![WwmiModDependencySurfaceClass::MappingHash]
+    );
+    assert!(
+        mapping_surface
+            .compare_signals
+            .iter()
+            .any(|signal| signal == "removed_assets")
+    );
+    assert!(
+        projection
+            .triggering_compare_signals
+            .iter()
+            .any(|signal| signal == "removed_assets")
+    );
+
+    let _ = fs::remove_dir_all(&test_root);
+}
+
 fn sample_compare_report() -> SnapshotCompareReport {
     SnapshotCompareReport {
         schema_version: "whashreonator.snapshot-compare.v1".to_string(),

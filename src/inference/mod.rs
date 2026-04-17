@@ -2305,7 +2305,9 @@ fn build_representative_projection(
 
 fn mapping_hash_projection_signals(compare_report: &SnapshotCompareReport) -> Vec<String> {
     let mut signals = Vec::new();
-    if !compare_report.removed_assets.is_empty() {
+    if !compare_report.scope.scope_induced_removals_likely
+        && !compare_report.removed_assets.is_empty()
+    {
         signals.push("removed_assets".to_string());
     }
     if !compare_report.candidate_mapping_changes.is_empty() {
