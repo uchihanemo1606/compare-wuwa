@@ -13,8 +13,8 @@ use crate::wwmi::dependency::{
 use crate::{
     cli::{
         CompareSnapshotsArgs, ExtractWwmiKnowledgeArgs, GenerateProposalsArgs, InferFixesArgs,
-        MapArgs, MapLocalArgs, OrchestrateVersionPairArgs, ScanModDependenciesArgs, SnapshotArgs,
-        SnapshotCaptureScopeArg, SnapshotReportArgs,
+        MapArgs, MapLocalArgs, OrchestrateVersionPairArgs, QualityGateModeArg,
+        ScanModDependenciesArgs, SnapshotArgs, SnapshotCaptureScopeArg, SnapshotReportArgs,
     },
     compare::{SnapshotCompareReport, SnapshotComparer, load_snapshot_compare_report},
     config::AppConfig,
@@ -174,8 +174,34 @@ pub struct VersionPairRunManifest {
     pub selected_new_baseline: VersionPairRunSelectedBaselineManifest,
     #[serde(default)]
     pub readiness: VersionPairRunReadinessManifest,
+    #[serde(default)]
+    pub quality_gate: VersionPairRunQualityGateManifest,
     pub produced_artifacts: VersionPairRunProducedArtifactsManifest,
     pub summary: VersionPairRunSummaryManifest,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct VersionPairRunQualityGateSignalsManifest {
+    pub compare_low_signal: bool,
+    pub scope_narrowing_detected: bool,
+    pub scope_induced_removals_likely: bool,
+    pub old_baseline_evidence_posture: String,
+    pub old_baseline_inventory_alignment: String,
+    pub old_baseline_low_signal_for_character_analysis: bool,
+    pub new_baseline_evidence_posture: String,
+    pub new_baseline_inventory_alignment: String,
+    pub new_baseline_low_signal_for_character_analysis: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct VersionPairRunQualityGateManifest {
+    pub mode: String,
+    pub status: String,
+    pub passed: bool,
+    pub reasons: Vec<String>,
+    pub key_signals: VersionPairRunQualityGateSignalsManifest,
 }
 
 #[derive(Debug, Clone)]
@@ -446,6 +472,36 @@ pub fn run_orchestrate_version_pair_command(
         "version-pair compare output exported"
     );
 
+    let quality_gate = build_version_pair_quality_gate_manifest(&compared, args.quality_gate_mode);
+    if args.quality_gate_mode == QualityGateModeArg::Enforce && !quality_gate.passed {
+        let manifest = build_version_pair_run_manifest(
+            &storage,
+            &compared,
+            None,
+            None,
+            &outputs,
+            quality_gate,
+        )?;
+        export_text_output(
+            &serde_json::to_string_pretty(&manifest)?,
+            &outputs.manifest_output,
+        )?;
+        info!(
+            output = %outputs.manifest_output.display(),
+            old_version = %manifest.old_version_id,
+            new_version = %manifest.new_version_id,
+            "version-pair run manifest exported"
+        );
+
+        return Err(AppError::InvalidInput(format!(
+            "quality gate blocked orchestrate-version-pair for {} -> {}; status={} manifest={}",
+            manifest.old_version_id,
+            manifest.new_version_id,
+            manifest.quality_gate.status,
+            outputs.manifest_output.display()
+        )));
+    }
+
     let inference = run_infer_fixes_command(&InferFixesArgs {
         compare_report: outputs.compare_output.clone(),
         wwmi_knowledge: args.wwmi_knowledge.clone(),
@@ -463,8 +519,14 @@ pub fn run_orchestrate_version_pair_command(
         summary_output: Some(outputs.summary_output.clone()),
         min_confidence: args.min_confidence,
     })?;
-    let manifest =
-        build_version_pair_run_manifest(&storage, &compared, &inference, &proposals, &outputs)?;
+    let manifest = build_version_pair_run_manifest(
+        &storage,
+        &compared,
+        Some(&inference),
+        Some(&proposals),
+        &outputs,
+        quality_gate,
+    )?;
     export_text_output(
         &serde_json::to_string_pretty(&manifest)?,
         &outputs.manifest_output,
@@ -926,10 +988,17 @@ fn normalize_path(path: &Path) -> AppResult<PathBuf> {
 fn build_version_pair_run_manifest(
     storage: &ReportStorage,
     compared: &ComparedVersionPair,
-    inference: &InferenceReport,
-    proposals: &ProposalResult,
+    inference: Option<&InferenceReport>,
+    proposals: Option<&ProposalResult>,
     outputs: &VersionPairRunOutputPaths,
+    quality_gate: VersionPairRunQualityGateManifest,
 ) -> AppResult<VersionPairRunManifest> {
+    let readiness = match (inference, proposals) {
+        (Some(inference), Some(proposals)) => {
+            build_version_pair_readiness_manifest(compared, inference, proposals)
+        }
+        _ => VersionPairRunReadinessManifest::default(),
+    };
     Ok(VersionPairRunManifest {
         schema_version: "whashreonator.version-pair-run.v1".to_string(),
         generated_at_unix_ms: current_unix_ms()?,
@@ -938,7 +1007,8 @@ fn build_version_pair_run_manifest(
         report_root: storage.reports_root(),
         selected_old_baseline: baseline_manifest_entry(&compared.old_baseline),
         selected_new_baseline: baseline_manifest_entry(&compared.new_baseline),
-        readiness: build_version_pair_readiness_manifest(compared, inference, proposals),
+        readiness,
+        quality_gate,
         produced_artifacts: VersionPairRunProducedArtifactsManifest {
             run_directory: outputs.run_directory.clone(),
             compare_report: outputs.compare_output.clone(),
@@ -953,26 +1023,134 @@ fn build_version_pair_run_manifest(
             added_assets: compared.compare.summary.added_assets,
             removed_assets: compared.compare.summary.removed_assets,
             candidate_mapping_changes: compared.compare.summary.candidate_mapping_changes,
-            probable_crash_causes: inference.summary.probable_crash_causes,
-            suggested_fixes: inference.summary.suggested_fixes,
-            candidate_mapping_hints: inference.summary.candidate_mapping_hints,
+            probable_crash_causes: inference
+                .map(|report| report.summary.probable_crash_causes)
+                .unwrap_or(0),
+            suggested_fixes: inference
+                .map(|report| report.summary.suggested_fixes)
+                .unwrap_or(0),
+            candidate_mapping_hints: inference
+                .map(|report| report.summary.candidate_mapping_hints)
+                .unwrap_or(0),
             proposed_mappings: proposals
-                .artifacts
-                .mapping_proposal
-                .summary
-                .proposed_mappings,
+                .map(|result| result.artifacts.mapping_proposal.summary.proposed_mappings)
+                .unwrap_or(0),
             needs_review_mappings: proposals
-                .artifacts
-                .mapping_proposal
-                .summary
-                .needs_review_mappings,
+                .map(|result| {
+                    result
+                        .artifacts
+                        .mapping_proposal
+                        .summary
+                        .needs_review_mappings
+                })
+                .unwrap_or(0),
             suggested_fix_actions: proposals
-                .artifacts
-                .mapping_proposal
-                .summary
-                .suggested_fix_actions,
+                .map(|result| {
+                    result
+                        .artifacts
+                        .mapping_proposal
+                        .summary
+                        .suggested_fix_actions
+                })
+                .unwrap_or(0),
         },
     })
+}
+
+fn build_version_pair_quality_gate_manifest(
+    compared: &ComparedVersionPair,
+    mode: QualityGateModeArg,
+) -> VersionPairRunQualityGateManifest {
+    let old_scope = crate::snapshot::assess_snapshot_scope(&compared.old_baseline.snapshot);
+    let new_scope = crate::snapshot::assess_snapshot_scope(&compared.new_baseline.snapshot);
+
+    let key_signals = VersionPairRunQualityGateSignalsManifest {
+        compare_low_signal: compared.compare.scope.low_signal_compare,
+        scope_narrowing_detected: compared.compare.scope.scope_narrowing_detected,
+        scope_induced_removals_likely: compared.compare.scope.scope_induced_removals_likely,
+        old_baseline_evidence_posture: compared.old_baseline.evidence_posture.clone(),
+        old_baseline_inventory_alignment: compared.old_baseline.inventory_alignment.clone(),
+        old_baseline_low_signal_for_character_analysis: old_scope
+            .is_low_signal_for_character_analysis(),
+        new_baseline_evidence_posture: compared.new_baseline.evidence_posture.clone(),
+        new_baseline_inventory_alignment: compared.new_baseline.inventory_alignment.clone(),
+        new_baseline_low_signal_for_character_analysis: new_scope
+            .is_low_signal_for_character_analysis(),
+    };
+
+    let mut reasons = Vec::new();
+    if key_signals.compare_low_signal {
+        reasons.push(
+            "compare scope is low-signal, so downstream repair review should stay audit-first"
+                .to_string(),
+        );
+    }
+    if key_signals.old_baseline_low_signal_for_character_analysis {
+        reasons.push(format!(
+            "selected old baseline {} remains low-signal for character/content analysis",
+            compared.old_baseline.version_id
+        ));
+    }
+    if key_signals.new_baseline_low_signal_for_character_analysis {
+        reasons.push(format!(
+            "selected new baseline {} remains low-signal for character/content analysis",
+            compared.new_baseline.version_id
+        ));
+    }
+    if key_signals.scope_narrowing_detected {
+        reasons.push(
+            "scope narrowing was detected across the selected pair, so missing paths may reflect capture scope drift"
+                .to_string(),
+        );
+    }
+    if key_signals.scope_induced_removals_likely {
+        reasons.push(
+            "scope-induced removals are likely, so removal-heavy compare results should not hard-gate repair conclusions"
+                .to_string(),
+        );
+    }
+    if compared.old_baseline.inventory_alignment != "aligned" {
+        reasons.push(format!(
+            "selected old baseline inventory alignment is {}",
+            compared.old_baseline.inventory_alignment
+        ));
+    }
+    if compared.new_baseline.inventory_alignment != "aligned" {
+        reasons.push(format!(
+            "selected new baseline inventory alignment is {}",
+            compared.new_baseline.inventory_alignment
+        ));
+    }
+
+    let block = key_signals.compare_low_signal
+        && (key_signals.scope_induced_removals_likely
+            || (key_signals.old_baseline_low_signal_for_character_analysis
+                && key_signals.new_baseline_low_signal_for_character_analysis));
+    let warn = !block
+        && (key_signals.compare_low_signal
+            || key_signals.scope_narrowing_detected
+            || key_signals.old_baseline_low_signal_for_character_analysis
+            || key_signals.new_baseline_low_signal_for_character_analysis
+            || compared.old_baseline.inventory_alignment != "aligned"
+            || compared.new_baseline.inventory_alignment != "aligned");
+    let status = if block {
+        "block"
+    } else if warn {
+        "warn"
+    } else {
+        "pass"
+    };
+
+    VersionPairRunQualityGateManifest {
+        mode: match mode {
+            QualityGateModeArg::Advisory => "advisory".to_string(),
+            QualityGateModeArg::Enforce => "enforce".to_string(),
+        },
+        status: status.to_string(),
+        passed: !block,
+        reasons,
+        key_signals,
+    }
 }
 
 fn baseline_manifest_entry(

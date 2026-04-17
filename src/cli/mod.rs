@@ -132,6 +132,14 @@ pub struct OrchestrateVersionPairArgs {
     pub manifest_output: Option<PathBuf>,
     #[arg(long, default_value_t = 0.85)]
     pub min_confidence: f32,
+    #[arg(long, value_enum, default_value_t = QualityGateModeArg::Advisory)]
+    pub quality_gate_mode: QualityGateModeArg,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum QualityGateModeArg {
+    Advisory,
+    Enforce,
 }
 
 #[derive(Debug, Clone, Args)]

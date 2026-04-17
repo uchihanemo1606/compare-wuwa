@@ -7,8 +7,9 @@ use std::{
 };
 
 use whashreonator::{
-    cli::OrchestrateVersionPairArgs,
+    cli::{OrchestrateVersionPairArgs, QualityGateModeArg},
     compare::SnapshotCompareReport,
+    error::AppError,
     inference::{InferenceReport, RepresentativeModRiskClass},
     pipeline::{VersionPairRunManifest, run_orchestrate_version_pair_command},
     proposal::MappingProposalOutput,
@@ -61,6 +62,7 @@ fn orchestrate_version_pair_command_produces_expected_artifacts_and_manifest() {
         summary_output: None,
         manifest_output: None,
         min_confidence: 0.85,
+        quality_gate_mode: QualityGateModeArg::Advisory,
     })
     .expect("run version-pair orchestration");
 
@@ -98,6 +100,10 @@ fn orchestrate_version_pair_command_produces_expected_artifacts_and_manifest() {
     assert_eq!(result.manifest, manifest);
     assert_eq!(manifest.old_version_id, "8.0.0");
     assert_eq!(manifest.new_version_id, "8.1.0");
+    assert_eq!(manifest.quality_gate.mode, "advisory");
+    assert_eq!(manifest.quality_gate.status, "block");
+    assert!(!manifest.quality_gate.passed);
+    assert!(manifest.quality_gate.key_signals.compare_low_signal);
     assert_eq!(manifest.produced_artifacts.run_directory, output_dir);
     assert_eq!(manifest.produced_artifacts.compare_report, compare_path);
     assert_eq!(manifest.produced_artifacts.inference_report, inference_path);
@@ -197,6 +203,7 @@ fn orchestrate_version_pair_command_manifest_preserves_trust_and_recency_aware_b
         summary_output: None,
         manifest_output: None,
         min_confidence: 0.85,
+        quality_gate_mode: QualityGateModeArg::Advisory,
     })
     .expect("run orchestration with richer alternate baseline");
 
@@ -272,6 +279,7 @@ fn orchestrate_version_pair_command_keeps_scope_induced_behavior_conservative_do
         summary_output: None,
         manifest_output: None,
         min_confidence: 0.85,
+        quality_gate_mode: QualityGateModeArg::Advisory,
     })
     .expect("run scope-induced orchestration");
 
@@ -352,6 +360,7 @@ fn orchestrate_version_pair_command_auto_loads_old_version_representative_baseli
         summary_output: None,
         manifest_output: None,
         min_confidence: 0.85,
+        quality_gate_mode: QualityGateModeArg::Advisory,
     })
     .expect("run representative auto-load orchestration");
 
@@ -404,6 +413,7 @@ fn orchestrate_version_pair_command_exports_readiness_diagnostics_for_low_signal
         summary_output: None,
         manifest_output: None,
         min_confidence: 0.85,
+        quality_gate_mode: QualityGateModeArg::Advisory,
     })
     .expect("run low-signal readiness orchestration");
 
@@ -449,6 +459,155 @@ fn orchestrate_version_pair_command_exports_readiness_diagnostics_for_low_signal
     assert!(summary.contains("Readiness: low-signal compare scope"));
     assert!(summary.contains("Low-signal reason:"));
     assert!(summary.contains("manifest/hash coverage"));
+
+    let _ = fs::remove_dir_all(&test_root);
+}
+
+#[test]
+fn orchestrate_version_pair_command_manifest_exports_quality_gate_signals() {
+    let test_root = unique_test_dir();
+    let report_root = test_root.join("out").join("report");
+    let storage = ReportStorage::new(report_root.clone());
+    let knowledge_path = test_root.join("knowledge.json");
+    let output_dir = test_root.join("out").join("quality-gate-advisory-run");
+    let old_version = "8.9.0";
+    let new_version = "8.9.1";
+
+    storage
+        .save_snapshot_for_version(&scope_full_snapshot(old_version))
+        .expect("save old scope snapshot");
+    storage
+        .save_snapshot_for_version(&scope_character_snapshot(new_version))
+        .expect("save new scope snapshot");
+    fs::write(
+        &knowledge_path,
+        serde_json::to_string_pretty(&sample_knowledge()).expect("serialize knowledge"),
+    )
+    .expect("write knowledge");
+
+    let result = run_orchestrate_version_pair_command(&OrchestrateVersionPairArgs {
+        old_version_id: old_version.to_string(),
+        new_version_id: new_version.to_string(),
+        wwmi_knowledge: knowledge_path,
+        output_dir: output_dir.clone(),
+        report_root: Some(report_root),
+        compare_output: None,
+        inference_output: None,
+        mapping_output: None,
+        patch_draft_output: None,
+        summary_output: None,
+        manifest_output: None,
+        min_confidence: 0.85,
+        quality_gate_mode: QualityGateModeArg::Advisory,
+    })
+    .expect("run quality gate advisory orchestration");
+
+    let manifest: VersionPairRunManifest = serde_json::from_str(
+        &fs::read_to_string(output_dir.join("run-manifest.v1.json")).expect("read manifest"),
+    )
+    .expect("parse manifest");
+
+    assert_eq!(result.manifest, manifest);
+    assert_eq!(manifest.quality_gate.mode, "advisory");
+    assert_eq!(manifest.quality_gate.status, "block");
+    assert!(!manifest.quality_gate.passed);
+    assert!(manifest.quality_gate.key_signals.compare_low_signal);
+    assert!(manifest.quality_gate.key_signals.scope_narrowing_detected);
+    assert!(
+        manifest
+            .quality_gate
+            .key_signals
+            .scope_induced_removals_likely
+    );
+    assert!(
+        manifest
+            .quality_gate
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("scope-induced removals are likely"))
+    );
+
+    for path in [
+        output_dir.join("compare.v1.json"),
+        output_dir.join("inference.v1.json"),
+        output_dir.join("mapping-proposal.v1.json"),
+        output_dir.join("proposal-patch-draft.v1.json"),
+        output_dir.join("human-summary.md"),
+        output_dir.join("run-manifest.v1.json"),
+    ] {
+        assert!(path.exists(), "expected output {}", path.display());
+    }
+
+    let _ = fs::remove_dir_all(&test_root);
+}
+
+#[test]
+fn orchestrate_version_pair_command_enforce_mode_returns_error_after_persisting_audit_artifacts() {
+    let test_root = unique_test_dir();
+    let report_root = test_root.join("out").join("report");
+    let storage = ReportStorage::new(report_root.clone());
+    let knowledge_path = test_root.join("knowledge.json");
+    let output_dir = test_root.join("out").join("quality-gate-enforce-run");
+    let old_version = "9.0.0";
+    let new_version = "9.0.1";
+
+    storage
+        .save_snapshot_for_version(&scope_full_snapshot(old_version))
+        .expect("save old scope snapshot");
+    storage
+        .save_snapshot_for_version(&scope_character_snapshot(new_version))
+        .expect("save new scope snapshot");
+    fs::write(
+        &knowledge_path,
+        serde_json::to_string_pretty(&sample_knowledge()).expect("serialize knowledge"),
+    )
+    .expect("write knowledge");
+
+    let error = run_orchestrate_version_pair_command(&OrchestrateVersionPairArgs {
+        old_version_id: old_version.to_string(),
+        new_version_id: new_version.to_string(),
+        wwmi_knowledge: knowledge_path,
+        output_dir: output_dir.clone(),
+        report_root: Some(report_root),
+        compare_output: None,
+        inference_output: None,
+        mapping_output: None,
+        patch_draft_output: None,
+        summary_output: None,
+        manifest_output: None,
+        min_confidence: 0.85,
+        quality_gate_mode: QualityGateModeArg::Enforce,
+    })
+    .expect_err("enforce mode should block low-quality pair");
+
+    match error {
+        AppError::InvalidInput(message) => {
+            assert!(message.contains("quality gate blocked orchestrate-version-pair"));
+            assert!(message.contains("status=block"));
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+
+    let manifest: VersionPairRunManifest = serde_json::from_str(
+        &fs::read_to_string(output_dir.join("run-manifest.v1.json")).expect("read manifest"),
+    )
+    .expect("parse manifest");
+    assert_eq!(manifest.quality_gate.mode, "enforce");
+    assert_eq!(manifest.quality_gate.status, "block");
+    assert!(!manifest.quality_gate.passed);
+    assert!(manifest.readiness.reasons.is_empty());
+    assert_eq!(manifest.summary.probable_crash_causes, 0);
+    assert_eq!(manifest.summary.suggested_fixes, 0);
+    assert_eq!(manifest.summary.candidate_mapping_hints, 0);
+    assert_eq!(manifest.summary.proposed_mappings, 0);
+    assert_eq!(manifest.summary.needs_review_mappings, 0);
+    assert_eq!(manifest.summary.suggested_fix_actions, 0);
+    assert!(output_dir.join("compare.v1.json").exists());
+    assert!(output_dir.join("run-manifest.v1.json").exists());
+    assert!(!output_dir.join("inference.v1.json").exists());
+    assert!(!output_dir.join("mapping-proposal.v1.json").exists());
+    assert!(!output_dir.join("proposal-patch-draft.v1.json").exists());
+    assert!(!output_dir.join("human-summary.md").exists());
 
     let _ = fs::remove_dir_all(&test_root);
 }
