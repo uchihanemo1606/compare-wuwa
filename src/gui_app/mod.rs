@@ -7,7 +7,7 @@ use crate::{
     inference::{FixInferenceEngine, InferenceReport},
     output_policy::resolve_artifact_root,
     proposal::{ProposalArtifacts, ProposalEngine},
-    report::{ReportItemType, ResonatorDiffEntry, VersionDiffReportV2},
+    report::{DiffStatus, ResonatorDiffEntry, VersionDiffReportV2},
     report_storage::{ReportStorage, VersionArtifactKind},
     scan::{
         ExecuteVersionScanResult, LocalSnapshotFactory, PrepareVersionScanResult,
@@ -52,8 +52,22 @@ pub struct VersionDetailView {
 #[derive(Debug, Clone)]
 pub struct ReportDetailView {
     pub summary: String,
-    pub old_column: String,
-    pub new_column: String,
+    pub table_rows: Vec<CompareTableRow>,
+    pub quality_gate_text: String,
+    pub inference_text: String,
+    pub proposal_text: String,
+    pub human_summary_text: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CompareTableRow {
+    pub resonator: String,
+    pub item_type: String,
+    pub status: String,
+    pub confidence: String,
+    pub path: String,
+    pub asset_hash: String,
+    pub shader_hash: String,
 }
 
 #[derive(Debug, Clone)]
@@ -172,19 +186,7 @@ impl GuiController {
         Ok(versions
             .into_iter()
             .map(|entry| VersionRowView {
-                label: format!(
-                    "wuwa_{} | snapshot={} report_bundle={} continuity={} inference={} proposal={} summary={} buffer={} hash={} artifacts={}",
-                    entry.version_id,
-                    yes_no(entry.has_snapshot),
-                    yes_no(entry.has_report_bundle),
-                    yes_no(entry.has_continuity_data),
-                    yes_no(entry.has_inference_data),
-                    yes_no(entry.has_proposal_data),
-                    yes_no(entry.has_human_summary),
-                    yes_no(entry.has_buffer_data),
-                    yes_no(entry.has_hash_data),
-                    entry.artifacts.len()
-                ),
+                label: format!("wuwa_{}", entry.version_id),
                 version_id: entry.version_id,
             })
             .collect())
@@ -219,9 +221,39 @@ impl GuiController {
         old_version: &str,
         new_version: &str,
         resonator_filter: &str,
+        hide_unchanged: bool,
     ) -> AppResult<ReportDetailView> {
         let report = self.storage.compare_versions(old_version, new_version)?;
-        Ok(render_detail_view(&report, resonator_filter))
+        let mut view = render_detail_view(&report, resonator_filter, hide_unchanged);
+
+        let inference = self
+            .storage
+            .load_latest_inference(new_version)
+            .ok()
+            .flatten();
+        let mapping_proposal = self
+            .storage
+            .load_latest_mapping_proposal(new_version)
+            .ok()
+            .flatten();
+        let patch_draft = self
+            .storage
+            .load_latest_patch_draft(new_version)
+            .ok()
+            .flatten();
+        let human_summary = self
+            .storage
+            .load_latest_human_summary(new_version)
+            .ok()
+            .flatten();
+
+        view.quality_gate_text = render_quality_gate_preview(&report);
+        view.inference_text = render_inference_preview(inference.as_ref());
+        view.proposal_text =
+            render_proposal_preview(mapping_proposal.as_ref(), patch_draft.as_ref());
+        view.human_summary_text = render_human_summary_preview(human_summary.as_deref());
+
+        Ok(view)
     }
 
     pub fn reports_root_label(&self) -> String {
@@ -750,6 +782,7 @@ fn continuity_relation_label(relation: &crate::report::VersionContinuityRelation
 pub fn render_detail_view(
     report: &VersionDiffReportV2,
     resonator_filter: &str,
+    hide_unchanged: bool,
 ) -> ReportDetailView {
     let filter = resonator_filter.to_ascii_lowercase();
     let resonators = report
@@ -770,6 +803,12 @@ pub fn render_detail_view(
         report.summary.uncertain_items,
         report.summary.mapping_candidates
     );
+    if hide_unchanged && report.summary.unchanged_items > 0 {
+        summary.push_str(&format!(
+            "\nFilter: hiding {} unchanged item(s) — toggle 'Show unchanged' to see them.",
+            report.summary.unchanged_items
+        ));
+    }
     if !report.scope_notes.is_empty() {
         for note in report.scope_notes.iter().take(2) {
             summary.push_str(&format!("\nScope note: {note}"));
@@ -778,72 +817,202 @@ pub fn render_detail_view(
 
     ReportDetailView {
         summary,
-        old_column: render_side_column(&report.old_version.version_id, &resonators, true),
-        new_column: render_side_column(&report.new_version.version_id, &resonators, false),
+        table_rows: build_compare_table_rows(&resonators, hide_unchanged),
+        quality_gate_text: String::new(),
+        inference_text: String::new(),
+        proposal_text: String::new(),
+        human_summary_text: String::new(),
     }
 }
 
-fn render_side_column(
-    version_label: &str,
+fn build_compare_table_rows(
     resonators: &[&ResonatorDiffEntry],
-    render_old: bool,
-) -> String {
-    let mut lines = vec![format!("{version_label}")];
+    hide_unchanged: bool,
+) -> Vec<CompareTableRow> {
+    const MAX_ROWS: usize = 400;
+
+    let mut rows = Vec::new();
+    let mut truncated: usize = 0;
+
     for entry in resonators {
-        let counts = if render_old {
-            &entry.old_version
-        } else {
-            &entry.new_version
-        };
-        lines.push(String::new());
-        lines.push(format!(
-            "Resonator: {} | assets={} buffers={} mappings={}",
-            entry.resonator, counts.asset_count, counts.buffer_count, counts.mapping_count
-        ));
         for item in &entry.items {
-            let side = if render_old { &item.old } else { &item.new };
-            let Some(side) = side else {
+            if hide_unchanged && matches!(item.status, DiffStatus::Unchanged) {
                 continue;
-            };
-            lines.push(format!(
-                "- {:?} | {} | status={:?} | confidence={}",
-                item.item_type,
-                side.path.clone().unwrap_or_else(|| side.label.clone()),
-                item.status,
-                item.confidence
-                    .map(|value| format!("{value:.3}"))
-                    .unwrap_or_else(|| "-".to_string())
-            ));
-            if matches!(
-                item.item_type,
-                ReportItemType::Asset | ReportItemType::Buffer
-            ) {
-                lines.push(format!(
-                    "  metadata: kind={:?}, name={:?}, vertex={:?}, index={:?}, slots={:?}, sections={:?}, asset_hash={:?}, shader_hash={:?}",
-                    side.metadata.kind,
-                    side.metadata.normalized_name,
-                    side.metadata.vertex_count,
-                    side.metadata.index_count,
-                    side.metadata.material_slots,
-                    side.metadata.section_count,
-                    side.metadata.asset_hash,
-                    side.metadata.shader_hash
-                ));
             }
-            if !item.reasons.is_empty() {
-                lines.push(format!(
-                    "  reasons: {}",
-                    item.reasons
-                        .iter()
-                        .map(|reason| format!("[{}] {}", reason.code, reason.message))
-                        .collect::<Vec<_>>()
-                        .join("; ")
-                ));
+            if rows.len() >= MAX_ROWS {
+                truncated += 1;
+                continue;
             }
+
+            let path = item
+                .new
+                .as_ref()
+                .or(item.old.as_ref())
+                .map(|side| side.path.clone().unwrap_or_else(|| side.label.clone()))
+                .unwrap_or_else(|| "-".to_string());
+            let confidence = item
+                .confidence
+                .map(|value| format!("{value:.3}"))
+                .unwrap_or_else(|| "-".to_string());
+
+            let asset_hash = format_hash_transition(
+                item.old.as_ref().and_then(|s| s.metadata.asset_hash.as_deref()),
+                item.new.as_ref().and_then(|s| s.metadata.asset_hash.as_deref()),
+            );
+            let shader_hash = format_hash_transition(
+                item.old.as_ref().and_then(|s| s.metadata.shader_hash.as_deref()),
+                item.new.as_ref().and_then(|s| s.metadata.shader_hash.as_deref()),
+            );
+
+            rows.push(CompareTableRow {
+                resonator: entry.resonator.clone(),
+                item_type: format!("{:?}", item.item_type),
+                status: format!("{:?}", item.status),
+                confidence,
+                path,
+                asset_hash,
+                shader_hash,
+            });
         }
+    }
+
+    if truncated > 0 {
+        rows.push(CompareTableRow {
+            resonator: "…".to_string(),
+            item_type: "truncated".to_string(),
+            status: format!("+{truncated}"),
+            confidence: "-".to_string(),
+            path: "Open the stored report bundle for the full list.".to_string(),
+            asset_hash: String::new(),
+            shader_hash: String::new(),
+        });
+    }
+
+    rows
+}
+
+fn format_hash_transition(old_hash: Option<&str>, new_hash: Option<&str>) -> String {
+    match (old_hash, new_hash) {
+        (None, None) => "-".to_string(),
+        (Some(hash), None) => format!("{hash} → (removed)"),
+        (None, Some(hash)) => format!("(added) → {hash}"),
+        (Some(old), Some(new)) if old == new => old.to_string(),
+        (Some(old), Some(new)) => format!("{old} → {new}"),
+    }
+}
+
+fn render_quality_gate_preview(report: &VersionDiffReportV2) -> String {
+    let mut lines = vec![format!(
+        "Quality / scope signals for {} -> {}",
+        report.old_version.version_id, report.new_version.version_id
+    )];
+
+    let scope_notes = &report.scope_notes;
+    let mut low_signal_found = false;
+    for note in scope_notes {
+        let lower = note.to_ascii_lowercase();
+        if lower.contains("low-signal")
+            || lower.contains("shallow")
+            || lower.contains("low-coverage")
+            || lower.contains("install/package-level")
+        {
+            low_signal_found = true;
+            lines.push(format!("WARN: {note}"));
+        }
+    }
+    if !low_signal_found {
+        lines.push("No low-signal warnings detected from compare scope notes.".to_string());
+    }
+
+    for note in scope_notes
+        .iter()
+        .filter(|note| note.to_ascii_lowercase().contains("selected baseline"))
+        .take(2)
+    {
+        lines.push(format!("Baseline: {note}"));
+    }
+
+    lines.join("\n")
+}
+
+fn render_inference_preview(inference: Option<&InferenceReport>) -> String {
+    let Some(inference) = inference else {
+        return "Inference preview: not stored yet for the new version. Run Scan Version first so Phase 3 artifacts are persisted.".to_string();
+    };
+
+    let mut lines = vec![format!(
+        "Inference: crash_causes={} fixes={} mapping_hints={} highest_confidence={:.3}",
+        inference.summary.probable_crash_causes,
+        inference.summary.suggested_fixes,
+        inference.summary.candidate_mapping_hints,
+        inference.summary.highest_confidence
+    )];
+    for cause in inference.probable_crash_causes.iter().take(5) {
+        lines.push(format!(
+            "- cause [{}] risk={:?} confidence={:.3} affected={}",
+            cause.code,
+            cause.risk,
+            cause.confidence,
+            cause.affected_assets.len()
+        ));
+    }
+    for fix in inference.suggested_fixes.iter().take(5) {
+        lines.push(format!(
+            "- fix   [{}] priority={:?} confidence={:.3} actions={}",
+            fix.code,
+            fix.priority,
+            fix.confidence,
+            fix.actions.len()
+        ));
     }
     lines.join("\n")
 }
+
+fn render_proposal_preview(
+    mapping_proposal: Option<&crate::proposal::MappingProposalOutput>,
+    patch_draft: Option<&crate::proposal::ProposalPatchDraftOutput>,
+) -> String {
+    let Some(mapping_proposal) = mapping_proposal else {
+        return "Mapping proposal preview: not stored yet for the new version.".to_string();
+    };
+
+    let mut lines = vec![format!(
+        "Mapping proposal: proposed={} review={} total={} highest_confidence={:.3}",
+        mapping_proposal.summary.proposed_mappings,
+        mapping_proposal.summary.needs_review_mappings,
+        mapping_proposal.summary.total_mapping_candidates,
+        mapping_proposal.summary.highest_confidence
+    )];
+    for mapping in mapping_proposal.mappings.iter().take(5) {
+        lines.push(format!(
+            "- {} -> {} | status={:?} confidence={:.3}",
+            mapping.old_asset_path, mapping.new_asset_path, mapping.status, mapping.confidence
+        ));
+    }
+    if let Some(patch_draft) = patch_draft {
+        lines.push(format!(
+            "Patch draft: actions={} min_confidence={:.3}",
+            patch_draft.actions.len(),
+            patch_draft.min_confidence
+        ));
+    }
+    lines.join("\n")
+}
+
+fn render_human_summary_preview(summary: Option<&str>) -> String {
+    let Some(summary) = summary else {
+        return "Human summary preview: not stored yet for the new version.".to_string();
+    };
+    let mut lines = Vec::new();
+    for line in summary.lines().take(30) {
+        lines.push(line.to_string());
+    }
+    if summary.lines().count() > 30 {
+        lines.push("... (human summary truncated in GUI preview; open the stored .md file for the full text)".to_string());
+    }
+    lines.join("\n")
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -879,7 +1048,7 @@ mod tests {
     use super::{GuiController, ScanForm, ScanRunResult, render_detail_view};
 
     #[test]
-    fn detail_view_renders_two_columns_and_resonator_items() {
+    fn detail_view_renders_table_rows_for_resonator_items() {
         let report = VersionDiffReportV2 {
             schema_version: "whashreonator.report.v2".to_string(),
             generated_at_unix_ms: 1,
@@ -935,11 +1104,15 @@ mod tests {
             review: Default::default(),
         };
 
-        let detail = render_detail_view(&report, "");
+        let detail = render_detail_view(&report, "", false);
         assert!(detail.summary.contains("Compare 2.4.0 -> 2.5.0"));
         assert!(detail.summary.contains("Scope note: scope warning"));
-        assert!(detail.old_column.contains("Resonator: Encore"));
-        assert!(detail.new_column.contains("Body_v2.mesh"));
+        assert_eq!(detail.table_rows.len(), 1);
+        let row = &detail.table_rows[0];
+        assert_eq!(row.resonator, "Encore");
+        assert_eq!(row.item_type, "Asset");
+        assert_eq!(row.status, "Changed");
+        assert_eq!(row.path, "Content/Character/Encore/Body_v2.mesh");
     }
 
     #[test]
@@ -1039,7 +1212,7 @@ mod tests {
         let controller = GuiController::new(storage);
 
         let detail = controller
-            .compare_versions("3.2.5", "3.3.1", "")
+            .compare_versions("3.2.5", "3.3.1", "", false)
             .expect("compare");
         assert!(detail.summary.contains("Compare 3.2.5 -> 3.3.1"));
         assert!(detail.summary.contains("Scope note:"));

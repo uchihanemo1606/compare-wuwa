@@ -1,14 +1,33 @@
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use slint::{Model, ModelRc, SharedString, VecModel};
-use whashreonator::gui_app::{GuiController, ScanForm, ScanRunResult, ScanStartResult};
+use whashreonator::gui_app::{
+    CompareTableRow, GuiController, ScanForm, ScanRunResult, ScanStartResult,
+};
+
+thread_local! {
+    static COMPARE_ROWS_MODEL: RefCell<Option<Rc<VecModel<CompareRow>>>> = const { RefCell::new(None) };
+}
 
 slint::slint! {
-    import { Button, CheckBox, HorizontalBox, LineEdit, StandardListView, TabWidget, TextEdit, VerticalBox } from "std-widgets.slint";
+    import { Button, CheckBox, ComboBox, HorizontalBox, LineEdit, ListView, ScrollView, TabWidget, TextEdit, VerticalBox } from "std-widgets.slint";
+
+    struct CompareRow {
+        resonator: string,
+        item_type: string,
+        status: string,
+        confidence: string,
+        path: string,
+        asset_hash: string,
+        shader_hash: string,
+    }
 
     export component MainWindow inherits Window {
-        width: 1320px;
-        height: 900px;
+        preferred-width: 1320px;
+        preferred-height: 900px;
+        min-width: 900px;
+        min-height: 600px;
         title: "WhashReonator Desktop";
 
         in-out property <string> status_text;
@@ -29,9 +48,13 @@ slint::slint! {
 
         in-out property <int> selected_compare_old_index;
         in-out property <int> selected_compare_new_index;
+        in-out property <bool> compare_show_unchanged;
         in-out property <string> compare_summary_text;
-        in-out property <string> compare_old_text;
-        in-out property <string> compare_new_text;
+        in-out property <[CompareRow]> compare_rows;
+        in-out property <string> compare_gate_text;
+        in-out property <string> compare_inference_text;
+        in-out property <string> compare_proposal_text;
+        in-out property <string> compare_human_summary_text;
 
         callback run_scan();
         callback confirm_rescan();
@@ -42,16 +65,11 @@ slint::slint! {
 
         VerticalBox {
             padding: 12px;
-            spacing: 10px;
+            spacing: 8px;
 
             Text {
                 text: "WhashReonator Desktop";
-                font-size: 24px;
-            }
-
-            Text {
-                text: "Version-oriented report storage and compare workflow.";
-                wrap: word-wrap;
+                font-size: 22px;
             }
 
             Text {
@@ -65,38 +83,38 @@ slint::slint! {
                     title: "Scan Version";
                     VerticalBox {
                         spacing: 8px;
-                        Text { text: "Artifact root"; }
-                        Text { text: root.artifact_root_text; wrap: word-wrap; }
-                        Text { text: "Version library root"; }
-                        Text { text: root.reports_root_text; wrap: word-wrap; }
 
-                        Text { text: "Game source root"; }
+                        Text { text: "Game source root"; font-weight: 700; }
                         LineEdit { text <=> root.source_root; }
 
-                        CheckBox {
-                            text: "Show Advanced";
-                            checked <=> root.show_advanced;
+                        HorizontalBox {
+                            spacing: 10px;
+                            Button {
+                                text: "Run Scan";
+                                clicked => { root.run_scan(); }
+                            }
+                            CheckBox {
+                                text: "Show advanced";
+                                checked <=> root.show_advanced;
+                            }
                         }
 
                         if root.show_advanced : VerticalBox {
                             spacing: 6px;
                             Text { text: "Version override (optional)"; }
                             LineEdit { text <=> root.version_override; }
-                            Text { text: "WWMI knowledge JSON (optional, reserved)"; }
+                            Text { text: "WWMI knowledge JSON (optional)"; }
                             LineEdit { text <=> root.knowledge_path; }
+                            Text { text: "Artifact root: " + root.artifact_root_text; wrap: word-wrap; font-size: 11px; color: #9ca3af; }
+                            Text { text: "Version library root: " + root.reports_root_text; wrap: word-wrap; font-size: 11px; color: #9ca3af; }
                         }
 
-                        Button {
-                            text: "Run Scan";
-                            clicked => { root.run_scan(); }
-                        }
-
-                        Text { text: "Latest scan summary"; }
+                        Text { text: "Latest scan summary"; font-weight: 700; }
                         TextEdit {
                             text <=> root.version_summary_text;
                             read-only: true;
                             wrap: word-wrap;
-                            height: 180px;
+                            vertical-stretch: 1;
                         }
                     }
                 }
@@ -108,7 +126,7 @@ slint::slint! {
                         HorizontalBox {
                             spacing: 8px;
                             Button {
-                                text: "Refresh Versions";
+                                text: "Refresh";
                                 clicked => { root.refresh_versions(); }
                             }
                             Button {
@@ -117,31 +135,60 @@ slint::slint! {
                             }
                         }
 
-                        Text { text: "Versions"; }
-                        StandardListView {
-                            for item[i] in root.version_rows : Text {
-                                text: item;
-                                vertical-alignment: center;
-                            }
-                            current-item <=> root.selected_version_index;
-                            height: 220px;
-                        }
+                        HorizontalBox {
+                            spacing: 10px;
 
-                        Text { text: "Artifacts in selected version"; }
-                        StandardListView {
-                            for item[i] in root.artifact_rows : Text {
-                                text: item;
-                                vertical-alignment: center;
-                            }
-                            height: 170px;
-                        }
+                            VerticalBox {
+                                horizontal-stretch: 1;
+                                spacing: 4px;
+                                Text { text: "Versions"; font-weight: 700; }
+                                ListView {
+                                    vertical-stretch: 1;
+                                    min-height: 180px;
+                                    for item[i] in root.version_rows : Rectangle {
+                                        height: 26px;
+                                        background: i == root.selected_version_index ? #1b4d8a
+                                                  : mod(i, 2) == 0 ? #1f2937 : #111827;
+                                        Text {
+                                            text: item;
+                                            color: white;
+                                            vertical-alignment: center;
+                                            x: 8px;
+                                        }
+                                        TouchArea {
+                                            clicked => { root.selected_version_index = i; }
+                                        }
+                                    }
+                                }
 
-                        Text { text: "Version summary"; }
-                        TextEdit {
-                            text <=> root.version_summary_text;
-                            read-only: true;
-                            wrap: word-wrap;
-                            height: 180px;
+                                Text { text: "Artifacts"; font-weight: 700; }
+                                ListView {
+                                    min-height: 140px;
+                                    for item[i] in root.artifact_rows : Rectangle {
+                                        height: 22px;
+                                        background: mod(i, 2) == 0 ? #1f2937 : #111827;
+                                        Text {
+                                            text: item;
+                                            color: white;
+                                            vertical-alignment: center;
+                                            x: 8px;
+                                            font-size: 12px;
+                                        }
+                                    }
+                                }
+                            }
+
+                            VerticalBox {
+                                horizontal-stretch: 2;
+                                spacing: 4px;
+                                Text { text: "Version summary"; font-weight: 700; }
+                                TextEdit {
+                                    text <=> root.version_summary_text;
+                                    read-only: true;
+                                    wrap: word-wrap;
+                                    vertical-stretch: 1;
+                                }
+                            }
                         }
                     }
                 }
@@ -149,65 +196,134 @@ slint::slint! {
                 Tab {
                     title: "Compare Versions";
                     VerticalBox {
-                        spacing: 8px;
-                        Text { text: "Select two versions from library data and compare."; wrap: word-wrap; }
+                        spacing: 6px;
+
                         HorizontalBox {
-                            spacing: 12px;
+                            spacing: 10px;
+                            alignment: start;
+
                             VerticalBox {
-                                spacing: 6px;
-                                Text { text: "Old version"; }
-                                StandardListView {
-                                    for item[i] in root.version_rows : Text {
-                                        text: item;
-                                        vertical-alignment: center;
-                                    }
-                                    current-item <=> root.selected_compare_old_index;
-                                    height: 180px;
+                                spacing: 2px;
+                                Text { text: "Old"; font-size: 12px; color: #9ca3af; }
+                                ComboBox {
+                                    width: 200px;
+                                    model: root.version_rows;
+                                    current-index <=> root.selected_compare_old_index;
                                 }
                             }
                             VerticalBox {
-                                spacing: 6px;
-                                Text { text: "New version"; }
-                                StandardListView {
-                                    for item[i] in root.version_rows : Text {
-                                        text: item;
-                                        vertical-alignment: center;
-                                    }
-                                    current-item <=> root.selected_compare_new_index;
-                                    height: 180px;
+                                spacing: 2px;
+                                Text { text: "New"; font-size: 12px; color: #9ca3af; }
+                                ComboBox {
+                                    width: 200px;
+                                    model: root.version_rows;
+                                    current-index <=> root.selected_compare_new_index;
+                                }
+                            }
+                            VerticalBox {
+                                spacing: 2px;
+                                Text { text: ""; font-size: 12px; }
+                                Button {
+                                    text: "Compare";
+                                    clicked => { root.compare_selected_versions(); }
+                                }
+                            }
+                            VerticalBox {
+                                spacing: 2px;
+                                Text { text: ""; font-size: 12px; }
+                                CheckBox {
+                                    text: "Show unchanged";
+                                    checked <=> root.compare_show_unchanged;
+                                    toggled => { root.compare_selected_versions(); }
                                 }
                             }
                         }
 
-                        Button {
-                            text: "Compare Selected Versions";
-                            clicked => { root.compare_selected_versions(); }
-                        }
-
-                        Text { text: "Compare summary"; }
-                        TextEdit {
-                            text <=> root.compare_summary_text;
-                            read-only: true;
+                        Text {
+                            text: root.compare_summary_text;
                             wrap: word-wrap;
-                            height: 120px;
+                            font-size: 12px;
                         }
 
-                        HorizontalBox {
-                            spacing: 12px;
-                            VerticalBox {
-                                spacing: 6px;
-                                Text { text: "Old version detail"; }
+                        Text { text: "Diff items"; font-weight: 700; }
+
+                        Rectangle {
+                            background: #1b4d8a;
+                            height: 28px;
+                            HorizontalLayout {
+                                padding-left: 8px;
+                                padding-right: 8px;
+                                spacing: 8px;
+                                Text { text: "Resonator"; color: white; font-weight: 700; horizontal-stretch: 2; vertical-alignment: center; overflow: elide; }
+                                Text { text: "Type"; color: white; font-weight: 700; horizontal-stretch: 1; vertical-alignment: center; }
+                                Text { text: "Status"; color: white; font-weight: 700; horizontal-stretch: 1; vertical-alignment: center; }
+                                Text { text: "Conf"; color: white; font-weight: 700; horizontal-stretch: 1; vertical-alignment: center; }
+                                Text { text: "Path"; color: white; font-weight: 700; horizontal-stretch: 5; vertical-alignment: center; overflow: elide; }
+                                Text { text: "Asset hash"; color: white; font-weight: 700; horizontal-stretch: 6; vertical-alignment: center; overflow: elide; }
+                                Text { text: "Shader hash"; color: white; font-weight: 700; horizontal-stretch: 6; vertical-alignment: center; overflow: elide; }
+                            }
+                        }
+
+                        ListView {
+                            vertical-stretch: 1;
+                            min-height: 200px;
+                            for row[i] in root.compare_rows : Rectangle {
+                                height: 28px;
+                                background: mod(i, 2) == 0 ? #1f2937 : #111827;
+                                HorizontalLayout {
+                                    padding-left: 8px;
+                                    padding-right: 8px;
+                                    spacing: 8px;
+                                    Text { text: row.resonator; color: white; horizontal-stretch: 2; vertical-alignment: center; overflow: elide; }
+                                    Text { text: row.item_type; color: white; horizontal-stretch: 1; vertical-alignment: center; overflow: elide; }
+                                    Text {
+                                        text: row.status;
+                                        color: row.status == "Removed" ? rgb(252, 165, 165)
+                                             : row.status == "Added" ? rgb(134, 239, 172)
+                                             : row.status == "Changed" ? rgb(252, 211, 77)
+                                             : white;
+                                        horizontal-stretch: 1;
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                    }
+                                    Text { text: row.confidence; color: white; horizontal-stretch: 1; vertical-alignment: center; overflow: elide; }
+                                    Text { text: row.path; color: white; horizontal-stretch: 5; vertical-alignment: center; overflow: elide; font-size: 12px; }
+                                    Text { text: row.asset_hash; color: rgb(147, 197, 253); horizontal-stretch: 6; vertical-alignment: center; font-size: 12px; font-family: "Consolas"; }
+                                    Text { text: row.shader_hash; color: rgb(196, 181, 253); horizontal-stretch: 6; vertical-alignment: center; font-size: 12px; font-family: "Consolas"; }
+                                }
+                            }
+                        }
+
+                        TabWidget {
+                            height: 260px;
+                            Tab {
+                                title: "Quality / scope";
                                 TextEdit {
-                                    text <=> root.compare_old_text;
+                                    text <=> root.compare_gate_text;
                                     read-only: true;
                                     wrap: word-wrap;
                                 }
                             }
-                            VerticalBox {
-                                spacing: 6px;
-                                Text { text: "New version detail"; }
+                            Tab {
+                                title: "Inference";
                                 TextEdit {
-                                    text <=> root.compare_new_text;
+                                    text <=> root.compare_inference_text;
+                                    read-only: true;
+                                    wrap: word-wrap;
+                                }
+                            }
+                            Tab {
+                                title: "Mapping proposal";
+                                TextEdit {
+                                    text <=> root.compare_proposal_text;
+                                    read-only: true;
+                                    wrap: word-wrap;
+                                }
+                            }
+                            Tab {
+                                title: "Human summary";
+                                TextEdit {
+                                    text <=> root.compare_human_summary_text;
                                     read-only: true;
                                     wrap: word-wrap;
                                 }
@@ -217,29 +333,62 @@ slint::slint! {
                 }
             }
 
-            if root.show_confirm_dialog : Rectangle {
-                background: #ddf0f8;
+        }
+
+        if root.show_confirm_dialog : Rectangle {
+            width: parent.width;
+            height: parent.height;
+            x: 0;
+            y: 0;
+            background: #00000099;
+
+            TouchArea {
+                width: parent.width;
+                height: parent.height;
+            }
+
+            Rectangle {
+                width: 480px;
+                height: 220px;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                background: #1e293b;
                 border-color: #1b4d8a;
-                border-width: 1px;
-                border-radius: 8px;
-                min-height: 120px;
+                border-width: 2px;
+                border-radius: 10px;
+                drop-shadow-color: #000000aa;
+                drop-shadow-blur: 24px;
+                drop-shadow-offset-y: 6px;
 
                 VerticalBox {
-                    padding: 12px;
-                    spacing: 10px;
+                    padding: 20px;
+                    spacing: 14px;
+
+                    Text {
+                        text: "Version already exists";
+                        font-size: 16px;
+                        font-weight: 700;
+                        color: white;
+                    }
+
                     Text {
                         text: root.confirm_dialog_text;
                         wrap: word-wrap;
+                        vertical-stretch: 1;
+                        color: #dbe2ea;
                     }
+
                     HorizontalBox {
-                        spacing: 8px;
-                        Button {
-                            text: "Re-scan";
-                            clicked => { root.confirm_rescan(); }
-                        }
+                        spacing: 10px;
+                        alignment: end;
                         Button {
                             text: "Cancel";
                             clicked => { root.cancel_rescan(); }
+                        }
+                        Button {
+                            text: "Re-scan";
+                            primary: true;
+                            clicked => { root.confirm_rescan(); }
                         }
                     }
                 }
@@ -249,6 +398,21 @@ slint::slint! {
 }
 
 fn main() -> Result<(), slint::PlatformError> {
+    // Slint + debug build có thể vượt stack 1MB mặc định của Windows khi init
+    // MainWindow lớn. Chạy event loop trên thread riêng với stack 16MB.
+    let handle = std::thread::Builder::new()
+        .name("whashreonator-gui".into())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(run_gui)
+        .map_err(|error| {
+            slint::PlatformError::Other(format!("failed to spawn gui thread: {error}"))
+        })?;
+    handle.join().map_err(|_| {
+        slint::PlatformError::Other("gui thread panicked".to_string())
+    })?
+}
+
+fn run_gui() -> Result<(), slint::PlatformError> {
     let controller = Rc::new(GuiController::default());
     let pending_scan = Rc::new(std::cell::RefCell::new(
         None::<whashreonator::scan::PreparedVersionScan>,
@@ -256,6 +420,8 @@ fn main() -> Result<(), slint::PlatformError> {
     let version_ids = Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
     let version_rows_model = Rc::new(VecModel::<SharedString>::from(vec![]));
     let artifact_rows_model = Rc::new(VecModel::<SharedString>::from(vec![]));
+    let compare_rows_model = Rc::new(VecModel::<CompareRow>::from(vec![]));
+    COMPARE_ROWS_MODEL.with(|cell| *cell.borrow_mut() = Some(compare_rows_model.clone()));
     let window = MainWindow::new()?;
 
     window.set_status_text("Ready.".into());
@@ -270,11 +436,13 @@ fn main() -> Result<(), slint::PlatformError> {
     );
     window.set_version_rows(ModelRc::from(version_rows_model.clone()));
     window.set_artifact_rows(ModelRc::from(artifact_rows_model.clone()));
+    window.set_compare_rows(ModelRc::from(compare_rows_model.clone()));
     window.set_selected_version_index(-1);
     window.set_selected_compare_old_index(-1);
     window.set_selected_compare_new_index(-1);
     window.set_show_advanced(false);
     window.set_show_confirm_dialog(false);
+    window.set_compare_show_unchanged(false);
 
     {
         let window = window.as_weak();
@@ -427,12 +595,14 @@ fn main() -> Result<(), slint::PlatformError> {
 
     {
         let window = window.as_weak();
-        let controller = controller.clone();
+        let controller_rc = controller.clone();
         let version_ids = version_ids.clone();
+        let compare_rows_model = compare_rows_model.clone();
         window.unwrap().on_compare_selected_versions(move || {
-            let Some(window) = window.upgrade() else {
+            let Some(window_strong) = window.upgrade() else {
                 return;
             };
+            let window = window_strong;
 
             let old_index = window.get_selected_compare_old_index();
             let new_index = window.get_selected_compare_new_index();
@@ -441,34 +611,98 @@ fn main() -> Result<(), slint::PlatformError> {
                 return;
             }
 
-            let ids = version_ids.borrow();
-            let Some(old_version) = ids.get(old_index as usize) else {
-                window.set_status_text("Old version index is out of range.".into());
-                return;
-            };
-            let Some(new_version) = ids.get(new_index as usize) else {
-                window.set_status_text("New version index is out of range.".into());
-                return;
+            let (old_version, new_version) = {
+                let ids = version_ids.borrow();
+                let Some(old_version) = ids.get(old_index as usize).cloned() else {
+                    window.set_status_text("Old version index is out of range.".into());
+                    return;
+                };
+                let Some(new_version) = ids.get(new_index as usize).cloned() else {
+                    window.set_status_text("New version index is out of range.".into());
+                    return;
+                };
+                (old_version, new_version)
             };
 
-            match controller.compare_versions(old_version, new_version, "") {
-                Ok(detail) => {
-                    window.set_status_text(
-                        format!("Compared versions {} -> {}.", old_version, new_version).into(),
-                    );
-                    window.set_compare_summary_text(detail.summary.into());
-                    window.set_compare_old_text(detail.old_column.into());
-                    window.set_compare_new_text(detail.new_column.into());
-                }
-                Err(error) => {
-                    window.set_status_text(format!("Compare failed: {error}").into());
-                }
-            }
+            window.set_status_text(
+                format!(
+                    "Comparing wuwa_{} -> wuwa_{} ... please wait",
+                    old_version, new_version
+                )
+                .into(),
+            );
+            window.set_compare_summary_text("Comparing, please wait...".into());
+            compare_rows_model.set_vec(Vec::<CompareRow>::new());
+            window.set_compare_gate_text("".into());
+            window.set_compare_inference_text("".into());
+            window.set_compare_proposal_text("".into());
+            window.set_compare_human_summary_text("".into());
+
+            let hide_unchanged = !window.get_compare_show_unchanged();
+            let controller_owned = (*controller_rc).clone();
+            let weak_for_thread = window.as_weak();
+            std::thread::spawn(move || {
+                let result = controller_owned.compare_versions(
+                    &old_version,
+                    &new_version,
+                    "",
+                    hide_unchanged,
+                );
+                let _ = slint::invoke_from_event_loop(move || {
+                    let Some(window) = weak_for_thread.upgrade() else {
+                        return;
+                    };
+                    match result {
+                        Ok(detail) => {
+                            window.set_status_text(
+                                format!(
+                                    "Compared wuwa_{} -> wuwa_{}.",
+                                    old_version, new_version
+                                )
+                                .into(),
+                            );
+                            window.set_compare_summary_text(detail.summary.into());
+                            let rows = detail
+                                .table_rows
+                                .into_iter()
+                                .map(to_compare_row)
+                                .collect::<Vec<_>>();
+                            COMPARE_ROWS_MODEL.with(|cell| {
+                                if let Some(model) = cell.borrow().as_ref() {
+                                    model.set_vec(rows);
+                                }
+                            });
+                            window.set_compare_gate_text(detail.quality_gate_text.into());
+                            window.set_compare_inference_text(detail.inference_text.into());
+                            window.set_compare_proposal_text(detail.proposal_text.into());
+                            window.set_compare_human_summary_text(
+                                detail.human_summary_text.into(),
+                            );
+                        }
+                        Err(error) => {
+                            window.set_status_text(format!("Compare failed: {error}").into());
+                            window.set_compare_summary_text("".into());
+                        }
+                    }
+                });
+            });
         });
     }
 
     window.invoke_refresh_versions();
     window.run()
+}
+
+fn to_compare_row(row: CompareTableRow) -> CompareRow {
+    CompareRow {
+        resonator: row.resonator.into(),
+        item_type: row.item_type.into(),
+        status: row.status.into(),
+        confidence: row.confidence.into(),
+        path: row.path.into(),
+        asset_hash: row.asset_hash.into(),
+        shader_hash: row.shader_hash.into(),
+    }
 }
 
 fn refresh_version_library(
