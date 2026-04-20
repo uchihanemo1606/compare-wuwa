@@ -856,12 +856,20 @@ fn build_compare_table_rows(
                 .unwrap_or_else(|| "-".to_string());
 
             let asset_hash = format_hash_transition(
-                item.old.as_ref().and_then(|s| s.metadata.asset_hash.as_deref()),
-                item.new.as_ref().and_then(|s| s.metadata.asset_hash.as_deref()),
+                item.old
+                    .as_ref()
+                    .and_then(|s| s.metadata.asset_hash.as_deref()),
+                item.new
+                    .as_ref()
+                    .and_then(|s| s.metadata.asset_hash.as_deref()),
             );
             let shader_hash = format_hash_transition(
-                item.old.as_ref().and_then(|s| s.metadata.shader_hash.as_deref()),
-                item.new.as_ref().and_then(|s| s.metadata.shader_hash.as_deref()),
+                item.old
+                    .as_ref()
+                    .and_then(|s| s.metadata.shader_hash.as_deref()),
+                item.new
+                    .as_ref()
+                    .and_then(|s| s.metadata.shader_hash.as_deref()),
             );
 
             rows.push(CompareTableRow {
@@ -1012,7 +1020,6 @@ fn render_human_summary_preview(summary: Option<&str>) -> String {
     }
     lines.join("\n")
 }
-
 
 #[cfg(test)]
 mod tests {

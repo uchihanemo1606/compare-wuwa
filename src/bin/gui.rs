@@ -407,9 +407,9 @@ fn main() -> Result<(), slint::PlatformError> {
         .map_err(|error| {
             slint::PlatformError::Other(format!("failed to spawn gui thread: {error}"))
         })?;
-    handle.join().map_err(|_| {
-        slint::PlatformError::Other("gui thread panicked".to_string())
-    })?
+    handle
+        .join()
+        .map_err(|_| slint::PlatformError::Other("gui thread panicked".to_string()))?
 }
 
 fn run_gui() -> Result<(), slint::PlatformError> {
@@ -655,11 +655,8 @@ fn run_gui() -> Result<(), slint::PlatformError> {
                     match result {
                         Ok(detail) => {
                             window.set_status_text(
-                                format!(
-                                    "Compared wuwa_{} -> wuwa_{}.",
-                                    old_version, new_version
-                                )
-                                .into(),
+                                format!("Compared wuwa_{} -> wuwa_{}.", old_version, new_version)
+                                    .into(),
                             );
                             window.set_compare_summary_text(detail.summary.into());
                             let rows = detail
@@ -675,9 +672,7 @@ fn run_gui() -> Result<(), slint::PlatformError> {
                             window.set_compare_gate_text(detail.quality_gate_text.into());
                             window.set_compare_inference_text(detail.inference_text.into());
                             window.set_compare_proposal_text(detail.proposal_text.into());
-                            window.set_compare_human_summary_text(
-                                detail.human_summary_text.into(),
-                            );
+                            window.set_compare_human_summary_text(detail.human_summary_text.into());
                         }
                         Err(error) => {
                             window.set_status_text(format!("Compare failed: {error}").into());
