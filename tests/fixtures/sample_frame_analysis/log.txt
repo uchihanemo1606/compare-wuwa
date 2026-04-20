@@ -1,0 +1,34 @@
+analyse_options=dump_vb dump_ib log
+
+000123 IASetVertexBuffers(StartSlot:0, NumBuffers:2, ppVertexBuffers:0x12345678, pStrides:0x40, pOffsets:0)
+    0: resource=0x12345678 hash=4a7d9c1f
+    1: resource=0x87654321 hash=8e2b5a9f
+000123 IASetIndexBuffer(pIndexBuffer:0xABCDEF00, Format:R32_UINT, Offset:0)
+    resource=0xABCDEF00 hash=c1d3f072
+000123 VSSetShader(pVertexShader:0x11111111)
+    resource=0x11111111 hash=aabbccdd
+000123 PSSetShader(pPixelShader:0x22222222)
+    resource=0x22222222 hash=11223344
+000123 DrawIndexed(IndexCount:15234, StartIndexLocation:0, BaseVertexLocation:0)
+
+000124 IASetVertexBuffers(StartSlot:0, NumBuffers:1, ppVertexBuffers:0x33445566, pStrides:0x40, pOffsets:0)
+    0: resource=0x33445566 hash=4d8a6f23
+000124 IASetIndexBuffer(pIndexBuffer:0x77889900, Format:R32_UINT, Offset:0)
+    resource=0x77889900 hash=e7c195b0
+000124 VSSetShader(pVertexShader:0x11111111)
+    resource=0x11111111 hash=aabbccdd
+000124 PSSetShader(pPixelShader:0x33333333)
+    resource=0x33333333 hash=55667788
+000124 DrawIndexed(IndexCount:8192, StartIndexLocation:0, BaseVertexLocation:0)
+
+000125 IASetVertexBuffers(StartSlot:0, NumBuffers:1, ppVertexBuffers:0xAABBCCDD, pStrides:0x20, pOffsets:0)
+    0: resource=0xAABBCCDD hash=2a3b4c5d
+000125 IASetIndexBuffer(pIndexBuffer:0x10101010, Format:R16_UINT, Offset:0)
+    resource=0x10101010 hash=6e7f8a9b
+000125 DrawIndexed(IndexCount:3072, StartIndexLocation:0, BaseVertexLocation:0)
+
+000126 SOSetTargets(NumBuffers:1, ppSOTargets:0x90909090, pOffsets:0)
+    0: resource=0x90909090 hash=cdef0123
+000126 IASetVertexBuffers(StartSlot:0, NumBuffers:1, ppVertexBuffers:0x12345678, pStrides:0x40, pOffsets:0)
+    0: view=0xDEADBEEF resource=0x12345678 hash=4a7d9c1f
+000126 DrawIndexed(IndexCount:15234, StartIndexLocation:0, BaseVertexLocation:0)
