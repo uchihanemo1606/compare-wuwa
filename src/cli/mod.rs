@@ -20,6 +20,7 @@ pub enum Command {
     Map(MapArgs),
     MapLocal(MapLocalArgs),
     Snapshot(SnapshotArgs),
+    IngestFrameAnalysis(IngestFrameAnalysisArgs),
     SnapshotReport(SnapshotReportArgs),
     CompareSnapshots(CompareSnapshotsArgs),
     OrchestrateVersionPair(OrchestrateVersionPairArgs),
@@ -75,6 +76,22 @@ pub struct SnapshotArgs {
     pub extractor_inventory: Option<PathBuf>,
     #[arg(long)]
     pub store_in_report: bool,
+    #[arg(long)]
+    pub report_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct IngestFrameAnalysisArgs {
+    /// Read-only FrameAnalysis dump directory copied out of the game folder; must contain log.txt.
+    #[arg(long)]
+    pub dump_dir: PathBuf,
+    #[arg(long)]
+    pub version_id: String,
+    #[arg(long)]
+    pub output: PathBuf,
+    /// If true, also call create_extractor_backed_snapshot_from_file and persist the snapshot under report_root.
+    #[arg(long)]
+    pub store_snapshot: bool,
     #[arg(long)]
     pub report_root: Option<PathBuf>,
 }

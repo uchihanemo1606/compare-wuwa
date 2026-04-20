@@ -45,6 +45,9 @@ pub fn run(cli: Cli) -> AppResult<()> {
                 println!("stored extractor-inventory: {}", path.display());
             }
         }
+        Command::IngestFrameAnalysis(args) => {
+            pipeline::run_ingest_frame_analysis_command(args)?;
+        }
         Command::SnapshotReport(args) => {
             let report = pipeline::run_snapshot_report_command(&args)?;
             println!(

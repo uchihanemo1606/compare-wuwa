@@ -115,7 +115,7 @@ the existing slots as follows:
 
 ```rust
 PreparedAssetInventory {
-    schema_version: "whashreonator.prepared-asset-inventory.v1".to_string(),
+    schema_version: "whashreonator.prepared-assets.v1".to_string(),
     context: PreparedAssetInventoryContext {
         extraction_tool: Some("3dmigoto-frame-analysis".to_string()),
         extraction_kind: Some("runtime_draw_call_hashes".to_string()),

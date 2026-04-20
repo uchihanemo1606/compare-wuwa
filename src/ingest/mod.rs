@@ -1,3 +1,5 @@
+pub mod frame_analysis;
+
 use std::{
     collections::BTreeSet,
     fs,
@@ -372,9 +374,10 @@ fn validate_prepared_asset_inventory(
 
     if let Some(extraction_kind) = inventory.context.extraction_kind.as_deref()
         && !extraction_kind.eq_ignore_ascii_case("asset_records")
+        && !extraction_kind.eq_ignore_ascii_case("runtime_draw_call_hashes")
     {
         return Err(AppError::InvalidInput(format!(
-            "{label}.context.extraction_kind must stay on asset_records for the current extractor-backed integration"
+            "{label}.context.extraction_kind must stay on asset_records or runtime_draw_call_hashes for the current extractor-backed integration"
         )));
     }
 

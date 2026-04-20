@@ -1,4 +1,5 @@
 use std::{
+    fs,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -13,8 +14,9 @@ use crate::wwmi::dependency::{
 use crate::{
     cli::{
         CompareSnapshotsArgs, ExtractWwmiKnowledgeArgs, GenerateProposalsArgs, InferFixesArgs,
-        MapArgs, MapLocalArgs, OrchestrateVersionPairArgs, QualityGateModeArg,
-        ScanModDependenciesArgs, SnapshotArgs, SnapshotCaptureScopeArg, SnapshotReportArgs,
+        IngestFrameAnalysisArgs, MapArgs, MapLocalArgs, OrchestrateVersionPairArgs,
+        QualityGateModeArg, ScanModDependenciesArgs, SnapshotArgs, SnapshotCaptureScopeArg,
+        SnapshotReportArgs,
     },
     compare::{SnapshotCompareReport, SnapshotComparer, load_snapshot_compare_report},
     config::AppConfig,
@@ -32,9 +34,11 @@ use crate::{
     inference::{FixInferenceEngine, InferenceReport, load_inference_report},
     ingest::{
         AssetSourceSpec, IngestSource, JsonFileIngestSource, LocalSnapshotCaptureScope,
+        frame_analysis::{build_prepared_inventory, parse_frame_analysis_log},
         load_bundle_from_sources,
     },
     matcher::{HeuristicMatcher, Matcher},
+    output_policy::validate_artifact_output_path,
     proposal::{ProposalArtifacts, ProposalEngine},
     report::{
         VersionContinuityIndex, VersionDiffReportBuilder, VersionDiffReportV2,
@@ -381,6 +385,91 @@ pub fn run_snapshot_command(args: &SnapshotArgs) -> AppResult<SnapshotCommandRes
         stored_snapshot_path,
         stored_extractor_inventory_path,
     })
+}
+
+pub fn run_ingest_frame_analysis_command(args: IngestFrameAnalysisArgs) -> AppResult<()> {
+    validate_artifact_output_path(args.output.as_path())?;
+
+    if !args.dump_dir.exists() {
+        return Err(AppError::InvalidInput(format!(
+            "frame analysis dump directory does not exist: {}",
+            args.dump_dir.display()
+        )));
+    }
+    if !args.dump_dir.is_dir() {
+        return Err(AppError::InvalidInput(format!(
+            "frame analysis dump path is not a directory: {}",
+            args.dump_dir.display()
+        )));
+    }
+
+    let dump_dir = args.dump_dir.canonicalize()?;
+    let log_path = dump_dir.join("log.txt");
+    if !log_path.exists() || !log_path.is_file() {
+        return Err(AppError::InvalidInput(format!(
+            "frame analysis dump directory must contain log.txt: {}",
+            dump_dir.display()
+        )));
+    }
+
+    let log_text = fs::read_to_string(&log_path)?;
+    let mut dump = parse_frame_analysis_log(&log_text)?;
+    dump.dump_dir = dump_dir.clone();
+    dump.log_path = log_path.clone();
+
+    let inventory = build_prepared_inventory(&dump, &args.version_id);
+    let json = serde_json::to_string_pretty(&inventory)?;
+
+    if let Some(parent) = args.output.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&args.output, json)?;
+
+    if args.store_snapshot {
+        let snapshot = create_extractor_backed_snapshot_from_file(
+            &args.version_id,
+            dump_dir.as_path(),
+            args.output.as_path(),
+        )?;
+        let storage = match args.report_root {
+            Some(root) => ReportStorage::new(root),
+            None => ReportStorage::default(),
+        };
+        let stored_path = storage.save_snapshot_for_version(&snapshot)?;
+        println!("stored snapshot: {}", stored_path.display());
+    }
+
+    let ib_count = inventory
+        .assets
+        .iter()
+        .filter(|asset| asset.asset.kind.as_deref() == Some("index_buffer"))
+        .count();
+    let vb_count = inventory
+        .assets
+        .iter()
+        .filter(|asset| asset.asset.kind.as_deref() == Some("vertex_buffer"))
+        .count();
+    let shader_count = inventory
+        .assets
+        .iter()
+        .filter(|asset| {
+            matches!(
+                asset.asset.kind.as_deref(),
+                Some("vertex_shader") | Some("pixel_shader")
+            )
+        })
+        .count();
+    println!(
+        "frame-analysis inventory exported: draw_calls={} ib={} vb={} shaders={} assets={}",
+        dump.draw_calls.len(),
+        ib_count,
+        vb_count,
+        shader_count,
+        inventory.assets.len()
+    );
+    println!("wrote frame-analysis inventory: {}", args.output.display());
+
+    Ok(())
 }
 
 fn validate_snapshot_storage_alignment(
