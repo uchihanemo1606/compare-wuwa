@@ -84,6 +84,7 @@ Codex should treat the following as always-on repository rules:
 - Keep technical identifiers, code symbols, file paths, commands, and literal program output in their original language.
 - Do not drift into mod-authoring, mod packaging, or generic mod-management features. Stay focused on version diff, evidence gathering, continuity, repair-assist, and reviewer-facing outputs.
 - Prefer additive changes, conservative review-first decisions, and backward-compatible schema evolution.
+- **Pak-format reverse engineering for Wuthering Waves is out of scope.** Do not reintroduce a Rust `.pak` parser, do not vendor `repak` (or any equivalent), and do not add direct dependencies on `aes`/`oodle`/Unreal-pak crates for the purpose of offline `.pak` decoding. The canonical ground truth for runtime hashes is the Frame Analysis (3DMigoto / WWMI) adapter. See `docs/adr-001-no-pak-parser.md` for context and rationale.
 
 ## Backend Phase Defaults
 When Codex is asked to implement a backend phase, these defaults apply unless the user explicitly overrides them:

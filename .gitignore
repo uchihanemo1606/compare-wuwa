@@ -21,6 +21,10 @@ Thumbs.db
 # Environment files
 .env
 .env.*
+
+# Local AES keys + other secrets (public community keys but kept out of tree
+# to avoid diff noise when rotating per game version; see secrets/README.md)
+/secrets/
 # Agent files
 AGENTS.md
 #.cursor

@@ -21,7 +21,6 @@ pub enum Command {
     MapLocal(MapLocalArgs),
     Snapshot(SnapshotArgs),
     IngestFrameAnalysis(IngestFrameAnalysisArgs),
-    ExtractPak(ExtractPakArgs),
     SnapshotReport(SnapshotReportArgs),
     CompareSnapshots(CompareSnapshotsArgs),
     OrchestrateVersionPair(OrchestrateVersionPairArgs),
@@ -95,29 +94,6 @@ pub struct IngestFrameAnalysisArgs {
     pub store_snapshot: bool,
     #[arg(long)]
     pub report_root: Option<PathBuf>,
-}
-
-#[derive(Debug, Clone, Args)]
-pub struct ExtractPakArgs {
-    /// Read-only path to a .pak file. Reading from the live game folder is allowed, but this command never writes there.
-    #[arg(long)]
-    pub pak: PathBuf,
-
-    /// 64-char hex AES-256 key (with or without 0x prefix). Mutually exclusive with --aes-key-file.
-    #[arg(long, conflicts_with = "aes_key_file")]
-    pub aes_key: Option<String>,
-
-    /// Text file whose first line is a 64-char hex AES-256 key, so the key does not appear in shell history.
-    #[arg(long, conflicts_with = "aes_key")]
-    pub aes_key_file: Option<PathBuf>,
-
-    /// Output directory for extracted files. Created if missing and validated by validate_artifact_output_path.
-    #[arg(long)]
-    pub output_dir: PathBuf,
-
-    /// Optional v1 path filter. Uses simple substring match after removing '**', e.g. "Content/Character/**".
-    #[arg(long)]
-    pub path_filter: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
