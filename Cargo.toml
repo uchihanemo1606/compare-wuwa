@@ -12,3 +12,5 @@ tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["fmt"] }
 slint = { version = "1.8.0", default-features = true, features = ["std", "compat-1-2"] }
 winapi = { version = "0.3.9", features = ["winuser", "windef"] }
+repak = { path = "vendor/repak/repak" }
+aes = "0.8.4"

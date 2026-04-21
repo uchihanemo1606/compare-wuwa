@@ -82,18 +82,38 @@ The synthetic pak validates extraction logic without exposing real game data.
 
 A separate fixture for AES-encrypted pak is **optional**. If `repak` test fixtures expose one, reuse; else add a `cargo test --ignored` test that the user runs once with a real key+pak to validate AES path.
 
-### 3.5 New dependency
+### 3.5 New dependencies
 
-Add to `Cargo.toml`:
+`repak` is **vendored locally** under `vendor/repak/` (cloned from `https://github.com/trumank/repak.git` at tag `v0.2.3`, with the upstream `.git` folder removed to avoid nested git history). Reference it via path dep:
 
 ```toml
 [dependencies]
-repak = "0.x"  # latest stable that supports UE4.26 + AES read
+repak = { path = "vendor/repak/repak" }
+aes = "0.8.4"
 ```
 
-If `glob` crate is not already in deps, prefer NOT to add it; use a simple substring match for path filter v1.
+**Why vendored, not git remote**: project policy is to minimize external dependency coupling. Vendored repak gives:
+- Offline build (no GitHub fetch required)
+- Locked code (no upstream surprise)
+- Easy in-tree patches (e.g. add `pub use aes;` later to drop the direct `aes` dep)
+- Self-contained repo for clones
 
-This is an **explicit dependency addition**, the only one allowed for Phase 2A. STOP and report blocker if you find you need any other new dep (no `tokio`, no `clap` extension, no `serde_json` rewrite — work with what is already in the project).
+License: Apache-2.0 OR MIT dual. The vendored copy preserves upstream license files: `vendor/repak/LICENSE-APACHE` and `vendor/repak/LICENSE-MIT`. Do NOT remove those files. Do NOT modify any file under `vendor/repak/` for Phase 2A — treat it as read-only third-party code. (A separate maintenance phase later may apply minimal patches; for Phase 2A, stay surgical: zero modifications to vendor/.)
+
+Path is `vendor/repak/repak` (the inner library crate inside the upstream Cargo workspace), NOT `vendor/repak/` (which is the workspace root containing both `repak` and `repak_cli`). Picking the wrong path will pull in the CLI binary deps unnecessarily.
+
+**Why `aes` direct dep**: `repak::PakBuilder::key(...)` requires an `aes::Aes256` instance, but `repak` does not `pub use aes`. The `aes` crate is already in the dep tree as a transitive dep of `repak` (workspace pin: `aes = "0.8.4"`), so adding it as a direct dep does not increase binary size or version skew (Cargo deduplicates). The version `0.8.4` is locked because that is what the vendored repak's workspace `Cargo.toml` pins.
+
+This `aes` direct dep is acceptable because:
+- It is a **technical workaround for an API gap** in repak (missing re-export), not a feature scope expansion.
+- It is already pulled in transitively, so the dep tree depth and binary size are unchanged.
+- A future patch to vendored repak can add `pub use aes;` and remove this direct dep without any other code change in our codebase.
+
+Wrap the `aes::Aes256` instance inside our own `AesKey` struct (defined in section 5.1). Internal callers convert via a method like `AesKey::to_repak_key() -> aes::Aes256`. The public API of our `pak_extractor` module must not leak the upstream type.
+
+If `glob` crate is not already in project deps, do NOT add it; use a simple substring match for path filter v1 (e.g. `entry_path.contains(filter)`).
+
+`repak` and `aes` are the **only new dependencies allowed for Phase 2A**. STOP and report blocker if you find you need any other (no `tokio`, no `clap` extension, no `serde_json` rewrite, no `glob`, no `walkdir`, no other crypto crate beyond what repak + aes provide — work with what is already in the dep tree).
 
 ## 4. Output spec
 
@@ -139,14 +159,20 @@ A small JSON sidecar describing the extraction run, written into the output dir 
     {
       "pak_path": "Content/Character/Encore/Body.uasset",
       "output_relative_path": "Content/Character/Encore/Body.uasset",
-      "size_bytes": 10240,
-      "compression": "Zlib"
+      "size_bytes": 10240
     }
     // ... more entries (do NOT include all 1342 in the JSON for performance;
     // cap at 1000 entries with a "truncated_entries: 342" sibling field)
   ]
 }
 ```
+
+**Per-entry fields**:
+- `pak_path`: from `repak`'s `files()` iterator
+- `output_relative_path`: built when extracting (relative to `--output-dir`)
+- `size_bytes`: from `fs::metadata(output_path).len()` after writing the entry (= uncompressed payload size)
+
+**Note on missing fields**: per-entry `compression` (Zlib / Oodle / None) and `compressed_size` are intentionally NOT included because `repak`'s public API does not expose entry-level metadata for them. A future fork of `repak` can expose these, at which point the manifest schema can evolve additively. For Phase 2A, the diagnostic value of the manifest does not require those fields.
 
 This manifest is **diagnostic only** — Phase 2B reads files from disk, not from the manifest. The manifest exists so a reviewer can sanity-check what the extractor did without inspecting the file tree.
 
@@ -376,7 +402,7 @@ If at any point you find yourself wanting to:
 - Build a `PreparedAssetInventory` from extracted files → STOP. Phase 2C.
 - Modify `PreparedAssetInventory`, `ExtractedAssetRecord`, or any schema in `src/domain/mod.rs` → STOP, report blocker.
 - Touch `compare/`, `inference/`, `proposal/`, `human_summary/`, `report_storage/`, `report/`, `gui_app/`, `bin/gui.rs` → STOP, report blocker.
-- Add any new Cargo dependency beyond `repak` → STOP, report blocker.
+- Add any new Cargo dependency beyond `repak` and `aes` (see section 3.5 for why both are necessary) → STOP, report blocker.
 - Add a new `#[cfg(test)]` block inside `src/` → STOP, report blocker.
 - Try to "auto-fetch" AES keys from a remote endpoint → STOP. Out of scope for Phase 2A.
 - Invent a new schema_version that is NOT `whashreonator.pak-extraction-manifest.v1` → STOP, the schema name is locked by this spec.
@@ -493,8 +519,8 @@ Tick each before declaring Phase 2A done:
 
 ## 15. External references
 
-- `repak` Rust crate: https://github.com/trumank/repak — UE4 pak format reader/writer in Rust, supports UE4.26-5.3 with AES read.
-- WuWa AES key archive (community, public): https://github.com/ClostroOffi/wuwa-aes-archive — reference only; NEVER commit a key into our repo.
+- `trumank/repak` upstream (vendored locally, NOT a live network dep): https://github.com/trumank/repak — UE4 pak format reader/writer in Rust, supports UE4.26-5.3 with AES read. License: Apache-2.0 OR MIT. Vendored copy at `vendor/repak/` pinned to tag `v0.2.3`.
+- WuWa AES key archive (community, public reference only): https://github.com/ClostroOffi/wuwa-aes-archive — NEVER commit a key into our repo, NEVER fetch keys from the network in this phase.
 - WWMI mod tools (modder workflow context, not directly used by Phase 2A): https://github.com/SpectrumQT/WWMI-TOOLS
 
 ## 16. Anti-scope reminder (final)

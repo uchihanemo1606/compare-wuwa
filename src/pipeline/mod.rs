@@ -13,8 +13,8 @@ use crate::wwmi::dependency::{
 };
 use crate::{
     cli::{
-        CompareSnapshotsArgs, ExtractWwmiKnowledgeArgs, GenerateProposalsArgs, InferFixesArgs,
-        IngestFrameAnalysisArgs, MapArgs, MapLocalArgs, OrchestrateVersionPairArgs,
+        CompareSnapshotsArgs, ExtractPakArgs, ExtractWwmiKnowledgeArgs, GenerateProposalsArgs,
+        InferFixesArgs, IngestFrameAnalysisArgs, MapArgs, MapLocalArgs, OrchestrateVersionPairArgs,
         QualityGateModeArg, ScanModDependenciesArgs, SnapshotArgs, SnapshotCaptureScopeArg,
         SnapshotReportArgs,
     },
@@ -36,6 +36,7 @@ use crate::{
         AssetSourceSpec, IngestSource, JsonFileIngestSource, LocalSnapshotCaptureScope,
         frame_analysis::{build_prepared_inventory, parse_frame_analysis_log},
         load_bundle_from_sources,
+        pak_extractor::{AesKey, PakExtractionRequest, extract_pak},
     },
     matcher::{HeuristicMatcher, Matcher},
     output_policy::validate_artifact_output_path,
@@ -468,6 +469,68 @@ pub fn run_ingest_frame_analysis_command(args: IngestFrameAnalysisArgs) -> AppRe
         inventory.assets.len()
     );
     println!("wrote frame-analysis inventory: {}", args.output.display());
+
+    Ok(())
+}
+
+pub fn run_extract_pak_command(args: ExtractPakArgs) -> AppResult<()> {
+    validate_artifact_output_path(args.output_dir.as_path())?;
+
+    if !args.pak.exists() {
+        return Err(AppError::InvalidInput(format!(
+            "pak file does not exist: {}",
+            args.pak.display()
+        )));
+    }
+    if !args.pak.is_file() {
+        return Err(AppError::InvalidInput(format!(
+            "pak path is not a file: {}",
+            args.pak.display()
+        )));
+    }
+
+    let aes_key = match (args.aes_key.as_deref(), args.aes_key_file.as_deref()) {
+        (Some(_), Some(_)) => {
+            return Err(AppError::InvalidInput(
+                "--aes-key and --aes-key-file are mutually exclusive".to_string(),
+            ));
+        }
+        (Some(inline), None) => Some(AesKey::from_hex(inline)?),
+        (None, Some(path)) => {
+            let key_text = fs::read_to_string(path)?;
+            let first_line = key_text
+                .lines()
+                .next()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .ok_or_else(|| {
+                    AppError::InvalidInput(format!(
+                        "aes key file must contain a non-empty first line: {}",
+                        path.display()
+                    ))
+                })?;
+            Some(AesKey::from_hex(first_line)?)
+        }
+        (None, None) => None,
+    };
+
+    let result = extract_pak(PakExtractionRequest {
+        pak_path: args.pak.clone(),
+        aes_key,
+        output_dir: args.output_dir.clone(),
+        path_filter: args.path_filter.clone(),
+    })?;
+
+    let size_mb = result.manifest.summary.extracted_bytes as f64 / (1024.0 * 1024.0);
+    let duration_s = result.manifest.summary.duration_ms as f64 / 1000.0;
+    println!(
+        "extracted {} files ({size_mb:.1} MB) in {duration_s:.1}s; filtered out {} entries",
+        result.manifest.summary.extracted_entries, result.manifest.summary.filtered_out_entries
+    );
+    println!(
+        "wrote extraction-manifest: {}",
+        result.manifest_path.display()
+    );
 
     Ok(())
 }

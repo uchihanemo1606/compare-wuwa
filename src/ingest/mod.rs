@@ -1,4 +1,5 @@
 pub mod frame_analysis;
+pub mod pak_extractor;
 
 use std::{
     collections::BTreeSet,

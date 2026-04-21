@@ -48,6 +48,9 @@ pub fn run(cli: Cli) -> AppResult<()> {
         Command::IngestFrameAnalysis(args) => {
             pipeline::run_ingest_frame_analysis_command(args)?;
         }
+        Command::ExtractPak(args) => {
+            pipeline::run_extract_pak_command(args)?;
+        }
         Command::SnapshotReport(args) => {
             let report = pipeline::run_snapshot_report_command(&args)?;
             println!(
