@@ -184,6 +184,67 @@ fn cli_command_rejects_writing_into_src_or_tests() {
     assert!(error.to_string().contains("not allowed under src"));
 }
 
+#[test]
+fn parses_real_format_fixture_log_into_drawcalls() {
+    let text = fs::read_to_string(real_format_fixture_log_path())
+        .expect("read real-format frame analysis fixture");
+    let dump = parse_frame_analysis_log(&text).expect("parse real-format fixture");
+
+    assert_eq!(dump.options_header, "analyse_options: 0000063d");
+    assert_eq!(dump.draw_calls.len(), 3);
+
+    let first = &dump.draw_calls[0];
+    assert_eq!(first.drawcall, 5);
+    assert_eq!(first.vb_bindings.len(), 1);
+    assert_eq!(first.vb_bindings[0].hash, "5e31595c");
+    let ib = first.ib_binding.as_ref().expect("ib binding parsed inline");
+    assert_eq!(ib.hash, "647cd8c5");
+    let vs = first.vs_binding.as_ref().expect("vs binding parsed inline");
+    assert_eq!(vs.hash, "1bf99472af1427ba");
+    let ps = first.ps_binding.as_ref().expect("ps binding parsed inline");
+    assert_eq!(ps.hash, "8a60ac34aba9b8e2");
+    matches!(
+        first.draw,
+        Some(FrameAnalysisDraw::Indexed { index_count: 6, .. })
+    );
+
+    let second = &dump.draw_calls[1];
+    assert_eq!(second.drawcall, 7);
+    let ib2 = second
+        .ib_binding
+        .as_ref()
+        .expect("ib binding for drawcall 7");
+    assert_eq!(ib2.hash, "ab12cd34");
+}
+
+#[test]
+fn real_format_normalizes_dxgi_index_format_codes() {
+    let text = fs::read_to_string(real_format_fixture_log_path())
+        .expect("read real-format frame analysis fixture");
+    let dump = parse_frame_analysis_log(&text).expect("parse real-format fixture");
+    let inventory = build_prepared_inventory(&dump, "0.0.0-real-fixture");
+
+    let r16_record = inventory
+        .assets
+        .iter()
+        .find(|asset| asset.hash_fields.asset_hash.as_deref() == Some("647cd8c5"))
+        .expect("ib record for drawcall 5");
+    assert_eq!(
+        r16_record.asset.metadata.index_format.as_deref(),
+        Some("R16_UINT")
+    );
+
+    let r32_record = inventory
+        .assets
+        .iter()
+        .find(|asset| asset.hash_fields.asset_hash.as_deref() == Some("ab12cd34"))
+        .expect("ib record for drawcall 7");
+    assert_eq!(
+        r32_record.asset.metadata.index_format.as_deref(),
+        Some("R32_UINT")
+    );
+}
+
 fn parse_fixture_dump() -> whashreonator::ingest::frame_analysis::FrameAnalysisDump {
     parse_frame_analysis_log(&load_fixture_log_text()).expect("parse synthetic fixture")
 }
@@ -212,6 +273,14 @@ fn fixture_dump_dir() -> PathBuf {
 
 fn fixture_log_path() -> PathBuf {
     fixture_dump_dir().join("log.txt")
+}
+
+fn real_format_fixture_log_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("real_frame_analysis")
+        .join("log.txt")
 }
 
 fn unique_test_dir() -> PathBuf {

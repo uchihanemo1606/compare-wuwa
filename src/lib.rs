@@ -48,6 +48,21 @@ pub fn run(cli: Cli) -> AppResult<()> {
         Command::IngestFrameAnalysis(args) => {
             pipeline::run_ingest_frame_analysis_command(args)?;
         }
+        Command::ExtractWwmiAnchors(args) => {
+            let report = pipeline::run_extract_wwmi_anchors_command(&args)?;
+            println!(
+                "wwmi anchor report exported: profile={} found={} missing={} unexpected={} success={}",
+                report.capture_profile.label(),
+                report.found_anchors.len(),
+                report.missing_anchors.len(),
+                report.unexpected_anchor_candidates.len(),
+                if report.success { "yes" } else { "no" }
+            );
+            println!("wrote wwmi-anchor-report: {}", args.output.display());
+        }
+        Command::ArchiveDump(args) => {
+            pipeline::run_archive_dump_command(args)?;
+        }
         Command::SnapshotReport(args) => {
             let report = pipeline::run_snapshot_report_command(&args)?;
             println!(

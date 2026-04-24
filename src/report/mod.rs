@@ -893,8 +893,14 @@ impl VersionContinuityIndex {
                             reason_codes: input.reason_codes.clone(),
                         };
 
+                        let stable_key_transition = input
+                            .from
+                            .as_ref()
+                            .zip(input.to.as_ref())
+                            .is_some_and(|(from, to)| from.key == to.key);
+
                         let continue_key = observation.to_path.as_ref().and_then(|to_path| {
-                            if observation.relation.continues_thread() {
+                            if observation.relation.continues_thread() || stable_key_transition {
                                 Some((observation.to_version_id.clone(), to_path.clone()))
                             } else {
                                 None
@@ -909,6 +915,7 @@ impl VersionContinuityIndex {
                                 | VersionContinuityRelation::InsufficientEvidence
                                 | VersionContinuityRelation::Removed
                         ) || observation.status == DiffStatus::Uncertain;
+                        let terminal = terminal && !stable_key_transition;
 
                         let thread = threads
                             .get_mut(thread_index)
@@ -1556,7 +1563,10 @@ impl ResonatorCollector {
 impl From<&SnapshotAssetSummary> for VersionedItem {
     fn from(value: &SnapshotAssetSummary) -> Self {
         Self {
-            key: value.path.clone(),
+            key: value
+                .identity_tuple
+                .clone()
+                .unwrap_or_else(|| value.path.clone()),
             label: value
                 .normalized_name
                 .clone()
@@ -2659,6 +2669,7 @@ mod tests {
         SnapshotAsset {
             id: path.to_string(),
             path: path.to_string(),
+            identity_tuple: None,
             kind: Some("mesh".to_string()),
             metadata: crate::domain::AssetMetadata {
                 logical_name: Some(logical_name.to_string()),
@@ -2692,6 +2703,7 @@ mod tests {
                     Some(120) => Some("sig-b".to_string()),
                     _ => None,
                 },
+                identity_tuple: None,
             },
             source: crate::domain::AssetSourceContext::default(),
         }

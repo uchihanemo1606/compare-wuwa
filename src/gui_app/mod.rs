@@ -1389,6 +1389,7 @@ mod tests {
             assets: vec![SnapshotAsset {
                 id: "asset-1".to_string(),
                 path: "Content/Character/Encore/Body.mesh".to_string(),
+                identity_tuple: None,
                 kind: Some("mesh".to_string()),
                 metadata: AssetMetadata {
                     logical_name: Some("body".to_string()),

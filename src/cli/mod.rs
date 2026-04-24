@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 
+use crate::wwmi::anchors::WwmiAnchorCaptureProfile;
+
 #[derive(Debug, Parser)]
 #[command(
     name = "whashreonator",
@@ -21,6 +23,8 @@ pub enum Command {
     MapLocal(MapLocalArgs),
     Snapshot(SnapshotArgs),
     IngestFrameAnalysis(IngestFrameAnalysisArgs),
+    ExtractWwmiAnchors(ExtractWwmiAnchorsArgs),
+    ArchiveDump(ArchiveDumpArgs),
     SnapshotReport(SnapshotReportArgs),
     CompareSnapshots(CompareSnapshotsArgs),
     OrchestrateVersionPair(OrchestrateVersionPairArgs),
@@ -94,6 +98,52 @@ pub struct IngestFrameAnalysisArgs {
     pub store_snapshot: bool,
     #[arg(long)]
     pub report_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ExtractWwmiAnchorsArgs {
+    /// Read-only FrameAnalysis dump directory copied out of the game folder; must contain log.txt.
+    #[arg(long)]
+    pub dump_dir: PathBuf,
+    #[arg(long, value_enum, default_value_t = WwmiAnchorCaptureProfileArg::Full)]
+    pub capture_profile: WwmiAnchorCaptureProfileArg,
+    #[arg(long)]
+    pub output: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum WwmiAnchorCaptureProfileArg {
+    MenuUi,
+    ShapekeyRuntime,
+    Full,
+}
+
+impl From<WwmiAnchorCaptureProfileArg> for WwmiAnchorCaptureProfile {
+    fn from(value: WwmiAnchorCaptureProfileArg) -> Self {
+        match value {
+            WwmiAnchorCaptureProfileArg::MenuUi => Self::MenuUi,
+            WwmiAnchorCaptureProfileArg::ShapekeyRuntime => Self::ShapekeyRuntime,
+            WwmiAnchorCaptureProfileArg::Full => Self::Full,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ArchiveDumpArgs {
+    /// Read-only raw WWMI/3DMigoto FrameAnalysis dump directory; must contain log.txt.
+    /// The command reads log.txt and never writes into this directory.
+    #[arg(long)]
+    pub raw_dump_dir: PathBuf,
+    /// Character label (e.g. ameath, lupa). Must be non-empty and must not contain path separators.
+    #[arg(long)]
+    pub character: String,
+    /// Game version label (e.g. 3.2.2). Must be non-empty and must not contain path separators.
+    #[arg(long)]
+    pub version: String,
+    /// Base directory under which the archive is created. Must be under an approved artifact root.
+    /// Final archive path: <archive-root>/wuwa_<version>/<character>/<timestamp>/.
+    #[arg(long)]
+    pub archive_root: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

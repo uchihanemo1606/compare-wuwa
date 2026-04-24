@@ -13,6 +13,7 @@ use crate::{
     snapshot::GameSnapshot,
     wwmi::{
         WwmiKnowledgeBase,
+        anchors::WwmiAnchorReport,
         dependency::{WwmiModDependencyBaselineSet, WwmiModDependencyProfile},
     },
 };
@@ -52,6 +53,10 @@ pub fn export_snapshot_compare_output(
 
 pub fn export_wwmi_knowledge_output(knowledge: &WwmiKnowledgeBase, output: &Path) -> AppResult<()> {
     write_pretty_json(output, knowledge)
+}
+
+pub fn export_wwmi_anchor_report_output(report: &WwmiAnchorReport, output: &Path) -> AppResult<()> {
+    write_pretty_json(output, report)
 }
 
 pub fn export_mod_dependency_profile_output(

@@ -52,6 +52,10 @@ pub struct AssetHashFields {
     pub asset_hash: Option<String>,
     pub shader_hash: Option<String>,
     pub signature: Option<String>,
+    // Stable FA identity lives with hash-derived fields so snapshot construction can forward it
+    // without another domain wrapper.
+    #[serde(default)]
+    pub identity_tuple: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]

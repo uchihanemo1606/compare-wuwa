@@ -2704,6 +2704,7 @@ mod tests {
             assets: vec![SnapshotAsset {
                 id: "asset-1".to_string(),
                 path: "Content/Character/Encore/Body.mesh".to_string(),
+                identity_tuple: None,
                 kind: Some("mesh".to_string()),
                 metadata: AssetMetadata {
                     logical_name: Some("body".to_string()),
@@ -2965,6 +2966,7 @@ mod tests {
         SnapshotAsset {
             id: path.to_string(),
             path: path.to_string(),
+            identity_tuple: None,
             kind: Some("mesh".to_string()),
             metadata: AssetMetadata {
                 logical_name: Some(logical_name.to_string()),
@@ -3021,6 +3023,7 @@ mod tests {
                 asset_hash: Some(format!("hash-{path}")),
                 shader_hash: Some("shader-shared".to_string()),
                 signature: Some(signature.to_string()),
+                identity_tuple: None,
             },
             source: crate::domain::AssetSourceContext {
                 extraction_tool: Some("fixture-extractor".to_string()),

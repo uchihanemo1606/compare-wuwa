@@ -361,6 +361,7 @@ fn asset(path: &str, vertex_count: u32, enriched: bool) -> SnapshotAsset {
     SnapshotAsset {
         id: path.to_string(),
         path: path.to_string(),
+        identity_tuple: None,
         kind: Some("mesh".to_string()),
         metadata: whashreonator::domain::AssetMetadata {
             logical_name: Some("Encore Body".to_string()),
@@ -436,6 +437,7 @@ fn asset(path: &str, vertex_count: u32, enriched: bool) -> SnapshotAsset {
                 None
             },
             signature: Some(format!("sig-{vertex_count}")),
+            identity_tuple: None,
         },
         source: if enriched {
             whashreonator::domain::AssetSourceContext {

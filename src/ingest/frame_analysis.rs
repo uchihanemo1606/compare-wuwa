@@ -32,6 +32,14 @@ pub struct FrameAnalysisDrawCall {
     pub ib_binding: Option<FrameAnalysisBinding>,
     pub vs_binding: Option<FrameAnalysisBinding>,
     pub ps_binding: Option<FrameAnalysisBinding>,
+    /// Compute shader binding for Dispatch draw calls. Captured so the
+    /// inventory can surface compute-shader hashes, which are one of the
+    /// WWMI plugin's hardcoded hook anchors (e.g. ShapeKeyLoaderCS).
+    pub cs_binding: Option<FrameAnalysisBinding>,
+    /// Textures bound to the pixel shader for this draw call. Captured so
+    /// the inventory can surface UI texture anchors that the WWMI plugin
+    /// relies on for menu/dressing-room detection.
+    pub ps_texture_bindings: Vec<FrameAnalysisBinding>,
     pub draw: Option<FrameAnalysisDraw>,
     ib_format: Option<String>,
 }
@@ -55,6 +63,14 @@ pub enum FrameAnalysisDraw {
         vertex_count: u32,
         start_vertex: u32,
     },
+    /// `Dispatch` / `DispatchIndirect` — compute-shader invocation. Thread
+    /// group counts come from the API line; indirect dispatches have
+    /// unknown counts and store zeros.
+    Compute {
+        thread_group_x: u32,
+        thread_group_y: u32,
+        thread_group_z: u32,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +79,7 @@ enum PendingBindingKind {
     IndexBuffer,
     VertexShader,
     PixelShader,
+    PixelShaderTextures,
     Ignore,
 }
 
@@ -86,12 +103,27 @@ struct ShaderAggregate {
     draw_calls: BTreeSet<u32>,
 }
 
+#[derive(Debug, Default)]
+struct CsAggregate {
+    draw_calls: BTreeSet<u32>,
+    thread_group_dims: BTreeSet<(u32, u32, u32)>,
+}
+
+#[derive(Debug, Default)]
+struct PsTextureAggregate {
+    draw_calls: BTreeSet<u32>,
+    slots: BTreeSet<String>,
+    ps_hashes: BTreeSet<String>,
+}
+
 impl FrameAnalysisDrawCall {
     fn is_meaningful(&self) -> bool {
         !self.vb_bindings.is_empty()
             || self.ib_binding.is_some()
             || self.vs_binding.is_some()
             || self.ps_binding.is_some()
+            || self.cs_binding.is_some()
+            || !self.ps_texture_bindings.is_empty()
             || self.draw.is_some()
     }
 
@@ -118,6 +150,7 @@ impl FrameAnalysisDrawCall {
         match self.draw.as_ref() {
             Some(FrameAnalysisDraw::Indexed { index_count, .. }) => Some(*index_count),
             Some(FrameAnalysisDraw::NonIndexed { vertex_count, .. }) => Some(*vertex_count),
+            Some(FrameAnalysisDraw::Compute { .. }) => None,
             None => None,
         }
     }
@@ -130,9 +163,14 @@ pub fn parse_frame_analysis_log(text: &str) -> AppResult<FrameAnalysisDump> {
         .ok_or_else(|| AppError::InvalidInput("frame analysis log is empty".to_string()))?
         .trim_end()
         .to_string();
-    if !options_header.starts_with("analyse_options=") {
+    // 3DMigoto fixture style writes `analyse_options=<flag list>`; live WWMI
+    // dumps write `analyse_options: <hex flags>`. Accept either form.
+    if !options_header.starts_with("analyse_options=")
+        && !options_header.starts_with("analyse_options:")
+    {
         return Err(AppError::InvalidInput(
-            "frame analysis log must start with analyse_options=...".to_string(),
+            "frame analysis log must start with analyse_options=... or analyse_options: ..."
+                .to_string(),
         ));
     }
 
@@ -191,6 +229,9 @@ pub fn parse_frame_analysis_log(text: &str) -> AppResult<FrameAnalysisDump> {
             PendingBindingKind::IndexBuffer => draw_call.ib_binding = Some(binding),
             PendingBindingKind::VertexShader => draw_call.vs_binding = Some(binding),
             PendingBindingKind::PixelShader => draw_call.ps_binding = Some(binding),
+            PendingBindingKind::PixelShaderTextures => {
+                draw_call.ps_texture_bindings.push(binding);
+            }
             PendingBindingKind::Ignore => {}
         }
     }
@@ -226,6 +267,11 @@ pub fn build_prepared_inventory(
     let mut vb_assets = BTreeMap::<String, VbAggregate>::new();
     let mut vs_assets = BTreeMap::<String, ShaderAggregate>::new();
     let mut ps_assets = BTreeMap::<String, ShaderAggregate>::new();
+    let mut cs_assets = BTreeMap::<String, CsAggregate>::new();
+    // Textures bound to PS are keyed by (ps_hash, slot) so the identity
+    // tuple stays stable across a texture content hash drift as long as the
+    // parent pixel shader and slot position do not change.
+    let mut ps_texture_assets = BTreeMap::<String, PsTextureAggregate>::new();
 
     for draw_call in &dump.draw_calls {
         let count_hint = draw_call.draw_count_hint();
@@ -258,6 +304,23 @@ pub fn build_prepared_inventory(
                 .insert(draw_call.drawcall);
         }
 
+        if let Some(binding) = draw_call.cs_binding.as_ref() {
+            let aggregate = cs_assets.entry(binding.hash.clone()).or_default();
+            aggregate.draw_calls.insert(draw_call.drawcall);
+            if let Some(FrameAnalysisDraw::Compute {
+                thread_group_x,
+                thread_group_y,
+                thread_group_z,
+            }) = draw_call.draw.as_ref()
+            {
+                aggregate.thread_group_dims.insert((
+                    *thread_group_x,
+                    *thread_group_y,
+                    *thread_group_z,
+                ));
+            }
+        }
+
         for binding in &draw_call.vb_bindings {
             let aggregate = vb_assets.entry(binding.hash.clone()).or_default();
             aggregate.draw_calls.insert(draw_call.drawcall);
@@ -270,11 +333,26 @@ pub fn build_prepared_inventory(
                 aggregate.vs_hashes.insert(vs_binding.hash.clone());
             }
         }
+
+        for binding in &draw_call.ps_texture_bindings {
+            let aggregate = ps_texture_assets.entry(binding.hash.clone()).or_default();
+            aggregate.draw_calls.insert(draw_call.drawcall);
+            aggregate.slots.insert(binding.slot.clone());
+            if let Some(ps_binding) = draw_call.ps_binding.as_ref() {
+                aggregate.ps_hashes.insert(ps_binding.hash.clone());
+            }
+        }
     }
 
     let mut assets = Vec::<ExtractedAssetRecord>::new();
 
     for (hash, aggregate) in ib_assets {
+        let index_format = aggregate.index_format.clone();
+        let identity_tuple = Some(format!(
+            "fa|ib|idx_fmt:{}|idx_count:{}",
+            index_format.as_deref().unwrap_or("none"),
+            aggregate.max_index_count.unwrap_or(0)
+        ));
         assets.push(ExtractedAssetRecord {
             asset: AssetRecord {
                 id: format!("ib_{hash}"),
@@ -283,7 +361,7 @@ pub fn build_prepared_inventory(
                 metadata: AssetMetadata {
                     logical_name: Some(format!("ib_{hash}")),
                     index_count: aggregate.max_index_count,
-                    index_format: aggregate.index_format,
+                    index_format,
                     tags: vec![format!("draw_calls={}", aggregate.draw_calls.len())],
                     ..AssetMetadata::default()
                 },
@@ -292,6 +370,7 @@ pub fn build_prepared_inventory(
                 asset_hash: Some(hash),
                 shader_hash: None,
                 signature: None,
+                identity_tuple,
             },
             source: frame_analysis_source_context(dump_root.clone()),
         });
@@ -303,6 +382,7 @@ pub fn build_prepared_inventory(
         } else {
             None
         };
+        let identity_tuple = shader_identity_tuple(shader_hash.as_deref());
         assets.push(ExtractedAssetRecord {
             asset: AssetRecord {
                 id: format!("vb_{hash}"),
@@ -320,6 +400,7 @@ pub fn build_prepared_inventory(
                 asset_hash: Some(hash),
                 shader_hash,
                 signature: None,
+                identity_tuple,
             },
             source: frame_analysis_source_context(dump_root.clone()),
         });
@@ -343,6 +424,72 @@ pub fn build_prepared_inventory(
             aggregate.draw_calls.len(),
             dump_root.clone(),
         ));
+    }
+
+    for (hash, aggregate) in cs_assets {
+        let identity_tuple = compute_shader_identity_tuple(&aggregate);
+        assets.push(ExtractedAssetRecord {
+            asset: AssetRecord {
+                id: format!("cs_{hash}"),
+                path: format!("runtime/cs/{hash}"),
+                kind: Some("compute_shader".to_string()),
+                metadata: AssetMetadata {
+                    logical_name: Some(format!("cs_{hash}")),
+                    tags: vec![
+                        format!("draw_calls={}", aggregate.draw_calls.len()),
+                        "wwmi-anchor-candidate".to_string(),
+                    ],
+                    ..AssetMetadata::default()
+                },
+            },
+            hash_fields: AssetHashFields {
+                asset_hash: Some(hash),
+                shader_hash: None,
+                signature: None,
+                identity_tuple,
+            },
+            source: frame_analysis_source_context(dump_root.clone()),
+        });
+    }
+
+    for (hash, aggregate) in ps_texture_assets {
+        let ps_hash = if aggregate.ps_hashes.len() == 1 {
+            aggregate.ps_hashes.iter().next().cloned()
+        } else {
+            None
+        };
+        let slot = if aggregate.slots.len() == 1 {
+            aggregate.slots.iter().next().cloned()
+        } else {
+            None
+        };
+        let identity_tuple = ps_texture_identity_tuple(ps_hash.as_deref(), slot.as_deref());
+        let mut tags = vec![
+            format!("draw_calls={}", aggregate.draw_calls.len()),
+            "wwmi-anchor-candidate".to_string(),
+        ];
+        if let Some(slot_value) = slot.as_deref() {
+            tags.push(format!("ps_slot={slot_value}"));
+        }
+        assets.push(ExtractedAssetRecord {
+            asset: AssetRecord {
+                id: format!("ps_tex_{hash}"),
+                path: format!("runtime/ps_tex/{hash}"),
+                kind: Some("texture_resource".to_string()),
+                metadata: AssetMetadata {
+                    logical_name: Some(format!("ps_tex_{hash}")),
+                    tags,
+                    ..AssetMetadata::default()
+                },
+            },
+            hash_fields: AssetHashFields {
+                asset_hash: Some(hash),
+                shader_hash: ps_hash,
+                signature: None,
+                identity_tuple,
+            },
+            source: frame_analysis_source_context(dump_root.clone()),
+        });
     }
 
     assets.sort_by(|left, right| {
@@ -415,12 +562,88 @@ fn apply_api_call(
     match api_name {
         "IASetVertexBuffers" => Ok(Some(PendingBindingKind::VertexBuffer)),
         "IASetIndexBuffer" => {
-            draw_call.ib_format = parse_named_string_argument(api_call, "Format");
+            draw_call.ib_format = parse_named_string_argument(api_call, "Format")
+                .map(|raw| normalize_index_format(&raw));
+            // Live WWMI dump format: `IASetIndexBuffer(...) hash=<hex>` on a single
+            // line. Synthetic fixture format: hash on indented continuation line.
+            if let Some(hash) = extract_inline_trailing_hash(api_call)? {
+                let resource =
+                    parse_named_string_argument(api_call, "pIndexBuffer").unwrap_or_default();
+                draw_call.ib_binding = Some(FrameAnalysisBinding {
+                    slot: DEFAULT_BINDING_SLOT.to_string(),
+                    view_address: None,
+                    resource_address: resource,
+                    hash,
+                });
+                return Ok(Some(PendingBindingKind::Ignore));
+            }
             Ok(Some(PendingBindingKind::IndexBuffer))
         }
-        "VSSetShader" => Ok(Some(PendingBindingKind::VertexShader)),
-        "PSSetShader" => Ok(Some(PendingBindingKind::PixelShader)),
+        "VSSetShader" => {
+            if let Some(hash) = extract_inline_trailing_hash(api_call)? {
+                let resource =
+                    parse_named_string_argument(api_call, "pVertexShader").unwrap_or_default();
+                draw_call.vs_binding = Some(FrameAnalysisBinding {
+                    slot: DEFAULT_BINDING_SLOT.to_string(),
+                    view_address: None,
+                    resource_address: resource,
+                    hash,
+                });
+                return Ok(Some(PendingBindingKind::Ignore));
+            }
+            Ok(Some(PendingBindingKind::VertexShader))
+        }
+        "PSSetShader" => {
+            if let Some(hash) = extract_inline_trailing_hash(api_call)? {
+                let resource =
+                    parse_named_string_argument(api_call, "pPixelShader").unwrap_or_default();
+                draw_call.ps_binding = Some(FrameAnalysisBinding {
+                    slot: DEFAULT_BINDING_SLOT.to_string(),
+                    view_address: None,
+                    resource_address: resource,
+                    hash,
+                });
+                return Ok(Some(PendingBindingKind::Ignore));
+            }
+            Ok(Some(PendingBindingKind::PixelShader))
+        }
+        "CSSetShader" => {
+            if let Some(hash) = extract_inline_trailing_hash(api_call)? {
+                let resource =
+                    parse_named_string_argument(api_call, "pComputeShader").unwrap_or_default();
+                draw_call.cs_binding = Some(FrameAnalysisBinding {
+                    slot: DEFAULT_BINDING_SLOT.to_string(),
+                    view_address: None,
+                    resource_address: resource,
+                    hash,
+                });
+                return Ok(Some(PendingBindingKind::Ignore));
+            }
+            // No inline hash typically means the CS was unbound
+            // (`pComputeShader:0x0000000000000000`). Ignore without error.
+            Ok(Some(PendingBindingKind::Ignore))
+        }
+        "PSSetShaderResources" => Ok(Some(PendingBindingKind::PixelShaderTextures)),
         "SOSetTargets" => Ok(Some(PendingBindingKind::Ignore)),
+        "Dispatch" => {
+            draw_call.draw = Some(FrameAnalysisDraw::Compute {
+                thread_group_x: parse_required_u32_argument(api_call, "ThreadGroupCountX")?,
+                thread_group_y: parse_required_u32_argument(api_call, "ThreadGroupCountY")?,
+                thread_group_z: parse_required_u32_argument(api_call, "ThreadGroupCountZ")?,
+            });
+            Ok(None)
+        }
+        "DispatchIndirect" => {
+            // Thread group counts are not recoverable from the API line for
+            // an indirect dispatch; store zeros as a sentinel so downstream
+            // can still recognise the draw call as compute-kind.
+            draw_call.draw = Some(FrameAnalysisDraw::Compute {
+                thread_group_x: 0,
+                thread_group_y: 0,
+                thread_group_z: 0,
+            });
+            Ok(None)
+        }
         "DrawIndexed" => {
             draw_call.draw = Some(FrameAnalysisDraw::Indexed {
                 index_count: parse_required_u32_argument(api_call, "IndexCount")?,
@@ -514,6 +737,50 @@ fn parse_required_i32_argument(api_call: &str, key: &str) -> AppResult<i32> {
     })
 }
 
+/// Parse a trailing `hash=<hex>` segment that follows the closing `)` of an
+/// API call line. Live WWMI/3DMigoto dumps emit the resource hash inline on
+/// the same line as `IASetIndexBuffer`, `VSSetShader`, and `PSSetShader`,
+/// rather than on an indented continuation line. Returns `None` when no such
+/// trailing token is present (the parser then falls back to the indented
+/// `resource=... hash=...` continuation form used by synthetic fixtures).
+fn extract_inline_trailing_hash(api_call: &str) -> AppResult<Option<String>> {
+    let Some(close_paren) = api_call.rfind(')') else {
+        return Ok(None);
+    };
+    let trailing = api_call[close_paren + 1..].trim();
+    let Some(value) = trailing.strip_prefix("hash=") else {
+        return Ok(None);
+    };
+    let hash: String = value
+        .chars()
+        .take_while(|character| !character.is_ascii_whitespace())
+        .collect();
+    if hash.is_empty() {
+        return Ok(None);
+    }
+    if !hash
+        .chars()
+        .all(|character| character.is_ascii_hexdigit() && !character.is_ascii_uppercase())
+    {
+        return Err(AppError::InvalidInput(format!(
+            "frame analysis hash must be lowercase hex, got {hash}"
+        )));
+    }
+    Ok(Some(hash))
+}
+
+/// Normalize an `IASetIndexBuffer` `Format:` argument to a canonical string so
+/// that fixture-style symbolic names (`R32_UINT`) and live-dump numeric DXGI
+/// values (`42`, `57`) compare equal downstream.
+fn normalize_index_format(raw: &str) -> String {
+    let trimmed = raw.trim();
+    match trimmed {
+        "42" | "DXGI_FORMAT_R32_UINT" | "R32_UINT" => "R32_UINT".to_string(),
+        "57" | "DXGI_FORMAT_R16_UINT" | "R16_UINT" => "R16_UINT".to_string(),
+        other => other.to_string(),
+    }
+}
+
 fn parse_named_string_argument(api_call: &str, key: &str) -> Option<String> {
     let start = api_call.find('(')?;
     let end = api_call.rfind(')')?;
@@ -550,8 +817,38 @@ fn build_shader_asset(
             asset_hash: None,
             shader_hash: Some(hash),
             signature: None,
+            identity_tuple: None,
         },
         source: frame_analysis_source_context(dump_root),
+    }
+}
+
+fn shader_identity_tuple(shader_hash: Option<&str>) -> Option<String> {
+    shader_hash.map(|value| format!("fa|vb|shader:{value}"))
+}
+
+fn compute_shader_identity_tuple(aggregate: &CsAggregate) -> Option<String> {
+    // When a compute shader is dispatched with exactly one observed thread
+    // group shape, that shape is a stable-ish fingerprint across a hash
+    // drift caused by a semantics-preserving recompile. When we see
+    // multiple shapes (or none, for `DispatchIndirect`), fall back to None
+    // and let path-keyed comparison apply.
+    if aggregate.thread_group_dims.len() == 1 {
+        let (x, y, z) = aggregate.thread_group_dims.iter().next().copied().unwrap();
+        if (x, y, z) == (0, 0, 0) {
+            None
+        } else {
+            Some(format!("fa|cs|tg:{x}x{y}x{z}"))
+        }
+    } else {
+        None
+    }
+}
+
+fn ps_texture_identity_tuple(ps_hash: Option<&str>, slot: Option<&str>) -> Option<String> {
+    match (ps_hash, slot) {
+        (Some(ps), Some(slot)) => Some(format!("fa|tex|ps:{ps}|slot:{slot}")),
+        _ => None,
     }
 }
 

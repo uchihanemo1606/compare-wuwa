@@ -904,6 +904,7 @@ mod tests {
         SnapshotAsset {
             id: path.to_string(),
             path: path.to_string(),
+            identity_tuple: None,
             kind: Some(
                 if path.ends_with(".weapon") {
                     "weapon"

@@ -1,0 +1,21 @@
+analyse_options: 0000063d
+000005 IASetVertexBuffers(StartSlot:0, NumBuffers:1, ppVertexBuffers:0x00000000567CFDB0, pStrides:0x00000000567CFDC8, pOffsets:0x00000000567CFDB8)
+       0: resource=0x000000004AAF4D60 hash=5e31595c
+000005 IASetIndexBuffer(pIndexBuffer:0x000000004AAF5020, Format:57, Offset:0) hash=647cd8c5
+000005 VSSetShader(pVertexShader:0x000000005D8B06B8, ppClassInstances:0x0000000000000000, NumClassInstances:0) hash=1bf99472af1427ba
+000005 PSSetShader(pPixelShader:0x00000002ABAE8B38, ppClassInstances:0x0000000000000000, NumClassInstances:0) hash=8a60ac34aba9b8e2
+000005 DrawIndexed(IndexCount:6, StartIndexLocation:0, BaseVertexLocation:0)
+000007 IASetVertexBuffers(StartSlot:0, NumBuffers:1, ppVertexBuffers:0x00000000567CFBA0, pStrides:0x00000000567CFBB8, pOffsets:0x00000000567CFBA8)
+       0: resource=0x000000004AAF4D60 hash=5e31595c
+000007 IASetIndexBuffer(pIndexBuffer:0x000000004AAF5020, Format:42, Offset:0) hash=ab12cd34
+000007 VSSetShader(pVertexShader:0x000000005D8B06B8, ppClassInstances:0x0000000000000000, NumClassInstances:0) hash=1bf99472af1427ba
+000007 PSSetShader(pPixelShader:0x00000002ABAE8B40, ppClassInstances:0x0000000000000000, NumClassInstances:0) hash=ff00ee11dd22cc33
+000007 DrawIndexed(IndexCount:120, StartIndexLocation:0, BaseVertexLocation:0)
+000010 PSSetConstantBuffers(StartSlot:0, NumBuffers:1, ppConstantBuffers:0x00000000567CFD10)
+       0: resource=0x000000004ABCCAE0 hash=372cb03d
+000010 IASetVertexBuffers(StartSlot:0, NumBuffers:1, ppVertexBuffers:0x00000000567CFB80, pStrides:0x00000000567CFB98, pOffsets:0x00000000567CFB88)
+       0: resource=0x000000005AAF4D60 hash=fedc9876
+000010 IASetIndexBuffer(pIndexBuffer:0x000000005AAF5020, Format:57, Offset:0) hash=00112233
+000010 VSSetShader(pVertexShader:0x000000005D8B0700, ppClassInstances:0x0000000000000000, NumClassInstances:0) hash=2cccdddeeeefffaa
+000010 PSSetShader(pPixelShader:0x00000002ABAE8B50, ppClassInstances:0x0000000000000000, NumClassInstances:0) hash=99887766aabbccdd
+000010 Draw(VertexCount:32, StartVertexLocation:0)
