@@ -36,6 +36,8 @@ pub struct GameSnapshot {
 pub struct SnapshotAsset {
     pub id: String,
     pub path: String,
+    #[serde(default)]
+    pub identity_tuple: Option<String>,
     pub kind: Option<String>,
     pub metadata: AssetMetadata,
     pub fingerprint: SnapshotFingerprint,
@@ -75,6 +77,8 @@ pub struct SnapshotHashFields {
     pub asset_hash: Option<String>,
     pub shader_hash: Option<String>,
     pub signature: Option<String>,
+    #[serde(default)]
+    pub identity_tuple: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -573,6 +577,7 @@ impl SnapshotAsset {
         Self {
             id: asset.id.clone(),
             path: asset.path.clone(),
+            identity_tuple: hash_fields.identity_tuple.clone(),
             kind: asset.kind.clone(),
             metadata: asset.metadata.clone(),
             fingerprint: SnapshotFingerprint {
@@ -596,6 +601,7 @@ impl SnapshotAsset {
                 asset_hash: hash_fields.asset_hash.clone(),
                 shader_hash: hash_fields.shader_hash.clone(),
                 signature: hash_fields.signature.clone(),
+                identity_tuple: hash_fields.identity_tuple.clone(),
             },
             source: source.clone(),
         }
@@ -1854,6 +1860,7 @@ mod tests {
             assets: vec![SnapshotAsset {
                 id: "hash-only".to_string(),
                 path: "Content/Character/Encore/Body.mesh".to_string(),
+                identity_tuple: None,
                 kind: Some("mesh".to_string()),
                 metadata: crate::domain::AssetMetadata::default(),
                 fingerprint: SnapshotFingerprint::default(),
@@ -1861,6 +1868,7 @@ mod tests {
                     asset_hash: Some("asset-md5".to_string()),
                     shader_hash: None,
                     signature: Some("sig-001".to_string()),
+                    identity_tuple: None,
                 },
                 source: crate::domain::AssetSourceContext::default(),
             }],
@@ -1980,6 +1988,7 @@ mod tests {
                 SnapshotAsset {
                     id: "a".to_string(),
                     path: "Content/Character/Encore/Body.mesh".to_string(),
+                    identity_tuple: None,
                     kind: Some("mesh".to_string()),
                     metadata: crate::domain::AssetMetadata::default(),
                     fingerprint: SnapshotFingerprint {
@@ -2000,6 +2009,7 @@ mod tests {
                 SnapshotAsset {
                     id: "b".to_string(),
                     path: "Client/Config/DefaultGame.ini".to_string(),
+                    identity_tuple: None,
                     kind: Some("ini".to_string()),
                     metadata: crate::domain::AssetMetadata::default(),
                     fingerprint: SnapshotFingerprint {

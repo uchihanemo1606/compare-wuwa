@@ -12,6 +12,7 @@ use crate::{
     repo::{GitRepoHistorySource, RepoCommit, RepoHistorySource},
 };
 
+pub mod anchors;
 pub mod dependency;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

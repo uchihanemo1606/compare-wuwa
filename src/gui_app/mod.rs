@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use crate::{
     compare::SnapshotComparer,
-    error::AppResult,
+    error::{AppError, AppResult},
     human_summary::HumanSummaryRenderer,
     inference::{FixInferenceEngine, InferenceReport},
     output_policy::resolve_artifact_root,
@@ -14,7 +14,13 @@ use crate::{
         PreparedVersionScan, VersionScanService,
     },
     snapshot::{GameSnapshot, assess_snapshot_scope},
-    wwmi::load_wwmi_knowledge,
+    wwmi::{
+        anchors::{
+            WwmiAnchorCaptureProfile, WwmiAnchorReport, WwmiVersionAnchorKnowledge,
+            extract_wwmi_anchor_report_from_dump,
+        },
+        load_wwmi_knowledge,
+    },
 };
 
 #[derive(Debug, Clone)]
@@ -35,6 +41,21 @@ impl Default for ScanForm {
                 .to_string(),
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct FrameAnalysisScanForm {
+    pub dump_dir: String,
+    pub version_id: String,
+    pub capture_profile: WwmiAnchorCaptureProfile,
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedFrameAnalysisScan {
+    pub dump_dir: PathBuf,
+    pub version_id: String,
+    pub capture_profile: WwmiAnchorCaptureProfile,
+    pub existing_hash_data: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -181,12 +202,88 @@ impl GuiController {
         }
     }
 
+    pub fn prepare_frame_analysis_scan(
+        &self,
+        form: &FrameAnalysisScanForm,
+    ) -> AppResult<PreparedFrameAnalysisScan> {
+        let dump_dir = PathBuf::from(form.dump_dir.trim());
+        if form.dump_dir.trim().is_empty() {
+            return Err(AppError::InvalidInput(
+                "frame analysis dump directory must not be empty".to_string(),
+            ));
+        }
+        if !dump_dir.exists() || !dump_dir.is_dir() {
+            return Err(AppError::InvalidInput(format!(
+                "frame analysis dump directory does not exist or is not a directory: {}",
+                dump_dir.display()
+            )));
+        }
+        if !dump_dir.join("log.txt").exists() {
+            return Err(AppError::InvalidInput(format!(
+                "frame analysis dump directory must contain log.txt: {}",
+                dump_dir.display()
+            )));
+        }
+
+        let version_id = validate_version_id(form.version_id.trim())?;
+        let existing_hash_data = self
+            .storage
+            .list_version_artifacts(&version_id)?
+            .iter()
+            .any(|artifact| artifact.kind == VersionArtifactKind::HashData);
+
+        Ok(PreparedFrameAnalysisScan {
+            dump_dir: dump_dir.canonicalize()?,
+            version_id,
+            capture_profile: form.capture_profile,
+            existing_hash_data,
+        })
+    }
+
+    pub fn run_frame_analysis_scan(
+        &self,
+        prepared: &PreparedFrameAnalysisScan,
+    ) -> AppResult<ScanRunResult> {
+        let report =
+            extract_wwmi_anchor_report_from_dump(&prepared.dump_dir, prepared.capture_profile)?;
+        let report_path = self
+            .storage
+            .save_wwmi_anchor_report_for_version(&prepared.version_id, &report)?;
+        let knowledge_path = self
+            .storage
+            .rebuild_and_save_wwmi_anchor_knowledge_for_version(&prepared.version_id)?;
+        let knowledge = self
+            .storage
+            .load_latest_wwmi_anchor_knowledge(&prepared.version_id)?;
+        let summary = render_frame_analysis_scan_summary(
+            &prepared.version_id,
+            &report,
+            knowledge.as_ref(),
+            report_path.as_path(),
+            knowledge_path.as_deref(),
+        );
+
+        if prepared.existing_hash_data {
+            Ok(ScanRunResult::Overwritten {
+                version_id: prepared.version_id.clone(),
+                saved_path: report_path,
+                summary,
+            })
+        } else {
+            Ok(ScanRunResult::Created {
+                version_id: prepared.version_id.clone(),
+                saved_path: report_path,
+                summary,
+            })
+        }
+    }
+
     pub fn list_versions(&self) -> AppResult<Vec<VersionRowView>> {
         let versions = self.storage.list_versions()?;
         Ok(versions
             .into_iter()
             .map(|entry| VersionRowView {
-                label: format!("wuwa_{}", entry.version_id),
+                label: version_row_label(&entry),
                 version_id: entry.version_id,
             })
             .collect())
@@ -200,8 +297,10 @@ impl GuiController {
         let mapping_proposal = self.storage.load_latest_mapping_proposal(version_id)?;
         let patch_draft = self.storage.load_latest_patch_draft(version_id)?;
         let human_summary = self.storage.load_latest_human_summary(version_id)?;
+        let anchor_report = self.storage.load_latest_wwmi_anchor_report(version_id)?;
+        let anchor_knowledge = self.storage.load_latest_wwmi_anchor_knowledge(version_id)?;
 
-        let summary = render_version_summary(
+        let summary = render_version_summary_with_hash_context(
             version_id,
             snapshot.as_ref(),
             report.as_ref(),
@@ -209,6 +308,8 @@ impl GuiController {
             mapping_proposal.as_ref(),
             patch_draft.as_ref(),
             human_summary.as_deref(),
+            anchor_report.as_ref(),
+            anchor_knowledge.as_ref(),
             &artifacts,
         );
         let artifacts = render_version_artifact_lines(&artifacts);
@@ -365,6 +466,32 @@ fn optional_text(value: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+fn validate_version_id(value: &str) -> AppResult<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::InvalidInput(
+            "version_id must not be empty".to_string(),
+        ));
+    }
+    if trimmed.contains('/') || trimmed.contains('\\') {
+        return Err(AppError::InvalidInput(format!(
+            "version_id must not contain path separators: {trimmed}"
+        )));
+    }
+
+    Ok(trimmed.to_string())
+}
+
+fn version_row_label(entry: &crate::report_storage::StoredVersionEntry) -> String {
+    if entry.has_snapshot && entry.has_hash_data {
+        format!("wuwa_{} [snapshot+hash]", entry.version_id)
+    } else if entry.has_hash_data {
+        format!("wuwa_{} [hash-only]", entry.version_id)
+    } else {
+        format!("wuwa_{}", entry.version_id)
+    }
+}
+
 fn render_scan_summary(snapshot: &crate::snapshot::GameSnapshot) -> String {
     let scope = assess_snapshot_scope(snapshot);
     let mut lines = vec![
@@ -462,6 +589,116 @@ fn render_phase3_generation_summary(
                 fix.code, fix.confidence
             ));
         }
+    }
+
+    lines.join("\n")
+}
+
+fn render_frame_analysis_scan_summary(
+    version_id: &str,
+    report: &WwmiAnchorReport,
+    knowledge: Option<&WwmiVersionAnchorKnowledge>,
+    report_path: &Path,
+    knowledge_path: Option<&Path>,
+) -> String {
+    let mut lines = vec![
+        format!("WWMI Anchor Scan {}", version_id),
+        format!("Capture profile: {}", report.capture_profile.label()),
+        format!("Source dump: {}", report.source_dump_dir),
+        format!(
+            "Anchor report: found={} missing={} unexpected={} success={}",
+            report.found_anchors.len(),
+            report.missing_anchors.len(),
+            report.unexpected_anchor_candidates.len(),
+            yes_no(report.success)
+        ),
+        format!("Stored anchor report: {}", report_path.display()),
+    ];
+
+    if let Some(path) = knowledge_path {
+        lines.push(format!("Stored anchor knowledge: {}", path.display()));
+    }
+
+    for found in &report.found_anchors {
+        lines.push(format!(
+            "Found anchor [{}] kind={} hash={}",
+            found.logical_name, found.expected_kind, found.hash
+        ));
+    }
+    for missing in &report.missing_anchors {
+        if let Some(candidate) = missing.candidate_replacements.first() {
+            lines.push(format!(
+                "Missing anchor [{}] kind={} | top candidate={} score={}",
+                missing.logical_name, missing.expected_kind, candidate.hash, candidate.score
+            ));
+        } else {
+            lines.push(format!(
+                "Missing anchor [{}] kind={} | no ranked replacement candidates yet",
+                missing.logical_name, missing.expected_kind
+            ));
+        }
+    }
+
+    if let Some(knowledge) = knowledge {
+        append_anchor_knowledge_lines(&mut lines, knowledge);
+    }
+
+    lines.join("\n")
+}
+
+fn render_version_summary_with_hash_context(
+    version_id: &str,
+    snapshot: Option<&GameSnapshot>,
+    report: Option<&VersionDiffReportV2>,
+    inference: Option<&InferenceReport>,
+    mapping_proposal: Option<&crate::proposal::MappingProposalOutput>,
+    patch_draft: Option<&crate::proposal::ProposalPatchDraftOutput>,
+    human_summary: Option<&str>,
+    anchor_report: Option<&WwmiAnchorReport>,
+    anchor_knowledge: Option<&WwmiVersionAnchorKnowledge>,
+    artifacts: &[crate::report_storage::VersionArtifactEntry],
+) -> String {
+    let mut lines = render_version_summary(
+        version_id,
+        snapshot,
+        report,
+        inference,
+        mapping_proposal,
+        patch_draft,
+        human_summary,
+        artifacts,
+    )
+    .lines()
+    .map(|line| line.to_string())
+    .collect::<Vec<_>>();
+
+    if let Some(anchor_knowledge) = anchor_knowledge {
+        append_anchor_knowledge_lines(&mut lines, anchor_knowledge);
+    } else if let Some(anchor_report) = anchor_report {
+        lines.push(format!(
+            "WWMI anchor report: profile={} found={} missing={} unexpected={} success={}",
+            anchor_report.capture_profile.label(),
+            anchor_report.found_anchors.len(),
+            anchor_report.missing_anchors.len(),
+            anchor_report.unexpected_anchor_candidates.len(),
+            yes_no(anchor_report.success)
+        ));
+        for missing in anchor_report.missing_anchors.iter().take(3) {
+            if let Some(candidate) = missing.candidate_replacements.first() {
+                lines.push(format!(
+                    "  missing [{}] -> top candidate {} score={}",
+                    missing.logical_name, candidate.hash, candidate.score
+                ));
+            }
+        }
+    } else if artifacts
+        .iter()
+        .any(|artifact| artifact.kind == VersionArtifactKind::HashData)
+    {
+        lines.push(
+            "WWMI anchor data: hash artifacts exist, but no version-level anchor knowledge snapshot could be loaded."
+                .to_string(),
+        );
     }
 
     lines.join("\n")
@@ -654,6 +891,68 @@ fn render_version_summary(
     }
 
     lines.join("\n")
+}
+
+fn append_anchor_knowledge_lines(lines: &mut Vec<String>, knowledge: &WwmiVersionAnchorKnowledge) {
+    let exact_anchor_count = knowledge
+        .anchors
+        .iter()
+        .filter(|anchor| !anchor.current_exact_matches.is_empty())
+        .count();
+    let missing_anchor_count = knowledge
+        .anchors
+        .iter()
+        .filter(|anchor| anchor.current_missing)
+        .count();
+    let capture_profiles = knowledge
+        .capture_profiles
+        .iter()
+        .map(|profile| profile.label())
+        .collect::<Vec<_>>();
+    lines.push(format!(
+        "WWMI anchors: reports={} profiles={} exact={} missing={}",
+        knowledge.report_count,
+        if capture_profiles.is_empty() {
+            "none".to_string()
+        } else {
+            capture_profiles.join(", ")
+        },
+        exact_anchor_count,
+        missing_anchor_count
+    ));
+
+    for anchor in &knowledge.anchors {
+        if let Some(current) = anchor.current_exact_matches.first() {
+            lines.push(format!(
+                "  anchor [{}] matched hash={} via {}",
+                anchor.logical_name,
+                current.hash,
+                current.capture_profile.label()
+            ));
+        } else if let Some(candidate) = anchor.current_candidate_replacements.first() {
+            lines.push(format!(
+                "  anchor [{}] missing | top candidate={} score={}",
+                anchor.logical_name, candidate.hash, candidate.score
+            ));
+        } else {
+            lines.push(format!(
+                "  anchor [{}] missing | no current candidates",
+                anchor.logical_name
+            ));
+        }
+
+        if !anchor.historical_exact_matches.is_empty() {
+            let history = anchor
+                .historical_exact_matches
+                .iter()
+                .rev()
+                .take(3)
+                .map(|entry| format!("{}={}", entry.version_id, entry.hash))
+                .collect::<Vec<_>>()
+                .join(", ");
+            lines.push(format!("    history: {history}"));
+        }
+    }
 }
 
 fn render_version_artifact_lines(
@@ -1389,6 +1688,7 @@ mod tests {
             assets: vec![SnapshotAsset {
                 id: "asset-1".to_string(),
                 path: "Content/Character/Encore/Body.mesh".to_string(),
+                identity_tuple: None,
                 kind: Some("mesh".to_string()),
                 metadata: AssetMetadata {
                     logical_name: Some("body".to_string()),

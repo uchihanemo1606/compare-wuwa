@@ -1804,6 +1804,7 @@ fn asset_summary(path: &str) -> SnapshotAssetSummary {
     SnapshotAssetSummary {
         id: path.to_string(),
         path: path.to_string(),
+        identity_tuple: None,
         kind: Some("mesh".to_string()),
         logical_name: Some("Asset".to_string()),
         normalized_name: Some("asset".to_string()),
@@ -1835,6 +1836,7 @@ fn continuity_snapshot(version_id: &str, path: &str, logical_name: &str) -> Game
         assets: vec![SnapshotAsset {
             id: path.to_string(),
             path: path.to_string(),
+            identity_tuple: None,
             kind: Some("mesh".to_string()),
             metadata: AssetMetadata {
                 logical_name: Some(logical_name.to_string()),
@@ -1861,6 +1863,7 @@ fn continuity_snapshot(version_id: &str, path: &str, logical_name: &str) -> Game
                 asset_hash: Some(format!("hash-{path}")),
                 shader_hash: Some("shader-shared".to_string()),
                 signature: Some(format!("sig-{logical_name}")),
+                identity_tuple: None,
             },
             source: AssetSourceContext::default(),
         }],

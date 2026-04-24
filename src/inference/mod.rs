@@ -4482,6 +4482,7 @@ mod tests {
         SnapshotAssetSummary {
             id: path.to_string(),
             path: path.to_string(),
+            identity_tuple: None,
             kind: Some("mesh".to_string()),
             logical_name: Some("Asset".to_string()),
             normalized_name: Some("asset".to_string()),

@@ -234,6 +234,8 @@ pub struct SnapshotAssetChange {
 pub struct SnapshotAssetSummary {
     pub id: String,
     pub path: String,
+    #[serde(default)]
+    pub identity_tuple: Option<String>,
     pub kind: Option<String>,
     #[serde(default)]
     pub logical_name: Option<String>,
@@ -307,15 +309,15 @@ impl SnapshotComparer {
         old_snapshot: &GameSnapshot,
         new_snapshot: &GameSnapshot,
     ) -> SnapshotCompareReport {
-        let old_by_path = old_snapshot
+        let old_by_key = old_snapshot
             .assets
             .iter()
-            .map(|asset| (asset.path.as_str(), asset))
+            .map(|asset| (diff_key(asset), asset))
             .collect::<BTreeMap<_, _>>();
-        let new_by_path = new_snapshot
+        let new_by_key = new_snapshot
             .assets
             .iter()
-            .map(|asset| (asset.path.as_str(), asset))
+            .map(|asset| (diff_key(asset), asset))
             .collect::<BTreeMap<_, _>>();
 
         let mut added_assets = Vec::new();
@@ -323,8 +325,8 @@ impl SnapshotComparer {
         let mut changed_assets = Vec::new();
         let mut unchanged_assets = 0usize;
 
-        for (path, old_asset) in &old_by_path {
-            match new_by_path.get(path) {
+        for (key, old_asset) in &old_by_key {
+            match new_by_key.get(key) {
                 Some(new_asset) => {
                     let changed_fields = changed_fields(old_asset, new_asset);
                     if changed_fields.is_empty() {
@@ -343,8 +345,8 @@ impl SnapshotComparer {
             }
         }
 
-        for (path, new_asset) in &new_by_path {
-            if !old_by_path.contains_key(path) {
+        for (key, new_asset) in &new_by_key {
+            if !old_by_key.contains_key(key) {
                 added_assets.push(build_added_asset_entry(new_asset));
             }
         }
@@ -785,6 +787,7 @@ impl From<&SnapshotAsset> for SnapshotAssetSummary {
         Self {
             id: value.id.clone(),
             path: value.path.clone(),
+            identity_tuple: value.identity_tuple.clone(),
             kind: value.kind.clone(),
             logical_name: value.metadata.logical_name.clone(),
             normalized_name: value.fingerprint.normalized_name.clone(),
@@ -805,6 +808,13 @@ impl From<&SnapshotAsset> for SnapshotAssetSummary {
             source: value.source.clone(),
         }
     }
+}
+
+fn diff_key(asset: &SnapshotAsset) -> &str {
+    asset
+        .identity_tuple
+        .as_deref()
+        .unwrap_or(asset.path.as_str())
 }
 
 fn changed_fields(old_asset: &SnapshotAsset, new_asset: &SnapshotAsset) -> Vec<String> {
@@ -3070,6 +3080,7 @@ mod tests {
         SnapshotAsset {
             id: path.to_string(),
             path: path.to_string(),
+            identity_tuple: None,
             kind: Some("mesh".to_string()),
             metadata: crate::domain::AssetMetadata {
                 logical_name: normalized_name.map(ToOwned::to_owned),

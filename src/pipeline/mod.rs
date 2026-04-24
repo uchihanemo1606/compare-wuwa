@@ -13,10 +13,10 @@ use crate::wwmi::dependency::{
 };
 use crate::{
     cli::{
-        CompareSnapshotsArgs, ExtractWwmiKnowledgeArgs, GenerateProposalsArgs, InferFixesArgs,
-        IngestFrameAnalysisArgs, MapArgs, MapLocalArgs, OrchestrateVersionPairArgs,
-        QualityGateModeArg, ScanModDependenciesArgs, SnapshotArgs, SnapshotCaptureScopeArg,
-        SnapshotReportArgs,
+        ArchiveDumpArgs, CompareSnapshotsArgs, ExtractWwmiAnchorsArgs, ExtractWwmiKnowledgeArgs,
+        GenerateProposalsArgs, InferFixesArgs, IngestFrameAnalysisArgs, MapArgs, MapLocalArgs,
+        OrchestrateVersionPairArgs, QualityGateModeArg, ScanModDependenciesArgs, SnapshotArgs,
+        SnapshotCaptureScopeArg, SnapshotReportArgs,
     },
     compare::{SnapshotCompareReport, SnapshotComparer, load_snapshot_compare_report},
     config::AppConfig,
@@ -27,7 +27,7 @@ use crate::{
         export_mapping_proposal_output, export_mod_dependency_baseline_set_output,
         export_patch_draft_output, export_proposal_patch_draft_output,
         export_snapshot_compare_output, export_snapshot_output, export_text_output,
-        export_wwmi_knowledge_output,
+        export_wwmi_anchor_report_output, export_wwmi_knowledge_output,
     },
     fingerprint::{DefaultFingerprinter, Fingerprinter},
     human_summary::HumanSummaryRenderer,
@@ -51,7 +51,11 @@ use crate::{
     },
     snapshot_report::{SnapshotInventoryReport, SnapshotReportRenderer, load_snapshots},
     validator::{ThresholdValidator, Validator},
-    wwmi::{WwmiKnowledgeBase, WwmiKnowledgeExtractor, WwmiRepoInput, load_wwmi_knowledge},
+    wwmi::{
+        WwmiKnowledgeBase, WwmiKnowledgeExtractor, WwmiRepoInput,
+        anchors::{WwmiAnchorReport, extract_wwmi_anchor_report_from_dump},
+        load_wwmi_knowledge,
+    },
 };
 
 pub struct MatchPipeline<I, F, M, V, E> {
@@ -459,17 +463,184 @@ pub fn run_ingest_frame_analysis_command(args: IngestFrameAnalysisArgs) -> AppRe
             )
         })
         .count();
+    let cs_count = inventory
+        .assets
+        .iter()
+        .filter(|asset| asset.asset.kind.as_deref() == Some("compute_shader"))
+        .count();
+    let texture_count = inventory
+        .assets
+        .iter()
+        .filter(|asset| asset.asset.kind.as_deref() == Some("texture_resource"))
+        .count();
     println!(
-        "frame-analysis inventory exported: draw_calls={} ib={} vb={} shaders={} assets={}",
+        "frame-analysis inventory exported: draw_calls={} ib={} vb={} shaders={} cs={} textures={} assets={}",
         dump.draw_calls.len(),
         ib_count,
         vb_count,
         shader_count,
+        cs_count,
+        texture_count,
         inventory.assets.len()
     );
     println!("wrote frame-analysis inventory: {}", args.output.display());
 
     Ok(())
+}
+
+pub fn run_extract_wwmi_anchors_command(
+    args: &ExtractWwmiAnchorsArgs,
+) -> AppResult<WwmiAnchorReport> {
+    validate_artifact_output_path(args.output.as_path())?;
+    let report =
+        extract_wwmi_anchor_report_from_dump(args.dump_dir.as_path(), args.capture_profile.into())?;
+    export_wwmi_anchor_report_output(&report, args.output.as_path())?;
+
+    Ok(report)
+}
+
+const FA_DUMP_ARCHIVE_SCHEMA: &str = "whashreonator.fa-dump-archive.v1";
+const FA_DUMP_ARCHIVE_META_FILE: &str = "dump_meta.json";
+const FA_DUMP_ARCHIVE_LOG_FILE: &str = "log.txt";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FrameAnalysisDumpArchiveMeta {
+    pub schema_version: String,
+    pub archived_at_unix_ms: u128,
+    pub character: String,
+    pub version_id: String,
+    pub raw_dump_path: String,
+    pub raw_dump_size_bytes: u64,
+    pub archived_log_path: String,
+    pub archived_log_size_bytes: u64,
+}
+
+/// Archive the `log.txt` of a raw 3DMigoto FrameAnalysis dump to a clean,
+/// labelled location, leaving the raw dump untouched. The raw dump is often
+/// >1 GB because other tools (mod authoring) need the full `.buf`/`.dds`
+/// artefacts. This command gives the investigator workflow a compact, tagged
+/// copy (~MB) of just the part we need, without disturbing the original.
+pub fn run_archive_dump_command(args: ArchiveDumpArgs) -> AppResult<()> {
+    validate_artifact_output_path(args.archive_root.as_path())?;
+
+    let character = validate_archive_label("character", &args.character)?;
+    let version = validate_archive_label("version", &args.version)?;
+
+    if !args.raw_dump_dir.exists() {
+        return Err(AppError::InvalidInput(format!(
+            "raw dump directory does not exist: {}",
+            args.raw_dump_dir.display()
+        )));
+    }
+    if !args.raw_dump_dir.is_dir() {
+        return Err(AppError::InvalidInput(format!(
+            "raw dump path is not a directory: {}",
+            args.raw_dump_dir.display()
+        )));
+    }
+
+    let raw_dump_dir = args.raw_dump_dir.canonicalize()?;
+    let raw_log_path = raw_dump_dir.join(FA_DUMP_ARCHIVE_LOG_FILE);
+    if !raw_log_path.exists() || !raw_log_path.is_file() {
+        return Err(AppError::InvalidInput(format!(
+            "raw dump directory must contain log.txt: {}",
+            raw_dump_dir.display()
+        )));
+    }
+
+    fs::create_dir_all(&args.archive_root)?;
+
+    let now_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| {
+            AppError::InvalidInput(format!("system clock is before UNIX_EPOCH: {error}"))
+        })?
+        .as_millis();
+    // Timestamp subfolder keeps multiple dumps of the same (character, version)
+    // pair distinct so repeated archives never overwrite each other.
+    let timestamp_segment = format!("archive-{now_unix_ms:013}");
+    let target_dir = args
+        .archive_root
+        .join(format!("wuwa_{version}"))
+        .join(&character)
+        .join(&timestamp_segment);
+    fs::create_dir_all(&target_dir)?;
+
+    let archived_log_path = target_dir.join(FA_DUMP_ARCHIVE_LOG_FILE);
+    fs::copy(&raw_log_path, &archived_log_path)?;
+
+    let archived_log_size_bytes = fs::metadata(&archived_log_path)?.len();
+    let raw_dump_size_bytes = directory_size_recursive(&raw_dump_dir)?;
+
+    let meta = FrameAnalysisDumpArchiveMeta {
+        schema_version: FA_DUMP_ARCHIVE_SCHEMA.to_string(),
+        archived_at_unix_ms: now_unix_ms,
+        character: character.clone(),
+        version_id: version.clone(),
+        raw_dump_path: normalize_path_for_json(&raw_dump_dir),
+        raw_dump_size_bytes,
+        archived_log_path: normalize_path_for_json(&archived_log_path),
+        archived_log_size_bytes,
+    };
+    let meta_path = target_dir.join(FA_DUMP_ARCHIVE_META_FILE);
+    fs::write(&meta_path, serde_json::to_vec_pretty(&meta)?)?;
+
+    let raw_mb = raw_dump_size_bytes as f64 / (1024.0 * 1024.0);
+    let archived_mb = archived_log_size_bytes as f64 / (1024.0 * 1024.0);
+    println!(
+        "archived FA dump: character={character} version={version} log={archived_mb:.2} MB (raw dump preserved at {}, {raw_mb:.1} MB)",
+        raw_dump_dir.display()
+    );
+    println!("wrote archive: {}", target_dir.display());
+
+    Ok(())
+}
+
+fn validate_archive_label(label_name: &str, value: &str) -> AppResult<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::InvalidInput(format!(
+            "archive-dump {label_name} must not be empty"
+        )));
+    }
+    if trimmed.chars().any(|character| {
+        matches!(
+            character,
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'
+        )
+    }) {
+        return Err(AppError::InvalidInput(format!(
+            "archive-dump {label_name} must not contain path separator or reserved characters: got {trimmed:?}"
+        )));
+    }
+    Ok(trimmed.to_string())
+}
+
+fn directory_size_recursive(root: &Path) -> AppResult<u64> {
+    let mut total: u64 = 0;
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let entry_path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            total = total.saturating_add(directory_size_recursive(&entry_path)?);
+        } else if file_type.is_file() {
+            total = total.saturating_add(fs::metadata(&entry_path)?.len());
+        }
+    }
+    Ok(total)
+}
+
+fn normalize_path_for_json(path: &Path) -> String {
+    let lossy = path.to_string_lossy();
+    // Windows canonicalize() returns UNC-prefixed paths like `\\?\D:\...`.
+    // Strip that prefix for readability; the remaining path still resolves
+    // identically on Windows.
+    let stripped = lossy
+        .strip_prefix("\\\\?\\")
+        .unwrap_or(lossy.as_ref())
+        .to_string();
+    stripped.replace('\\', "/")
 }
 
 fn validate_snapshot_storage_alignment(
