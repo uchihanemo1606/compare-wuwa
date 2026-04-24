@@ -3,11 +3,19 @@ use std::rc::Rc;
 
 use slint::{Model, ModelRc, SharedString, VecModel};
 use whashreonator::gui_app::{
-    CompareTableRow, GuiController, ScanForm, ScanRunResult, ScanStartResult,
+    CompareTableRow, FrameAnalysisScanForm, GuiController, ScanForm, ScanRunResult, ScanStartResult,
 };
+use whashreonator::scan::PreparedVersionScan;
+use whashreonator::wwmi::anchors::WwmiAnchorCaptureProfile;
 
 thread_local! {
     static COMPARE_ROWS_MODEL: RefCell<Option<Rc<VecModel<CompareRow>>>> = const { RefCell::new(None) };
+}
+
+#[derive(Clone)]
+enum PendingScanState {
+    GameRoot(PreparedVersionScan),
+    FrameAnalysis,
 }
 
 slint::slint! {
@@ -34,7 +42,11 @@ slint::slint! {
         in-out property <string> artifact_root_text;
         in-out property <string> reports_root_text;
 
+        in-out property <int> scan_mode_index;
         in-out property <string> source_root;
+        in-out property <string> frame_analysis_dump_dir;
+        in-out property <string> frame_analysis_version_id;
+        in-out property <int> frame_analysis_capture_profile_index;
         in-out property <string> version_override;
         in-out property <string> knowledge_path;
         in-out property <bool> show_advanced;
@@ -84,8 +96,36 @@ slint::slint! {
                     VerticalBox {
                         spacing: 8px;
 
-                        Text { text: "Game source root"; font-weight: 700; }
-                        LineEdit { text <=> root.source_root; }
+                        Text { text: "Scan mode"; font-weight: 700; }
+                        ComboBox {
+                            model: ["Game Root", "FrameAnalysis Dump"];
+                            current-index <=> root.scan_mode_index;
+                        }
+
+                        if root.scan_mode_index == 0 : VerticalBox {
+                            spacing: 6px;
+                            Text { text: "Game source root"; font-weight: 700; }
+                            LineEdit { text <=> root.source_root; }
+                        }
+
+                        if root.scan_mode_index == 1 : VerticalBox {
+                            spacing: 6px;
+                            Text { text: "FrameAnalysis dump directory"; font-weight: 700; }
+                            LineEdit { text <=> root.frame_analysis_dump_dir; }
+                            Text { text: "Target version id"; font-weight: 700; }
+                            LineEdit { text <=> root.frame_analysis_version_id; }
+                            Text { text: "Capture profile"; font-weight: 700; }
+                            ComboBox {
+                                model: ["menu_ui", "shapekey_runtime", "full"];
+                                current-index <=> root.frame_analysis_capture_profile_index;
+                            }
+                            Text {
+                                text: "Use `menu_ui` for Resonators/Gallery or Dressing Room dumps; use `shapekey_runtime` for resonator model/runtime dumps.";
+                                wrap: word-wrap;
+                                font-size: 11px;
+                                color: #9ca3af;
+                            }
+                        }
 
                         HorizontalBox {
                             spacing: 10px;
@@ -101,10 +141,13 @@ slint::slint! {
 
                         if root.show_advanced : VerticalBox {
                             spacing: 6px;
-                            Text { text: "Version override (optional)"; }
-                            LineEdit { text <=> root.version_override; }
-                            Text { text: "WWMI knowledge JSON (optional)"; }
-                            LineEdit { text <=> root.knowledge_path; }
+                            if root.scan_mode_index == 0 : VerticalBox {
+                                spacing: 6px;
+                                Text { text: "Version override (optional)"; }
+                                LineEdit { text <=> root.version_override; }
+                                Text { text: "WWMI knowledge JSON (optional)"; }
+                                LineEdit { text <=> root.knowledge_path; }
+                            }
                             Text { text: "Artifact root: " + root.artifact_root_text; wrap: word-wrap; font-size: 11px; color: #9ca3af; }
                             Text { text: "Version library root: " + root.reports_root_text; wrap: word-wrap; font-size: 11px; color: #9ca3af; }
                         }
@@ -414,9 +457,7 @@ fn main() -> Result<(), slint::PlatformError> {
 
 fn run_gui() -> Result<(), slint::PlatformError> {
     let controller = Rc::new(GuiController::default());
-    let pending_scan = Rc::new(std::cell::RefCell::new(
-        None::<whashreonator::scan::PreparedVersionScan>,
-    ));
+    let pending_scan = Rc::new(std::cell::RefCell::new(None::<PendingScanState>));
     let version_ids = Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
     let version_rows_model = Rc::new(VecModel::<SharedString>::from(vec![]));
     let artifact_rows_model = Rc::new(VecModel::<SharedString>::from(vec![]));
@@ -440,6 +481,10 @@ fn run_gui() -> Result<(), slint::PlatformError> {
     window.set_selected_version_index(-1);
     window.set_selected_compare_old_index(-1);
     window.set_selected_compare_new_index(-1);
+    window.set_scan_mode_index(0);
+    window.set_frame_analysis_dump_dir("".into());
+    window.set_frame_analysis_version_id("".into());
+    window.set_frame_analysis_capture_profile_index(2);
     window.set_show_advanced(false);
     window.set_show_confirm_dialog(false);
     window.set_compare_show_unchanged(false);
@@ -456,52 +501,102 @@ fn run_gui() -> Result<(), slint::PlatformError> {
                 return;
             };
 
-            window.set_status_text("Detecting version...".into());
+            if window.get_scan_mode_index() == 0 {
+                window.set_status_text("Detecting version...".into());
 
-            let form = ScanForm {
-                source_root: window.get_source_root().to_string(),
-                version_override: window.get_version_override().to_string(),
-                knowledge_path: window.get_knowledge_path().to_string(),
-            };
+                let form = ScanForm {
+                    source_root: window.get_source_root().to_string(),
+                    version_override: window.get_version_override().to_string(),
+                    knowledge_path: window.get_knowledge_path().to_string(),
+                };
 
-            match controller.prepare_scan(&form) {
-                Ok(ScanStartResult::Ready(prepared)) => {
-                    pending_scan.borrow_mut().replace(prepared.clone());
-                    let scanned_version = apply_scan_result(
-                        &window,
-                        controller.run_scan(
-                            &prepared,
-                            false,
-                            &window.get_knowledge_path().to_string(),
-                        ),
-                    );
-                    pending_scan.borrow_mut().take();
-                    refresh_version_library(
-                        &window,
-                        &controller,
-                        &version_ids,
-                        &version_rows_model,
-                        &artifact_rows_model,
-                    );
-                    if let Some(version_id) = scanned_version {
-                        select_version(&window, &version_ids, &version_id);
-                        open_current_version(&window, &controller, &version_ids, &artifact_rows_model);
+                match controller.prepare_scan(&form) {
+                    Ok(ScanStartResult::Ready(prepared)) => {
+                        pending_scan
+                            .borrow_mut()
+                            .replace(PendingScanState::GameRoot(prepared.clone()));
+                        let scanned_version = apply_scan_result(
+                            &window,
+                            controller.run_scan(
+                                &prepared,
+                                false,
+                                &window.get_knowledge_path().to_string(),
+                            ),
+                        );
+                        pending_scan.borrow_mut().take();
+                        refresh_version_library(
+                            &window,
+                            &controller,
+                            &version_ids,
+                            &version_rows_model,
+                            &artifact_rows_model,
+                        );
+                        if let Some(version_id) = scanned_version {
+                            select_version(&window, &version_ids, &version_id);
+                            open_current_version(
+                                &window,
+                                &controller,
+                                &version_ids,
+                                &artifact_rows_model,
+                            );
+                        }
+                    }
+                    Ok(ScanStartResult::VersionAlreadyExists(prepared)) => {
+                        pending_scan
+                            .borrow_mut()
+                            .replace(PendingScanState::GameRoot(prepared.clone()));
+                        window.set_status_text("Version already exists".into());
+                        window.set_confirm_dialog_text(
+                            format!(
+                                "Version {} already exists.\nDo you want to re-scan and overwrite the stored snapshot if data changed?",
+                                prepared.version_id
+                            )
+                            .into(),
+                        );
+                        window.set_show_confirm_dialog(true);
+                    }
+                    Err(error) => {
+                        window.set_status_text(format!("Scan failed: {error}").into());
                     }
                 }
-                Ok(ScanStartResult::VersionAlreadyExists(prepared)) => {
-                    pending_scan.borrow_mut().replace(prepared.clone());
-                    window.set_status_text("Version already exists".into());
-                    window.set_confirm_dialog_text(
-                        format!(
-                            "Version {} already exists.\nDo you want to re-scan and overwrite the stored snapshot if data changed?",
-                            prepared.version_id
-                        )
-                        .into(),
-                    );
-                    window.set_show_confirm_dialog(true);
-                }
-                Err(error) => {
-                    window.set_status_text(format!("Scan failed: {error}").into());
+            } else {
+                window.set_status_text("Scanning FrameAnalysis dump...".into());
+                let form = FrameAnalysisScanForm {
+                    dump_dir: window.get_frame_analysis_dump_dir().to_string(),
+                    version_id: window.get_frame_analysis_version_id().to_string(),
+                    capture_profile: capture_profile_from_index(
+                        window.get_frame_analysis_capture_profile_index(),
+                    ),
+                };
+
+                match controller.prepare_frame_analysis_scan(&form) {
+                    Ok(prepared) => {
+                        pending_scan
+                            .borrow_mut()
+                            .replace(PendingScanState::FrameAnalysis);
+                        let scanned_version =
+                            apply_scan_result(&window, controller.run_frame_analysis_scan(&prepared));
+                        pending_scan.borrow_mut().take();
+                        refresh_version_library(
+                            &window,
+                            &controller,
+                            &version_ids,
+                            &version_rows_model,
+                            &artifact_rows_model,
+                        );
+                        if let Some(version_id) = scanned_version {
+                            select_version(&window, &version_ids, &version_id);
+                            open_current_version(
+                                &window,
+                                &controller,
+                                &version_ids,
+                                &artifact_rows_model,
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        window.set_status_text(format!("Dump scan failed: {error}").into());
+                    }
                 }
             }
         });
@@ -522,6 +617,14 @@ fn run_gui() -> Result<(), slint::PlatformError> {
             let Some(prepared) = pending_scan.borrow().clone() else {
                 window.set_show_confirm_dialog(false);
                 window.set_status_text("No pending re-scan.".into());
+                return;
+            };
+
+            let PendingScanState::GameRoot(prepared) = prepared else {
+                window.set_show_confirm_dialog(false);
+                window
+                    .set_status_text("Pending scan does not support re-scan confirmation.".into());
+                pending_scan.borrow_mut().take();
                 return;
             };
 
@@ -831,5 +934,13 @@ fn apply_scan_result(
             window.set_status_text(format!("Scan failed: {error}").into());
             None
         }
+    }
+}
+
+fn capture_profile_from_index(index: i32) -> WwmiAnchorCaptureProfile {
+    match index {
+        0 => WwmiAnchorCaptureProfile::MenuUi,
+        1 => WwmiAnchorCaptureProfile::ShapekeyRuntime,
+        _ => WwmiAnchorCaptureProfile::Full,
     }
 }

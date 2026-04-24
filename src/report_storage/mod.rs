@@ -13,6 +13,7 @@ use crate::{
         export_mod_dependency_baseline_set_output, export_mod_dependency_profile_output,
         export_proposal_patch_draft_output, export_snapshot_compare_output, export_snapshot_output,
         export_text_output, export_version_continuity_output, export_version_diff_report_v2,
+        export_wwmi_anchor_knowledge_output, export_wwmi_anchor_report_output,
     },
     human_summary::{ReviewBundleRenderer, render_mod_dependency_baseline_summary},
     inference::InferenceReport,
@@ -24,8 +25,15 @@ use crate::{
         load_version_diff_report_v2,
     },
     snapshot::{GameSnapshot, SnapshotEvidencePosture, load_snapshot, snapshot_evidence_posture},
-    wwmi::dependency::{
-        WwmiModDependencyBaselineSet, WwmiModDependencyProfile, load_mod_dependency_baseline_set,
+    wwmi::{
+        anchors::{
+            WwmiAnchorReport, WwmiVersionAnchorKnowledge, WwmiVersionedAnchorReport,
+            build_version_anchor_knowledge,
+        },
+        dependency::{
+            WwmiModDependencyBaselineSet, WwmiModDependencyProfile,
+            load_mod_dependency_baseline_set,
+        },
     },
 };
 
@@ -366,6 +374,39 @@ impl ReportStorage {
             &render_mod_dependency_baseline_summary(baseline_set),
             &target_path,
         )?;
+        Ok(target_path)
+    }
+
+    pub fn save_wwmi_anchor_report_for_version(
+        &self,
+        version_id: &str,
+        report: &WwmiAnchorReport,
+    ) -> AppResult<PathBuf> {
+        let layout = self.ensure_version_layout(version_id)?;
+        let mut stored_report = report.clone();
+        stored_report.version_id = Some(version_id.to_string());
+        let stamp = stored_report.generated_at_unix_ms.max(1);
+        stored_report.generated_at_unix_ms = stamp;
+        let target_path = layout.hash_dir.join(format!(
+            "{stamp:020}-{VERSION_DIR_PREFIX}{}.{}.wwmi-anchor-report.v1.json",
+            sanitize_version_segment(version_id),
+            stored_report.capture_profile.label()
+        ));
+        export_wwmi_anchor_report_output(&stored_report, &target_path)?;
+        Ok(target_path)
+    }
+
+    pub fn save_wwmi_anchor_knowledge_for_version(
+        &self,
+        version_id: &str,
+        knowledge: &WwmiVersionAnchorKnowledge,
+    ) -> AppResult<PathBuf> {
+        let layout = self.ensure_version_layout(version_id)?;
+        let target_path = layout.hash_dir.join(format!(
+            "{VERSION_DIR_PREFIX}{}.wwmi-anchor-knowledge.v1.json",
+            sanitize_version_segment(version_id)
+        ));
+        export_wwmi_anchor_knowledge_output(knowledge, &target_path)?;
         Ok(target_path)
     }
 
@@ -832,6 +873,63 @@ impl ReportStorage {
         Ok(None)
     }
 
+    pub fn load_latest_wwmi_anchor_report(
+        &self,
+        version_id: &str,
+    ) -> AppResult<Option<WwmiAnchorReport>> {
+        let mut candidates = self
+            .list_version_artifacts(version_id)?
+            .into_iter()
+            .filter(|artifact| is_wwmi_anchor_report_artifact(artifact))
+            .map(|artifact| artifact.path)
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| right.cmp(left));
+
+        for path in candidates {
+            if let Ok(parsed) = load_wwmi_anchor_report(&path) {
+                return Ok(Some(parsed));
+            }
+        }
+
+        Ok(None)
+    }
+
+    pub fn load_latest_wwmi_anchor_knowledge(
+        &self,
+        version_id: &str,
+    ) -> AppResult<Option<WwmiVersionAnchorKnowledge>> {
+        let mut candidates = self
+            .list_version_artifacts(version_id)?
+            .into_iter()
+            .filter(|artifact| is_wwmi_anchor_knowledge_artifact(artifact))
+            .map(|artifact| artifact.path)
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| right.cmp(left));
+
+        for path in candidates {
+            if let Ok(parsed) = load_wwmi_anchor_knowledge(&path) {
+                return Ok(Some(parsed));
+            }
+        }
+
+        Ok(None)
+    }
+
+    pub fn rebuild_and_save_wwmi_anchor_knowledge_for_version(
+        &self,
+        version_id: &str,
+    ) -> AppResult<Option<PathBuf>> {
+        let reports = self.collect_wwmi_anchor_reports()?;
+        if !reports.iter().any(|report| report.version_id == version_id) {
+            return Ok(None);
+        }
+
+        let knowledge = build_version_anchor_knowledge(version_id, &reports);
+        Ok(Some(self.save_wwmi_anchor_knowledge_for_version(
+            version_id, &knowledge,
+        )?))
+    }
+
     pub fn load_latest_extractor_inventory_input(
         &self,
         version_id: &str,
@@ -942,6 +1040,44 @@ impl ReportStorage {
         }
 
         Ok(None)
+    }
+
+    pub fn collect_wwmi_anchor_reports(&self) -> AppResult<Vec<WwmiVersionedAnchorReport>> {
+        let mut collected = Vec::new();
+
+        for version in self.list_versions()? {
+            for artifact in version
+                .artifacts
+                .iter()
+                .filter(|artifact| is_wwmi_anchor_report_artifact(artifact))
+            {
+                if let Ok(mut report) = load_wwmi_anchor_report(&artifact.path) {
+                    if report.version_id.is_none() {
+                        report.version_id = Some(version.version_id.clone());
+                    }
+                    collected.push(WwmiVersionedAnchorReport {
+                        version_id: version.version_id.clone(),
+                        report,
+                    });
+                }
+            }
+        }
+
+        collected.sort_by(|left, right| {
+            version_sort_key(&left.version_id)
+                .cmp(&version_sort_key(&right.version_id))
+                .then_with(|| {
+                    left.report
+                        .generated_at_unix_ms
+                        .cmp(&right.report.generated_at_unix_ms)
+                })
+                .then_with(|| {
+                    left.report
+                        .capture_profile
+                        .cmp(&right.report.capture_profile)
+                })
+        });
+        Ok(collected)
     }
 
     pub fn select_baseline_version(&self, current_version: &str) -> AppResult<Option<String>> {
@@ -1331,6 +1467,34 @@ fn baseline_preference_reason(
             artifact.label
         ),
     }
+}
+
+fn is_wwmi_anchor_report_artifact(artifact: &VersionArtifactEntry) -> bool {
+    artifact.kind == VersionArtifactKind::HashData
+        && artifact.path.extension().is_some_and(|ext| ext == "json")
+        && artifact
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.contains("wwmi-anchor-report"))
+}
+
+fn is_wwmi_anchor_knowledge_artifact(artifact: &VersionArtifactEntry) -> bool {
+    artifact.kind == VersionArtifactKind::HashData
+        && artifact.path.extension().is_some_and(|ext| ext == "json")
+        && artifact
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.contains("wwmi-anchor-knowledge"))
+}
+
+fn load_wwmi_anchor_report(path: &Path) -> AppResult<WwmiAnchorReport> {
+    Ok(serde_json::from_str(&fs::read_to_string(path)?)?)
+}
+
+fn load_wwmi_anchor_knowledge(path: &Path) -> AppResult<WwmiVersionAnchorKnowledge> {
+    Ok(serde_json::from_str(&fs::read_to_string(path)?)?)
 }
 
 fn collect_artifacts_from_new_layout(version_dir: &Path) -> AppResult<Vec<VersionArtifactEntry>> {

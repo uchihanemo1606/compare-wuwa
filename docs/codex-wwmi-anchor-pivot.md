@@ -190,6 +190,9 @@ Suggested report fields:
 - `success`
 - `notes`
 
+The next follow-up phase after exact-match extraction is documented in:
+- `docs/phase3a-wwmi-anchor-discovery.md`
+
 ## 10. Reporting language
 
 User-facing updates and final reports must be in Vietnamese unless the user

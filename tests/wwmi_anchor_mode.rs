@@ -55,6 +55,15 @@ const MENU_UI_WITH_EXTRA_CANDIDATE_LOG: &str = "analyse_options: 0000063d
 000005 DrawIndexed(IndexCount:6, StartIndexLocation:0, BaseVertexLocation:0)
 ";
 
+const SHAPEKEY_DISCOVERY_LOG: &str = "analyse_options: 0000063d
+000001 CSSetShader(pComputeShader:0x000000005D8B1E38, ppClassInstances:0x0000000000000000, NumClassInstances:0) hash=1111111111111111
+000001 Dispatch(ThreadGroupCountX:29747, ThreadGroupCountY:1, ThreadGroupCountZ:1)
+000003 CSSetShader(pComputeShader:0x000000008984C1B8, ppClassInstances:0x0000000000000000, NumClassInstances:0) hash=2222222222222222
+000003 Dispatch(ThreadGroupCountX:100, ThreadGroupCountY:1, ThreadGroupCountZ:1)
+000004 CSSetShader(pComputeShader:0x000000008984C1B8, ppClassInstances:0x0000000000000000, NumClassInstances:0) hash=3333333333333333
+000004 Dispatch(ThreadGroupCountX:4, ThreadGroupCountY:4, ThreadGroupCountZ:1)
+";
+
 #[test]
 fn full_profile_reports_all_six_canonical_anchors() {
     let report = build_report(
@@ -121,6 +130,58 @@ fn report_surfaces_non_canonical_shader_and_texture_candidates() {
     assert_eq!(
         report.unexpected_anchor_candidates[0].observed_kind,
         "texture_resource"
+    );
+}
+
+#[test]
+fn missing_shapekey_anchors_surface_ranked_compute_replacements() {
+    let report = build_report(
+        SHAPEKEY_DISCOVERY_LOG,
+        WwmiAnchorCaptureProfile::ShapekeyRuntime,
+        PathBuf::from("out/shapekey-discovery"),
+    );
+
+    assert!(!report.success);
+    assert_eq!(report.found_anchors.len(), 0);
+    assert_eq!(report.missing_anchors.len(), 2);
+    assert!(report.notes.iter().any(|note| {
+        note.contains("runtime hashes must be discovered from fresh Frame Analysis dumps")
+    }));
+
+    let loader = report
+        .missing_anchors
+        .iter()
+        .find(|anchor| anchor.logical_name == "ShapeKeyLoaderCS")
+        .expect("loader anchor");
+    assert_eq!(loader.candidate_replacements[0].hash, "1111111111111111");
+    assert_eq!(
+        loader.candidate_replacements[0].identity_tuple.as_deref(),
+        Some("fa|cs|tg:29747x1x1")
+    );
+    assert!(
+        loader.candidate_replacements[0]
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("known structural hint"))
+    );
+
+    let multiplier = report
+        .missing_anchors
+        .iter()
+        .find(|anchor| anchor.logical_name == "ShapeKeyMultiplierCS")
+        .expect("multiplier anchor");
+    assert_eq!(
+        multiplier.candidate_replacements[0].hash,
+        "2222222222222222"
+    );
+    assert_eq!(
+        multiplier.candidate_replacements[0]
+            .identity_tuple
+            .as_deref(),
+        Some("fa|cs|tg:100x1x1")
+    );
+    assert!(
+        multiplier.candidate_replacements[0].score > multiplier.candidate_replacements[1].score
     );
 }
 

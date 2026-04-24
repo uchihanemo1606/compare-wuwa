@@ -53,7 +53,7 @@ use crate::{
     validator::{ThresholdValidator, Validator},
     wwmi::{
         WwmiKnowledgeBase, WwmiKnowledgeExtractor, WwmiRepoInput,
-        anchors::{WwmiAnchorReport, extract_wwmi_anchor_report},
+        anchors::{WwmiAnchorReport, extract_wwmi_anchor_report_from_dump},
         load_wwmi_knowledge,
     },
 };
@@ -492,41 +492,8 @@ pub fn run_extract_wwmi_anchors_command(
     args: &ExtractWwmiAnchorsArgs,
 ) -> AppResult<WwmiAnchorReport> {
     validate_artifact_output_path(args.output.as_path())?;
-
-    if !args.dump_dir.exists() {
-        return Err(AppError::InvalidInput(format!(
-            "frame analysis dump directory does not exist: {}",
-            args.dump_dir.display()
-        )));
-    }
-    if !args.dump_dir.is_dir() {
-        return Err(AppError::InvalidInput(format!(
-            "frame analysis dump path is not a directory: {}",
-            args.dump_dir.display()
-        )));
-    }
-
-    let dump_dir = args.dump_dir.canonicalize()?;
-    let log_path = dump_dir.join("log.txt");
-    if !log_path.exists() || !log_path.is_file() {
-        return Err(AppError::InvalidInput(format!(
-            "frame analysis dump directory must contain log.txt: {}",
-            dump_dir.display()
-        )));
-    }
-
-    let log_text = fs::read_to_string(&log_path)?;
-    let mut dump = parse_frame_analysis_log(&log_text)?;
-    dump.dump_dir = dump_dir.clone();
-    dump.log_path = log_path.clone();
-
-    let inventory = build_prepared_inventory(&dump, "wwmi-anchor-audit");
-    let report = extract_wwmi_anchor_report(
-        &inventory,
-        args.capture_profile.into(),
-        dump_dir.as_path(),
-        log_path.as_path(),
-    );
+    let report =
+        extract_wwmi_anchor_report_from_dump(args.dump_dir.as_path(), args.capture_profile.into())?;
     export_wwmi_anchor_report_output(&report, args.output.as_path())?;
 
     Ok(report)
